@@ -337,6 +337,12 @@ class MasterClient {
     [[nodiscard]] tl::expected<void, ErrorCode> MountNoFSegment(
         const NoFSegment& segment);
 
+    [[nodiscard]] tl::expected<void, ErrorCode> MountGdsSsdSegment(
+        const GdsSsdSegment& segment);
+
+    [[nodiscard]] tl::expected<void, ErrorCode> RegisterGdsSsdAccessor(
+        const UUID& segment_id, const GdsSsdAccessor& accessor);
+
     /**
      * @brief Re-mount segments, invoked when the client is the first time to
      * connect to the master or the client Ping TTL is expired and need
@@ -385,6 +391,9 @@ class MasterClient {
      */
     [[nodiscard]] tl::expected<std::vector<NoFSegment>, ErrorCode>
     GetAllNoFSegments();
+
+    [[nodiscard]] tl::expected<std::vector<GdsSsdSegment>, ErrorCode>
+    GetAllGdsSsdSegments();
 
     /**
      * @brief Gets all mounted NoF segments that match a segment name together

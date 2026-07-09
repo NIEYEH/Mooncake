@@ -217,6 +217,45 @@ TEST_F(SerializerTest, MountedSegmentDeserializesLegacyFormatWithoutHostId) {
     EXPECT_EQ(restored->status, SegmentStatus::OK);
 }
 
+
+TEST_F(SerializerTest, GdsSsdReplicaSerializationRoundTrip) {
+    GdsSsdReplicaMeta meta;
+    meta.segment_id = generate_uuid();
+    meta.segment_name = "gds_pool_0";
+    meta.offset = 4096;
+    meta.object_size = 8192;
+    meta.block_size = 4096;
+    meta.allocation_alignment = 4096;
+
+    Replica original(meta, ReplicaStatus::COMPLETE);
+    SegmentManager segment_manager;
+    SegmentView segment_view = segment_manager.getView();
+
+    msgpack::sbuffer buffer;
+    MsgpackPacker packer(&buffer);
+    ASSERT_TRUE(Serializer<Replica>::serialize(original, segment_view, packer)
+                    .has_value());
+
+    auto object_handle = msgpack::unpack(buffer.data(), buffer.size());
+    auto restored = Serializer<Replica>::deserialize(object_handle.get(),
+                                                     segment_view);
+    ASSERT_TRUE(restored.has_value());
+    ASSERT_NE(restored.value(), nullptr);
+    EXPECT_EQ(restored.value()->status(), ReplicaStatus::COMPLETE);
+    EXPECT_TRUE(restored.value()->is_gds_ssd_replica());
+
+    auto descriptor = restored.value()->get_descriptor();
+    ASSERT_TRUE(descriptor.is_gds_ssd_replica());
+    const auto& gds_descriptor = descriptor.get_gds_ssd_descriptor();
+    EXPECT_EQ(gds_descriptor.segment_id, meta.segment_id);
+    EXPECT_EQ(gds_descriptor.segment_name, meta.segment_name);
+    EXPECT_TRUE(gds_descriptor.segment_uri.empty());
+    EXPECT_EQ(gds_descriptor.offset, meta.offset);
+    EXPECT_EQ(gds_descriptor.object_size, meta.object_size);
+    EXPECT_EQ(gds_descriptor.block_size, meta.block_size);
+    EXPECT_EQ(gds_descriptor.allocation_alignment,
+              meta.allocation_alignment);
+}
 }  // namespace mooncake::test
 
 int main(int argc, char** argv) {

@@ -174,12 +174,15 @@ WrappedMasterService::GetReplicaListByRegex(const std::string& str,
 }
 
 tl::expected<GetReplicaListResponse, ErrorCode>
-WrappedMasterService::GetReplicaList(const std::string& key,
+WrappedMasterService::GetReplicaList(const UUID& client_id,
+                                     const std::string& key,
                                      const std::string& tenant_id) {
     return execute_rpc(
         "GetReplicaList",
-        [&] { return master_service_.GetReplicaList(key, tenant_id); },
-        [&](auto& timer) { timer.LogRequest("key=", key); },
+        [&] { return master_service_.GetReplicaList(client_id, key, tenant_id); },
+        [&](auto& timer) {
+            timer.LogRequest("client_id=", client_id, ", key=", key);
+        },
         [] { MasterMetricManager::instance().inc_get_replica_list_requests(); },
         [] {
             MasterMetricManager::instance().inc_get_replica_list_failures();
@@ -187,18 +190,19 @@ WrappedMasterService::GetReplicaList(const std::string& key,
 }
 
 std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
-WrappedMasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
+WrappedMasterService::BatchGetReplicaList(const UUID& client_id,
+                                          const std::vector<std::string>& keys,
                                           const std::string& tenant_id) {
     ScopedVLogTimer timer(1, "BatchGetReplicaList");
     const size_t total_keys = keys.size();
-    timer.LogRequest("keys_count=", total_keys);
+    timer.LogRequest("client_id=", client_id, ", keys_count=", total_keys);
     MasterMetricManager::instance().inc_batch_get_replica_list_requests(
         total_keys);
 
     std::vector<tl::expected<GetReplicaListResponse, ErrorCode>> results;
     results.reserve(keys.size());
 
-    results = master_service_.BatchGetReplicaList(keys, tenant_id);
+    results = master_service_.BatchGetReplicaList(client_id, keys, tenant_id);
 
     size_t failure_count = 0;
     for (size_t i = 0; i < results.size(); ++i) {
@@ -705,6 +709,33 @@ tl::expected<void, ErrorCode> WrappedMasterService::MountNoFSegment(
         });
 }
 
+tl::expected<void, ErrorCode> WrappedMasterService::MountGdsSsdSegment(
+    const GdsSsdSegment& segment) {
+    return execute_rpc(
+        "MountGdsSsdSegment",
+        [&] { return master_service_.MountGdsSsdSegment(segment); },
+        [&](auto& timer) {
+            timer.LogRequest("GDS SSD segment mount: segment_name=",
+                             segment.name, ", id=", segment.id,
+                             ", size=", segment.size);
+        },
+        [] {}, [] {});
+}
+
+tl::expected<void, ErrorCode> WrappedMasterService::RegisterGdsSsdAccessor(
+    const UUID& segment_id, const GdsSsdAccessor& accessor) {
+    return execute_rpc(
+        "RegisterGdsSsdAccessor",
+        [&] { return master_service_.RegisterGdsSsdAccessor(segment_id,
+                                                            accessor); },
+        [&](auto& timer) {
+            timer.LogRequest("GDS SSD accessor register: segment_id=",
+                             segment_id, ", client_host=",
+                             accessor.client_host, ", segment_uri=",
+                             accessor.segment_uri);
+        },
+        [] {}, [] {});
+}
 tl::expected<void, ErrorCode> WrappedMasterService::ReMountSegment(
     const std::vector<Segment>& segments, const UUID& client_id) {
     return execute_rpc(
@@ -799,6 +830,14 @@ WrappedMasterService::GetAllNoFSegments() {
         [] {});
 }
 
+tl::expected<std::vector<GdsSsdSegment>, ErrorCode>
+WrappedMasterService::GetAllGdsSsdSegments() {
+    return execute_rpc(
+        "GetAllGdsSsdSegments",
+        [&] { return master_service_.GetAllGdsSsdSegments(); },
+        [&](auto& timer) { timer.LogRequest("Get all GDS SSD segments"); },
+        [] {}, [] {});
+}
 tl::expected<std::vector<NoFSegmentOwnerInfo>, ErrorCode>
 WrappedMasterService::GetNoFSegmentsByName(const std::string& segment_name) {
     return execute_rpc(
@@ -1296,6 +1335,12 @@ void RegisterRpcService(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::MountNoFSegment>(
         &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedMasterService::MountGdsSsdSegment>(
+        &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedMasterService::RegisterGdsSsdAccessor>(
+        &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::ReMountSegment>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::ReMountNoFSegment>(
@@ -1308,6 +1353,9 @@ void RegisterRpcService(
     server.register_handler<&mooncake::WrappedMasterService::UnmountNoFSegment>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::GetAllNoFSegments>(
+        &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedMasterService::GetAllGdsSsdSegments>(
         &wrapped_master_service);
     server.register_handler<
         &mooncake::WrappedMasterService::GetNoFSegmentsByName>(

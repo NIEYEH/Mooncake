@@ -244,7 +244,7 @@ inline bool IsValidTenantId(const std::string& tenant_id) {
 // Zero-copy variant: returns a const reference that is valid as long as
 // the input `tenant_id` is alive. When the input is empty, returns a
 // reference to a static "default" string. Use this in hot-path callers
-// (getMetadataShardIndex, getTenantQuotaShardIndex, MakeObjectIdentity, …)
+// (getMetadataShardIndex, getTenantQuotaShardIndex, MakeObjectIdentity, 鈥?
 // to eliminate the string copy that NormalizeTenantId() would otherwise
 // perform on every invocation.
 //
@@ -515,6 +515,44 @@ struct NoFSegment {
     NoFSegment() = default;
 };
 YLT_REFL(NoFSegment, id, name, base, size, te_endpoint);
+/**
+ * @brief Per-host access path for a GDS SSD namespace.
+ */
+struct GdsSsdAccessor {
+    std::string client_host{};
+    std::string segment_uri{};
+    std::string namespace_id{};
+    uint64_t size{0};
+    uint64_t block_size{0};
+    uint64_t allocation_alignment{0};
+    std::vector<int32_t> gpu_device_ids{};
+    int32_t numa_node{-1};
+    bool alive{true};
+};
+YLT_REFL(GdsSsdAccessor, client_host, segment_uri, namespace_id, size,
+         block_size, allocation_alignment, gpu_device_ids, numa_node, alive);
+
+/**
+ * @brief A globally managed GDS SSD byte-addressable storage segment.
+ *
+ * The segment describes one contiguous allocatable region in a real NVMe
+ * namespace. Accessors describe how individual client hosts open that same
+ * namespace locally.
+ */
+struct GdsSsdSegment {
+    UUID id{0, 0};
+    std::string name{};
+    uint64_t base{0};
+    uint64_t size{0};
+    uint64_t block_size{0};
+    uint64_t allocation_alignment{0};
+    uint64_t metadata_reserved_bytes{0};
+    std::string namespace_id{};
+    std::vector<GdsSsdAccessor> accessors{};
+};
+YLT_REFL(GdsSsdSegment, id, name, base, size, block_size,
+         allocation_alignment, metadata_reserved_bytes, namespace_id,
+         accessors);
 
 /**
  * @brief Client status from the master's perspective

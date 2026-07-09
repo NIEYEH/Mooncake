@@ -683,6 +683,26 @@ tl::expected<void, SerializationError> Serializer<Replica>::serialize(
             }
             break;
         }
+        case ReplicaType::GDS_SSD: {
+            const auto *gds_data =
+                std::get_if<GdsSsdReplicaData>(&replica.data_);
+            if (!gds_data) {
+                return tl::unexpected(SerializationError(
+                    ErrorCode::DESERIALIZE_FAIL,
+                    "serialize_msgpack Replica missing GdsSsdReplicaData"));
+            }
+            // Format: [segment_id, segment_name, offset, object_size,
+            // block_size, allocation_alignment]
+            packer.pack_array(6);
+            packer.pack(UuidToString(gds_data->meta.segment_id));
+            packer.pack(gds_data->meta.segment_name);
+            packer.pack(static_cast<uint64_t>(gds_data->meta.offset));
+            packer.pack(static_cast<uint64_t>(gds_data->meta.object_size));
+            packer.pack(static_cast<uint64_t>(gds_data->meta.block_size));
+            packer.pack(
+                static_cast<uint64_t>(gds_data->meta.allocation_alignment));
+            break;
+        }
         case ReplicaType::DISK: {
             const auto *disk_data =
                 std::get_if<DiskReplicaData>(&replica.data_);
@@ -783,6 +803,37 @@ auto Serializer<Replica>::deserialize(const msgpack::object &obj,
 
             replica = std::make_shared<Replica>(std::move(file_path),
                                                 object_size, status);
+            break;
+        }
+        case static_cast<int8_t>(ReplicaType::GDS_SSD): {
+            const auto &payload = array_items[3];
+            if (payload.type != msgpack::type::ARRAY ||
+                payload.via.array.size != 6) {
+                return tl::unexpected(SerializationError(
+                    ErrorCode::DESERIALIZE_FAIL,
+                    "deserialize_msgpack Replica GDS_SSD payload is not "
+                    "valid array[6]"));
+            }
+            auto *payload_items = payload.via.array.ptr;
+            UUID segment_id;
+            std::string segment_id_str = payload_items[0].as<std::string>();
+            if (!StringToUuid(segment_id_str, segment_id)) {
+                return tl::unexpected(SerializationError(
+                    ErrorCode::DESERIALIZE_FAIL,
+                    fmt::format("deserialize_msgpack Replica invalid GDS SSD "
+                                "segment UUID: {}",
+                                segment_id_str)));
+            }
+
+            GdsSsdReplicaMeta meta;
+            meta.segment_id = segment_id;
+            meta.segment_name = payload_items[1].as<std::string>();
+            meta.offset = payload_items[2].as<uint64_t>();
+            meta.object_size = payload_items[3].as<uint64_t>();
+            meta.block_size = payload_items[4].as<uint64_t>();
+            meta.allocation_alignment = payload_items[5].as<uint64_t>();
+
+            replica = std::make_shared<Replica>(std::move(meta), status);
             break;
         }
         case static_cast<int8_t>(ReplicaType::LOCAL_DISK): {

@@ -3,6 +3,7 @@
 #include <boost/functional/hash.hpp>
 #include <chrono>
 #include <map>
+#include <memory>
 #include <ostream>
 #include <set>
 #include <shared_mutex>
@@ -83,6 +84,52 @@ inline std::ostream& operator<<(
        << ", segment.base=" << snapshot.segment.base
        << ", segment.size=" << snapshot.segment.size
        << ", segment.te_endpoint=" << snapshot.segment.te_endpoint
+       << ", status=" << snapshot.status << "}";
+    return os;
+}
+
+struct MountedGdsSsdSegment {
+    GdsSsdSegment segment;
+    SegmentStatus status;
+    std::shared_ptr<BufferAllocatorBase> buf_allocator;
+};
+
+struct MountedGdsSsdSegmentSnapshot {
+    UUID segment_id;
+    GdsSsdSegment segment;
+    SegmentStatus status;
+};
+
+struct GdsSsdAllocationKey {
+    UUID segment_id{0, 0};
+    uint64_t offset{0};
+
+    bool operator==(const GdsSsdAllocationKey& other) const noexcept {
+        return segment_id == other.segment_id && offset == other.offset;
+    }
+};
+
+struct GdsSsdAllocationKeyHash {
+    std::size_t operator()(const GdsSsdAllocationKey& key) const noexcept {
+        std::size_t seed = boost::hash<UUID>{}(key.segment_id);
+        boost::hash_combine(seed, key.offset);
+        return seed;
+    }
+};
+
+struct GdsSsdAllocationRecord {
+    GdsSsdReplicaMeta meta;
+    std::unique_ptr<AllocatedBuffer> buffer;
+};
+
+inline std::ostream& operator<<(
+    std::ostream& os, const MountedGdsSsdSegmentSnapshot& snapshot) noexcept {
+    os << "{segment_id=" << snapshot.segment_id
+       << ", segment.id=" << snapshot.segment.id
+       << ", segment.name=" << snapshot.segment.name
+       << ", segment.base=" << snapshot.segment.base
+       << ", segment.size=" << snapshot.segment.size
+       << ", segment.namespace_id=" << snapshot.segment.namespace_id
        << ", status=" << snapshot.status << "}";
     return os;
 }
@@ -313,6 +360,46 @@ class ScopedNoFSegmentAccess {
 
    private:
     NoFSegmentManager* nof_segment_manager_;
+    std::unique_lock<std::shared_mutex> lock_;
+};
+
+class GdsSsdSegmentManager;
+
+/**
+ * @brief RAII-style access to GDS SSD segment state.
+ */
+class ScopedGdsSsdSegmentAccess {
+   public:
+    explicit ScopedGdsSsdSegmentAccess(GdsSsdSegmentManager* segment_manager,
+                                       std::shared_mutex& mutex)
+        : gds_segment_manager_(segment_manager), lock_(mutex) {}
+
+    ErrorCode MountSegment(const GdsSsdSegment& segment);
+
+    tl::expected<GdsSsdReplicaMeta, ErrorCode> AllocateReplica(
+        size_t object_size,
+        const std::vector<std::string>& preferred_segments = {},
+        const std::set<std::string>& excluded_segments = {});
+
+    ErrorCode ReleaseReplica(const GdsSsdReplicaMeta& meta);
+
+    ErrorCode RegisterAccessor(const UUID& segment_id,
+                               const GdsSsdAccessor& accessor);
+
+    ErrorCode ResolveDescriptor(const GdsSsdReplicaMeta& meta,
+                                const std::string& client_host,
+                                GdsSsdDescriptor& descriptor) const;
+
+    ErrorCode GetMountedSegments(
+        std::vector<MountedGdsSsdSegmentSnapshot>& segments) const;
+
+    ErrorCode GetAllSegments(std::vector<std::string>& all_segments);
+
+    ErrorCode QuerySegments(const std::string& segment, size_t& used,
+                            size_t& capacity);
+
+   private:
+    GdsSsdSegmentManager* gds_segment_manager_;
     std::unique_lock<std::shared_mutex> lock_;
 };
 
@@ -560,4 +647,47 @@ class NoFSegmentManager {
     friend class SegmentTest;
 };
 
+class GdsSsdSegmentManager {
+   public:
+    ScopedGdsSsdSegmentAccess getGdsSsdSegmentAccess() {
+        return ScopedGdsSsdSegmentAccess(this, segment_mutex_);
+    }
+
+
+    int getMountedSegmentCount() const {
+        std::shared_lock<std::shared_mutex> lock(segment_mutex_);
+        return mounted_segments_.size();
+    }
+
+    void GetMountedSegmentsSnapshot(
+        std::vector<MountedGdsSsdSegmentSnapshot>& segments) const;
+
+    tl::expected<std::vector<UUID>, ErrorCode> GetSegmentsByName(
+        const std::string& segment_name) const {
+        std::shared_lock<std::shared_mutex> lock(segment_mutex_);
+        std::vector<UUID> result;
+        for (const auto& [segment_id, mounted_segment] : mounted_segments_) {
+            if (mounted_segment.segment.name == segment_name) {
+                result.push_back(segment_id);
+            }
+        }
+        if (result.empty()) {
+            return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
+        }
+        return result;
+    }
+
+   private:
+    mutable std::shared_mutex segment_mutex_;
+    AllocatorManager allocator_manager_;
+    std::unordered_map<UUID, MountedGdsSsdSegment, boost::hash<UUID>>
+        mounted_segments_;
+    std::unordered_map<GdsSsdAllocationKey, GdsSsdAllocationRecord,
+                       GdsSsdAllocationKeyHash>
+        allocation_records_;
+    std::unordered_map<std::string, UUID> segment_id_by_name_;
+
+    friend class ScopedGdsSsdSegmentAccess;
+    friend class SegmentTest;
+};
 }  // namespace mooncake

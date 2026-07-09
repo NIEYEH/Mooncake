@@ -59,10 +59,12 @@ class WrappedMasterService {
                           const std::string& tenant_id = "default");
 
     tl::expected<GetReplicaListResponse, ErrorCode> GetReplicaList(
-        const std::string& key, const std::string& tenant_id = "default");
+        const UUID& client_id, const std::string& key,
+        const std::string& tenant_id = "default");
 
     std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
-    BatchGetReplicaList(const std::vector<std::string>& keys,
+    BatchGetReplicaList(const UUID& client_id,
+                        const std::vector<std::string>& keys,
                         const std::string& tenant_id = "default");
 
     tl::expected<std::vector<Replica::Descriptor>, ErrorCode> PutStart(
@@ -147,6 +149,12 @@ class WrappedMasterService {
     tl::expected<void, ErrorCode> MountNoFSegment(const NoFSegment& segment,
                                                   const UUID& client_id);
 
+    tl::expected<void, ErrorCode> MountGdsSsdSegment(
+        const GdsSsdSegment& segment);
+
+    tl::expected<void, ErrorCode> RegisterGdsSsdAccessor(
+        const UUID& segment_id, const GdsSsdAccessor& accessor);
+
     tl::expected<void, ErrorCode> ReMountSegment(
         const std::vector<Segment>& segments, const UUID& client_id);
 
@@ -165,6 +173,9 @@ class WrappedMasterService {
 
     [[nodiscard]] tl::expected<std::vector<NoFSegment>, ErrorCode>
     GetAllNoFSegments();
+
+    [[nodiscard]] tl::expected<std::vector<GdsSsdSegment>, ErrorCode>
+    GetAllGdsSsdSegments();
 
     [[nodiscard]] tl::expected<std::vector<NoFSegmentOwnerInfo>, ErrorCode>
     GetNoFSegmentsByName(const std::string& segment_name);

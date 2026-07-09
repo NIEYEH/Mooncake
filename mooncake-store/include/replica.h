@@ -15,6 +15,7 @@
 #include <optional>
 #include <string_view>
 #include <ostream>
+#include <utility>
 
 #include "types.h"
 #include "allocator.h"
@@ -37,6 +38,7 @@ inline std::ostream& operator<<(std::ostream& os,
                              {ReplicaType::DISK, "DISK"},
                              {ReplicaType::LOCAL_DISK, "LOCAL_DISK"},
                              {ReplicaType::NOF_SSD, "NOF_SSD"},
+                             {ReplicaType::GDS_SSD, "GDS_SSD"},
                              {ReplicaType::ALL, "ALL"}};
 
     os << (replica_type_strings.count(replicaType)
@@ -81,6 +83,7 @@ inline std::ostream& operator<<(std::ostream& os,
 struct ReplicateConfig {
     size_t replica_num{1};
     size_t nof_replica_num{0};
+    size_t gds_replica_num{0};
     bool with_soft_pin{false};
     bool with_hard_pin{false};  // Hard pin: object cannot be evicted
     std::vector<std::string>
@@ -89,6 +92,8 @@ struct ReplicateConfig {
                                       // for backward compatibility
     std::vector<std::string>
         preferred_nof_segments{};  // Preferred NoF segments for allocation
+    std::vector<std::string>
+        preferred_gds_segments{};  // Preferred GDS SSD segments for allocation
     bool prefer_alloc_in_same_node{false};
     ObjectDataType data_type{ObjectDataType::UNKNOWN};
     std::string host_id{};
@@ -110,6 +115,7 @@ struct ReplicateConfig {
                                     const ReplicateConfig& config) noexcept {
         os << "ReplicateConfig: { replica_num: " << config.replica_num
            << ", nof_replica_num: " << config.nof_replica_num
+           << ", gds_replica_num: " << config.gds_replica_num
            << ", with_soft_pin: " << config.with_soft_pin
            << ", with_hard_pin: " << config.with_hard_pin
            << ", preferred_segments: [";
@@ -126,6 +132,12 @@ struct ReplicateConfig {
         for (size_t i = 0; i < config.preferred_nof_segments.size(); ++i) {
             os << config.preferred_nof_segments[i];
             if (i < config.preferred_nof_segments.size() - 1) os << ", ";
+        }
+        os << "]";
+        os << ", preferred_gds_segments: [";
+        for (size_t i = 0; i < config.preferred_gds_segments.size(); ++i) {
+            os << config.preferred_gds_segments[i];
+            if (i < config.preferred_gds_segments.size() - 1) os << ", ";
         }
         os << "]";
         os << ", prefer_alloc_in_same_node: "
@@ -155,10 +167,14 @@ enum class ReplicaWriteMode {
 
 inline ReplicaWriteMode DetermineReplicaWriteMode(
     const ReplicateConfig& config) {
-    if (config.replica_num == 1 && config.nof_replica_num == 1) {
+    if (config.gds_replica_num == 0 && config.replica_num == 1 &&
+        config.nof_replica_num == 1) {
         return ReplicaWriteMode::FLEXIBLE_DUAL_REPLICA;
     }
-    if (config.replica_num > 1 || config.nof_replica_num > 1) {
+    const size_t total_replica_num = config.replica_num +
+                                     config.nof_replica_num +
+                                     config.gds_replica_num;
+    if (total_replica_num > 1) {
         return ReplicaWriteMode::RELIABLE_MULTI_REPLICA;
     }
     return ReplicaWriteMode::SINGLE_REPLICA;
@@ -170,6 +186,21 @@ struct MemoryReplicaData {
 
 struct NoFReplicaData {
     std::unique_ptr<AllocatedBuffer> buffer;
+};
+
+struct GdsSsdReplicaMeta {
+    UUID segment_id{0, 0};
+    std::string segment_name{};
+    uint64_t offset{0};
+    uint64_t object_size{0};
+    uint64_t block_size{0};
+    uint64_t allocation_alignment{0};
+    YLT_REFL(GdsSsdReplicaMeta, segment_id, segment_name, offset, object_size,
+             block_size, allocation_alignment);
+};
+
+struct GdsSsdReplicaData {
+    GdsSsdReplicaMeta meta;
 };
 
 struct DiskReplicaData {
@@ -191,6 +222,18 @@ struct MemoryDescriptor {
 struct NoFDescriptor {
     AllocatedBuffer::Descriptor buffer_descriptor;
     YLT_REFL(NoFDescriptor, buffer_descriptor);
+};
+
+struct GdsSsdDescriptor {
+    UUID segment_id{0, 0};
+    std::string segment_name{};
+    std::string segment_uri{};
+    uint64_t offset{0};
+    uint64_t object_size{0};
+    uint64_t block_size{0};
+    uint64_t allocation_alignment{0};
+    YLT_REFL(GdsSsdDescriptor, segment_id, segment_name, segment_uri, offset,
+             object_size, block_size, allocation_alignment);
 };
 
 struct DiskDescriptor {
@@ -230,6 +273,12 @@ class Replica {
         }
     }
 
+    // GDS SSD replica constructor. segment_uri is resolved per client later.
+    Replica(GdsSsdReplicaMeta meta, ReplicaStatus status)
+        : id_(next_id_.fetch_add(1)),
+          data_(GdsSsdReplicaData{std::move(meta)}),
+          status_(status),
+          refcnt_(0) {}
     // disk replica constructor
     Replica(std::string file_path, uint64_t object_size, ReplicaStatus status)
         : id_(next_id_.fetch_add(1)),
@@ -352,6 +401,18 @@ class Replica {
         return replica.is_nof_replica();
     }
 
+    [[nodiscard]] bool is_gds_ssd_replica() const {
+        return std::holds_alternative<GdsSsdReplicaData>(data_);
+    }
+
+    [[nodiscard]] static bool fn_is_gds_ssd_replica(const Replica& replica) {
+        return replica.is_gds_ssd_replica();
+    }
+
+    [[nodiscard]] const GdsSsdReplicaMeta& get_gds_ssd_meta() const {
+        return std::get<GdsSsdReplicaData>(data_).meta;
+    }
+
     [[nodiscard]] bool is_disk_replica() const {
         return std::holds_alternative<DiskReplicaData>(data_);
     }
@@ -460,6 +521,9 @@ class Replica {
         ReplicaType operator()(const NoFReplicaData&) const {
             return ReplicaType::NOF_SSD;
         }
+        ReplicaType operator()(const GdsSsdReplicaData&) const {
+            return ReplicaType::GDS_SSD;
+        }
         ReplicaType operator()(const DiskReplicaData&) const {
             return ReplicaType::DISK;
         }
@@ -471,7 +535,7 @@ class Replica {
     struct Descriptor {
         ReplicaID id;
         std::variant<MemoryDescriptor, NoFDescriptor, DiskDescriptor,
-                     LocalDiskDescriptor>
+                     LocalDiskDescriptor, GdsSsdDescriptor>
             descriptor_variant;
         ReplicaStatus status;
         YLT_REFL(Descriptor, id, descriptor_variant, status);
@@ -497,8 +561,18 @@ class Replica {
             return std::holds_alternative<DiskDescriptor>(descriptor_variant);
         }
 
+        bool is_gds_ssd_replica() noexcept {
+            return std::holds_alternative<GdsSsdDescriptor>(
+                descriptor_variant);
+        }
+
         bool is_disk_replica() const noexcept {
             return std::holds_alternative<DiskDescriptor>(descriptor_variant);
+        }
+
+        bool is_gds_ssd_replica() const noexcept {
+            return std::holds_alternative<GdsSsdDescriptor>(
+                descriptor_variant);
         }
 
         bool is_local_disk_replica() noexcept {
@@ -533,6 +607,14 @@ class Replica {
             throw std::runtime_error("Expected DiskDescriptor");
         }
 
+        GdsSsdDescriptor& get_gds_ssd_descriptor() {
+            if (auto* desc =
+                    std::get_if<GdsSsdDescriptor>(&descriptor_variant)) {
+                return *desc;
+            }
+            throw std::runtime_error("Expected GdsSsdDescriptor");
+        }
+
         LocalDiskDescriptor& get_local_disk_descriptor() {
             if (auto* desc =
                     std::get_if<LocalDiskDescriptor>(&descriptor_variant)) {
@@ -563,6 +645,14 @@ class Replica {
             throw std::runtime_error("Expected DiskDescriptor");
         }
 
+        const GdsSsdDescriptor& get_gds_ssd_descriptor() const {
+            if (auto* desc =
+                    std::get_if<GdsSsdDescriptor>(&descriptor_variant)) {
+                return *desc;
+            }
+            throw std::runtime_error("Expected GdsSsdDescriptor");
+        }
+
         const LocalDiskDescriptor& get_local_disk_descriptor() const {
             if (auto* desc =
                     std::get_if<LocalDiskDescriptor>(&descriptor_variant)) {
@@ -577,7 +667,7 @@ class Replica {
 
     ReplicaID id_;
     std::variant<MemoryReplicaData, NoFReplicaData, DiskReplicaData,
-                 LocalDiskReplicaData>
+                 LocalDiskReplicaData, GdsSsdReplicaData>
         data_;
     ReplicaStatus status_{ReplicaStatus::UNDEFINED};
 
@@ -615,6 +705,16 @@ inline Replica::Descriptor Replica::get_descriptor() const {
             LOG(ERROR) << "Trying to get invalid nof replica descriptor";
         }
         desc.descriptor_variant = std::move(nof_desc);
+    } else if (is_gds_ssd_replica()) {
+        const auto& gds_data = std::get<GdsSsdReplicaData>(data_);
+        GdsSsdDescriptor gds_desc;
+        gds_desc.segment_id = gds_data.meta.segment_id;
+        gds_desc.segment_name = gds_data.meta.segment_name;
+        gds_desc.offset = gds_data.meta.offset;
+        gds_desc.object_size = gds_data.meta.object_size;
+        gds_desc.block_size = gds_data.meta.block_size;
+        gds_desc.allocation_alignment = gds_data.meta.allocation_alignment;
+        desc.descriptor_variant = std::move(gds_desc);
     } else if (is_disk_replica()) {
         const auto& disk_data = std::get<DiskReplicaData>(data_);
         DiskDescriptor disk_desc;
@@ -653,6 +753,10 @@ inline std::vector<std::optional<std::string>> Replica::get_segment_names()
             segment_names.push_back(std::nullopt);
         }
         return segment_names;
+    } else if (is_gds_ssd_replica()) {
+        const auto& gds_data = std::get<GdsSsdReplicaData>(data_);
+        return std::vector<std::optional<std::string>>{
+            gds_data.meta.segment_name};
     }
     return std::vector<std::optional<std::string>>();
 }
@@ -675,6 +779,12 @@ inline std::ostream& operator<<(std::ostream& os, const Replica& replica) {
             os << *nof_data.buffer;
         }
         os << "]";
+    } else if (replica.is_gds_ssd_replica()) {
+        const auto& gds_data = std::get<GdsSsdReplicaData>(replica.data_);
+        os << "type: GDS_SSD, segment_id: " << gds_data.meta.segment_id
+           << ", segment_name: " << gds_data.meta.segment_name
+           << ", offset: " << gds_data.meta.offset
+           << ", object_size: " << gds_data.meta.object_size;
     } else if (replica.is_disk_replica()) {
         const auto& disk_data = std::get<DiskReplicaData>(replica.data_);
         os << "type: DISK, file_path: " << disk_data.file_path

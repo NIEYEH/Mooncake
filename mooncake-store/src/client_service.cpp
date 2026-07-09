@@ -129,10 +129,13 @@ std::optional<ContiguousSliceRange> GetContiguousSliceRange(
 struct ReplicaTransferSummary {
     size_t allocated_memory_replicas = 0;
     size_t allocated_nof_replicas = 0;
+    size_t allocated_gds_replicas = 0;
     size_t successful_memory_transfers = 0;
     size_t successful_nof_transfers = 0;
+    size_t successful_gds_transfers = 0;
     size_t failed_memory_transfers = 0;
     size_t failed_nof_transfers = 0;
+    size_t failed_gds_transfers = 0;
     ErrorCode first_error = ErrorCode::OK;
 
     void RecordAllocatedReplica(const Replica::Descriptor& replica) {
@@ -140,6 +143,8 @@ struct ReplicaTransferSummary {
             ++allocated_memory_replicas;
         } else if (replica.is_nof_replica()) {
             ++allocated_nof_replicas;
+        } else if (replica.is_gds_ssd_replica()) {
+            ++allocated_gds_replicas;
         }
     }
 
@@ -148,6 +153,8 @@ struct ReplicaTransferSummary {
             ++successful_memory_transfers;
         } else if (replica_type == ReplicaType::NOF_SSD) {
             ++successful_nof_transfers;
+        } else if (replica_type == ReplicaType::GDS_SSD) {
+            ++successful_gds_transfers;
         }
     }
 
@@ -156,6 +163,8 @@ struct ReplicaTransferSummary {
             ++failed_memory_transfers;
         } else if (replica_type == ReplicaType::NOF_SSD) {
             ++failed_nof_transfers;
+        } else if (replica_type == ReplicaType::GDS_SSD) {
+            ++failed_gds_transfers;
         }
         if (first_error == ErrorCode::OK) {
             first_error = error;
@@ -165,19 +174,21 @@ struct ReplicaTransferSummary {
 
 bool HasExpectedReplicaAllocation(const ReplicateConfig& config,
                                   const ReplicaTransferSummary& summary) {
-    if (config.nof_replica_num == 0) {
-        return summary.allocated_memory_replicas > 0;
+    if (config.nof_replica_num == 0 && config.gds_replica_num == 0) {
+        return summary.allocated_memory_replicas == config.replica_num &&
+               summary.allocated_memory_replicas > 0;
     }
     if (DetermineReplicaWriteMode(config) ==
-        ReplicaWriteMode::FLEXIBLE_DUAL_REPLICA) {
+            ReplicaWriteMode::FLEXIBLE_DUAL_REPLICA &&
+        config.gds_replica_num == 0) {
         return summary.allocated_memory_replicas +
                    summary.allocated_nof_replicas >
                0;
     }
     return summary.allocated_memory_replicas == config.replica_num &&
-           summary.allocated_nof_replicas == config.nof_replica_num;
+           summary.allocated_nof_replicas == config.nof_replica_num &&
+           summary.allocated_gds_replicas == config.gds_replica_num;
 }
-
 // success describes whether the overall put should succeed. Reliable modes
 // require all allocated replicas to complete. Flexible dual-replica mode only
 // requires one replica type to succeed, so success may be true while
@@ -201,8 +212,11 @@ FinalizeDecision DetermineFinalizeDecision(
                 summary.allocated_memory_replicas &&
             summary.successful_nof_transfers ==
                 summary.allocated_nof_replicas &&
+            summary.successful_gds_transfers ==
+                summary.allocated_gds_replicas &&
             summary.failed_memory_transfers == 0 &&
-            summary.failed_nof_transfers == 0;
+            summary.failed_nof_transfers == 0 &&
+            summary.failed_gds_transfers == 0;
         if (allocation_satisfied && all_transfers_succeeded) {
             return {.end_type = ReplicaType::ALL,
                     .revoke_type = std::nullopt,
@@ -1588,11 +1602,14 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
     }
 
     for (const auto& replica : start_result.value()) {
-        if (replica.is_memory_replica() || replica.is_nof_replica()) {
+        if (replica.is_memory_replica() || replica.is_nof_replica() ||
+            replica.is_gds_ssd_replica()) {
             // Transfer data using allocated handles from all replicas
             const auto replica_type = replica.is_memory_replica()
                                           ? ReplicaType::MEMORY
-                                          : ReplicaType::NOF_SSD;
+                                          : (replica.is_nof_replica()
+                                                 ? ReplicaType::NOF_SSD
+                                                 : ReplicaType::GDS_SSD);
             ErrorCode transfer_err = TransferWrite(replica, slices);
             if (transfer_err != ErrorCode::OK) {
                 transfer_summary.RecordFailure(replica_type, transfer_err);
@@ -1798,6 +1815,7 @@ class PutOperation {
 
     size_t requested_memory_replicas = 0;
     size_t requested_nof_replicas = 0;
+    size_t requested_gds_replicas = 0;
     ReplicaTransferSummary transfer_summary;
 
     // Error context for debugging
@@ -1850,12 +1868,14 @@ class PutOperation {
     void InitializeRequestedReplicas(const ReplicateConfig& config) {
         requested_memory_replicas = config.replica_num;
         requested_nof_replicas = config.nof_replica_num;
+        requested_gds_replicas = config.gds_replica_num;
     }
 
     ReplicateConfig ToReplicateConfig() const {
         ReplicateConfig config;
         config.replica_num = requested_memory_replicas;
         config.nof_replica_num = requested_nof_replicas;
+        config.gds_replica_num = requested_gds_replicas;
         return config;
     }
 
@@ -2045,10 +2065,13 @@ void Client::SubmitTransfers(std::vector<PutOperation>& ops) {
         for (size_t replica_idx = 0; replica_idx < op.replicas.size();
              ++replica_idx) {
             const auto& replica = op.replicas[replica_idx];
-            if (replica.is_memory_replica() || replica.is_nof_replica()) {
+            if (replica.is_memory_replica() || replica.is_nof_replica() ||
+                replica.is_gds_ssd_replica()) {
                 const auto replica_type = replica.is_memory_replica()
                                               ? ReplicaType::MEMORY
-                                              : ReplicaType::NOF_SSD;
+                                              : (replica.is_nof_replica()
+                                                     ? ReplicaType::NOF_SSD
+                                                     : ReplicaType::GDS_SSD);
                 std::optional<TransferFuture> submit_result;
                 if (replica.is_nof_replica()) {
                     auto contiguous_range = GetContiguousSliceRange(op.slices);
@@ -2115,8 +2138,10 @@ void Client::WaitForTransfers(std::vector<PutOperation>& ops) {
         VLOG(1) << "Transfers finished for key " << op.key << ", success(mem="
                 << op.transfer_summary.successful_memory_transfers
                 << ", nof=" << op.transfer_summary.successful_nof_transfers
+                << ", gds=" << op.transfer_summary.successful_gds_transfers
                 << "), fail(mem=" << op.transfer_summary.failed_memory_transfers
-                << ", nof=" << op.transfer_summary.failed_nof_transfers << ")";
+                << ", nof=" << op.transfer_summary.failed_nof_transfers
+                << ", gds=" << op.transfer_summary.failed_gds_transfers << ")";
     }
 }
 
@@ -2129,9 +2154,11 @@ void Client::FinalizeBatchPut(std::vector<PutOperation>& ops) {
     BatchFinalizeGroup end_all_group;
     BatchFinalizeGroup end_memory_group;
     BatchFinalizeGroup end_nof_group;
+    BatchFinalizeGroup end_gds_group;
     BatchFinalizeGroup revoke_all_group;
     BatchFinalizeGroup revoke_memory_group;
     BatchFinalizeGroup revoke_nof_group;
+    BatchFinalizeGroup revoke_gds_group;
 
     std::vector<size_t> pending_finalize_actions(ops.size(), 0);
     std::vector<bool> should_succeed(ops.size(), false);
@@ -2164,6 +2191,11 @@ void Client::FinalizeBatchPut(std::vector<PutOperation>& ops) {
                     break;
                 case ReplicaType::NOF_SSD:
                     add_group_entry(is_end ? end_nof_group : revoke_nof_group,
+                                    key, index);
+                    ++pending_finalize_actions[index];
+                    break;
+                case ReplicaType::GDS_SSD:
+                    add_group_entry(is_end ? end_gds_group : revoke_gds_group,
                                     key, index);
                     ++pending_finalize_actions[index];
                     break;
@@ -2263,9 +2295,11 @@ void Client::FinalizeBatchPut(std::vector<PutOperation>& ops) {
     process_end_group(end_all_group, ReplicaType::ALL);
     process_end_group(end_memory_group, ReplicaType::MEMORY);
     process_end_group(end_nof_group, ReplicaType::NOF_SSD);
+    process_end_group(end_gds_group, ReplicaType::GDS_SSD);
     process_revoke_group(revoke_all_group, ReplicaType::ALL);
     process_revoke_group(revoke_memory_group, ReplicaType::MEMORY);
     process_revoke_group(revoke_nof_group, ReplicaType::NOF_SSD);
+    process_revoke_group(revoke_gds_group, ReplicaType::GDS_SSD);
 
     auto append_finalize_error_context = [&](PutOperation& op, size_t index) {
         if (finalize_rpc_errors[index].has_value()) {
@@ -3512,8 +3546,10 @@ ErrorCode Client::TransferRead(const Replica::Descriptor& replica_descriptor,
     } else if (replica_descriptor.is_nof_replica()) {
         auto& nof_desc = replica_descriptor.get_nof_descriptor();
         total_size = nof_desc.buffer_descriptor.size_;
-    } else if (replica_descriptor.is_disk_replica()) {
-        auto& disk_desc = replica_descriptor.get_disk_descriptor();
+    } else if (replica_descriptor.is_gds_ssd_replica()) {
+        auto& gds_desc = replica_descriptor.get_gds_ssd_descriptor();
+        total_size = gds_desc.object_size;
+    } else if (replica_descriptor.is_disk_replica()) {        auto& disk_desc = replica_descriptor.get_disk_descriptor();
         total_size = disk_desc.object_size;
     } else if (replica_descriptor.is_local_disk_replica()) {
         auto& disk_desc = replica_descriptor.get_local_disk_descriptor();
@@ -3907,7 +3943,7 @@ tl::expected<Replica::Descriptor, ErrorCode> Client::GetPreferredReplica(
     if (replica_list.empty()) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
-    if (mounted_segments_.empty() || replica_list.size() == 1) {
+    if (replica_list.size() == 1) {
         return replica_list[0];
     }
 
@@ -3931,6 +3967,16 @@ tl::expected<Replica::Descriptor, ErrorCode> Client::GetPreferredReplica(
         }
     }
 
+    // Then prefer GDS SSD replicas that the master resolved for this client.
+    for (const auto& rep : replica_list) {
+        if (rep.is_gds_ssd_replica()) {
+            const auto& gds_desc = rep.get_gds_ssd_descriptor();
+            if (!gds_desc.segment_uri.empty()) {
+                return rep;
+            }
+        }
+    }
+
     // Then prefer local NOF_SSD replicas
     for (const auto& rep : replica_list) {
         if (rep.is_nof_replica()) {
@@ -3945,7 +3991,6 @@ tl::expected<Replica::Descriptor, ErrorCode> Client::GetPreferredReplica(
 
     return replica_list[0];
 }
-
 size_t Client::GetLocalHotCacheSizeFromEnv() {
     if (const char* ev_size = std::getenv("MC_STORE_LOCAL_HOT_CACHE_SIZE")) {
         std::string ev_size_str(ev_size);

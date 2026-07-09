@@ -133,6 +133,13 @@ class MasterService {
     auto MountNoFSegment(const NoFSegment& segment, const UUID& client_id)
         -> tl::expected<void, ErrorCode>;
 
+    auto MountGdsSsdSegment(const GdsSsdSegment& segment)
+        -> tl::expected<void, ErrorCode>;
+
+    auto RegisterGdsSsdAccessor(const UUID& segment_id,
+                                const GdsSsdAccessor& accessor)
+        -> tl::expected<void, ErrorCode>;
+
     /**
      * @brief Re-mount segments, invoked when the client is the first time to
      * connect to the master or the client Ping TTL is expired and need
@@ -216,6 +223,9 @@ class MasterService {
      */
     auto GetAllNoFSegments()
         -> tl::expected<std::vector<NoFSegment>, ErrorCode>;
+
+    auto GetAllGdsSsdSegments()
+        -> tl::expected<std::vector<GdsSsdSegment>, ErrorCode>;
 
     /**
      * @brief Query mounted NoF segments by segment name and return their
@@ -319,14 +329,16 @@ class MasterService {
      * @return ErrorCode::OK on success, ErrorCode::REPLICA_IS_NOT_READY if not
      * ready
      */
-    auto GetReplicaList(const std::string& key, const std::string& tenant_id)
+    auto GetReplicaList(const UUID& client_id, const std::string& key,
+                        const std::string& tenant_id)
         -> tl::expected<GetReplicaListResponse, ErrorCode>;
 
     /**
      * @brief Get replica lists for a batch of objects.
      */
     std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
-    BatchGetReplicaList(const std::vector<std::string>& keys,
+    BatchGetReplicaList(const UUID& client_id,
+                        const std::vector<std::string>& keys,
                         const std::string& tenant_id);
 
     /**
@@ -1037,7 +1049,8 @@ class MasterService {
             return EraseReplicas([replica_type](const Replica& replica) {
                 if (replica_type == ReplicaType::ALL) {
                     return replica.is_memory_replica() ||
-                           replica.is_nof_replica();
+                           replica.is_nof_replica() ||
+                           replica.is_gds_ssd_replica();
                 }
                 return replica.type() == replica_type;
             });
@@ -1399,6 +1412,10 @@ class MasterService {
         std::unordered_map<std::string, ObjectMetadata>::iterator it,
         const std::string& tenant_id);
     void ReleaseLocalDiskUsage(const std::vector<Replica>& replicas);
+    void ReleaseGdsSsdAllocations(const std::vector<Replica>& replicas);
+    auto BuildReplicaDescriptorForClient(const Replica& replica,
+                                         const UUID& client_id)
+        -> tl::expected<Replica::Descriptor, ErrorCode>;
     enum class QuotaEraseMode {
         kFull,
         kPreserveOld,
@@ -1982,6 +1999,7 @@ class MasterService {
     // Segment management
     SegmentManager segment_manager_;
     NoFSegmentManager nof_segment_manager_;
+    GdsSsdSegmentManager gds_ssd_segment_manager_;
     BufferAllocatorType memory_allocator_type_;
     const AllocationStrategyType allocation_strategy_type_;
     std::shared_ptr<AllocationStrategy> allocation_strategy_;
@@ -2034,6 +2052,8 @@ class MasterService {
         }
 
         uint64_t memSize() const { return mem_size_; }
+
+        const std::vector<Replica>& replicas() const { return replicas_; }
 
         bool isExpired(const std::chrono::system_clock::time_point& now) const {
             return ttl_ <= now;

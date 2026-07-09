@@ -118,16 +118,20 @@ uint64_t SaturatingMultiply(uint64_t lhs, uint64_t rhs) {
 
 bool HasExpectedReplicaAllocation(const ReplicateConfig& config,
                                   size_t allocated_memory_replicas,
-                                  size_t allocated_nof_replicas) {
-    if (config.nof_replica_num == 0) {
-        return allocated_memory_replicas > 0;
+                                  size_t allocated_nof_replicas,
+                                  size_t allocated_gds_replicas) {
+    if (config.nof_replica_num == 0 && config.gds_replica_num == 0) {
+        return allocated_memory_replicas == config.replica_num &&
+               allocated_memory_replicas > 0;
     }
     if (DetermineReplicaWriteMode(config) ==
-        ReplicaWriteMode::FLEXIBLE_DUAL_REPLICA) {
+            ReplicaWriteMode::FLEXIBLE_DUAL_REPLICA &&
+        config.gds_replica_num == 0) {
         return allocated_memory_replicas + allocated_nof_replicas > 0;
     }
     return allocated_memory_replicas == config.replica_num &&
-           allocated_nof_replicas == config.nof_replica_num;
+           allocated_nof_replicas == config.nof_replica_num &&
+           allocated_gds_replicas == config.gds_replica_num;
 }
 
 bool IsLazyEmptyTenantQuotaState(const TenantQuotaState& state) {
@@ -822,6 +826,36 @@ auto MasterService::MountNoFSegment(const NoFSegment& segment,
 #endif
 }
 
+auto MasterService::MountGdsSsdSegment(const GdsSsdSegment& segment)
+    -> tl::expected<void, ErrorCode> {
+    auto gds_access = gds_ssd_segment_manager_.getGdsSsdSegmentAccess();
+    LOG(INFO) << "GDS SSD segment mount: action=mount_segment, segment_name="
+              << segment.name << ", namespace_id=" << segment.namespace_id;
+
+    auto err = gds_access.MountSegment(segment);
+    if (err == ErrorCode::SEGMENT_ALREADY_EXISTS) {
+        return {};
+    }
+    if (err != ErrorCode::OK) {
+        return tl::make_unexpected(err);
+    }
+    return {};
+}
+
+auto MasterService::RegisterGdsSsdAccessor(
+    const UUID& segment_id, const GdsSsdAccessor& accessor)
+    -> tl::expected<void, ErrorCode> {
+    auto gds_access = gds_ssd_segment_manager_.getGdsSsdSegmentAccess();
+    LOG(INFO) << "GDS SSD accessor register: segment_id=" << segment_id
+              << ", client_host=" << accessor.client_host
+              << ", segment_uri=" << accessor.segment_uri;
+
+    auto err = gds_access.RegisterAccessor(segment_id, accessor);
+    if (err != ErrorCode::OK) {
+        return tl::make_unexpected(err);
+    }
+    return {};
+}
 auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
                                    const UUID& client_id)
     -> tl::expected<void, ErrorCode> {
@@ -1694,6 +1728,7 @@ size_t MasterService::EraseReplicasWithCacheTotalAccounting(
     // Release SSD/local-disk usage for any local-disk replicas being removed.
     // No-op for memory/noF replicas, so it is safe to call unconditionally.
     ReleaseLocalDiskUsage(erased_replicas);
+    ReleaseGdsSsdAllocations(erased_replicas);
     return erased_replicas.size();
 }
 
@@ -1747,6 +1782,7 @@ MasterService::EraseMetadata(
     ErasePromotionTaskIfPresent(tenant_state, key, tenant_id);
 
     ReleaseLocalDiskUsage(metadata.GetAllReplicas());
+    ReleaseGdsSsdAllocations(metadata.GetAllReplicas());
     AccountCacheTotalRemoval(metadata);
     switch (quota_mode) {
         case QuotaEraseMode::kFull:
@@ -1770,6 +1806,53 @@ MasterService::EraseMetadata(
     }
     UnregisterGroupMember(tenant_state, tenant_id, key, group_id);
     return next;
+}
+
+auto MasterService::BuildReplicaDescriptorForClient(const Replica& replica,
+                                                     const UUID& client_id)
+    -> tl::expected<Replica::Descriptor, ErrorCode> {
+    if (!replica.is_gds_ssd_replica()) {
+        return replica.get_descriptor();
+    }
+
+    GdsSsdDescriptor resolved_descriptor;
+    auto gds_access = gds_ssd_segment_manager_.getGdsSsdSegmentAccess();
+    auto err = gds_access.ResolveDescriptor(
+        replica.get_gds_ssd_meta(), GetClientHostId(client_id),
+        resolved_descriptor);
+    if (err != ErrorCode::OK) {
+        return tl::make_unexpected(err);
+    }
+
+    auto descriptor = replica.get_descriptor();
+    descriptor.descriptor_variant = std::move(resolved_descriptor);
+    return descriptor;
+}
+
+void MasterService::ReleaseGdsSsdAllocations(
+    const std::vector<Replica>& replicas) {
+    std::vector<GdsSsdReplicaMeta> allocations;
+    allocations.reserve(replicas.size());
+    for (const auto& replica : replicas) {
+        if (replica.is_gds_ssd_replica()) {
+            allocations.push_back(replica.get_gds_ssd_meta());
+        }
+    }
+    if (allocations.empty()) {
+        return;
+    }
+
+    auto gds_access = gds_ssd_segment_manager_.getGdsSsdSegmentAccess();
+    for (const auto& allocation : allocations) {
+        auto err = gds_access.ReleaseReplica(allocation);
+        if (err != ErrorCode::OK) {
+            LOG(WARNING) << "GDS SSD allocation release failed: segment_id="
+                         << allocation.segment_id
+                         << ", segment_name=" << allocation.segment_name
+                         << ", offset=" << allocation.offset
+                         << ", error=" << err;
+        }
+    }
 }
 
 void MasterService::ReleaseLocalDiskUsage(
@@ -1800,7 +1883,6 @@ void MasterService::ReleaseLocalDiskUsage(
         }
     }
 }
-
 void MasterService::RebuildGroupRoutingIndex() {
     std::unordered_map<std::string, std::string> rebuilt_group_ids;
     std::unordered_set<std::string> groups_needing_refresh;
@@ -2188,6 +2270,18 @@ auto MasterService::GetAllNoFSegments()
     return result;
 }
 
+auto MasterService::GetAllGdsSsdSegments()
+    -> tl::expected<std::vector<GdsSsdSegment>, ErrorCode> {
+    std::vector<MountedGdsSsdSegmentSnapshot> mounted_segments;
+    gds_ssd_segment_manager_.GetMountedSegmentsSnapshot(mounted_segments);
+
+    std::vector<GdsSsdSegment> result;
+    result.reserve(mounted_segments.size());
+    for (const auto& segment : mounted_segments) {
+        result.push_back(segment.segment);
+    }
+    return result;
+}
 auto MasterService::GetNoFSegmentsByName(const std::string& segment_name)
     -> tl::expected<std::vector<NoFSegmentOwnerInfo>, ErrorCode> {
     return nof_segment_manager_.GetSegmentsByName(segment_name);
@@ -2493,7 +2587,8 @@ auto MasterService::GetReplicaListByRegex(const std::string& regex_pattern,
     return results;
 }
 
-auto MasterService::GetReplicaList(const std::string& key,
+auto MasterService::GetReplicaList(const UUID& client_id,
+                                   const std::string& key,
                                    const std::string& tenant_id)
     -> tl::expected<GetReplicaListResponse, ErrorCode> {
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
@@ -2513,14 +2608,29 @@ auto MasterService::GetReplicaList(const std::string& key,
         const auto& metadata = accessor.Get();
 
         std::vector<Replica::Descriptor> replica_list;
+        size_t completed_replica_count = 0;
+        size_t unresolved_gds_replica_count = 0;
         metadata.VisitReplicas(
-            &Replica::fn_is_completed, [&replica_list](const Replica& replica) {
-                replica_list.emplace_back(replica.get_descriptor());
+            &Replica::fn_is_completed,
+            [this, &client_id, &replica_list, &completed_replica_count,
+             &unresolved_gds_replica_count](const Replica& replica) {
+                ++completed_replica_count;
+                auto descriptor_result =
+                    BuildReplicaDescriptorForClient(replica, client_id);
+                if (descriptor_result) {
+                    replica_list.emplace_back(
+                        std::move(descriptor_result.value()));
+                } else if (replica.is_gds_ssd_replica()) {
+                    ++unresolved_gds_replica_count;
+                }
             });
 
         if (replica_list.empty()) {
             LOG(WARNING) << "key=" << key << ", error=replica_not_ready";
-            return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
+            return tl::make_unexpected(
+                completed_replica_count > 0 && unresolved_gds_replica_count > 0
+                    ? ErrorCode::NO_AVAILABLE_HANDLE
+                    : ErrorCode::REPLICA_IS_NOT_READY);
         }
 
         // TODO: NoF SSD support (ranhaojia)
@@ -2568,7 +2678,8 @@ auto MasterService::GetReplicaList(const std::string& key,
 }
 
 std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
-MasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
+MasterService::BatchGetReplicaList(const UUID& client_id,
+                                   const std::vector<std::string>& keys,
                                    const std::string& tenant_id) {
     using GetResult = tl::expected<GetReplicaListResponse, ErrorCode>;
 
@@ -2637,17 +2748,33 @@ MasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
 
                 const auto& metadata = metadata_it->second;
                 std::vector<Replica::Descriptor> replica_list;
+                size_t completed_replica_count = 0;
+                size_t unresolved_gds_replica_count = 0;
                 metadata.VisitReplicas(
                     &Replica::fn_is_completed,
-                    [&replica_list](const Replica& replica) {
-                        replica_list.emplace_back(replica.get_descriptor());
+                    [this, &client_id, &replica_list,
+                     &completed_replica_count,
+                     &unresolved_gds_replica_count](const Replica& replica) {
+                        ++completed_replica_count;
+                        auto descriptor_result =
+                            BuildReplicaDescriptorForClient(replica,
+                                                            client_id);
+                        if (descriptor_result) {
+                            replica_list.emplace_back(
+                                std::move(descriptor_result.value()));
+                        } else if (replica.is_gds_ssd_replica()) {
+                            ++unresolved_gds_replica_count;
+                        }
                     });
 
                 if (replica_list.empty()) {
                     LOG(WARNING)
                         << "key=" << key << ", error=replica_not_ready";
-                    results[original_idx] =
-                        tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
+                    results[original_idx] = tl::make_unexpected(
+                        completed_replica_count > 0 &&
+                                unresolved_gds_replica_count > 0
+                            ? ErrorCode::NO_AVAILABLE_HANDLE
+                            : ErrorCode::REPLICA_IS_NOT_READY);
                     continue;
                 }
 
@@ -2719,6 +2846,7 @@ auto MasterService::AllocateAndInsertMetadata(
     const auto write_mode = DetermineReplicaWriteMode(config);
     size_t allocated_memory_replicas = 0;
     size_t allocated_nof_replicas = 0;
+    size_t allocated_gds_replicas = 0;
     if (config.replica_num > 0) {
         const bool use_local_first =
             allocation_strategy_type_ == AllocationStrategyType::LOCAL_FIRST &&
@@ -2831,12 +2959,52 @@ auto MasterService::AllocateAndInsertMetadata(
     }
 #endif
 
+    if (config.gds_replica_num > 0) {
+        if (gds_ssd_segment_manager_.getMountedSegmentCount() == 0) {
+            VLOG(1) << "Failed to allocate GDS SSD replicas for key=" << key
+                    << ", error=no_mounted_gds_ssd_segments";
+            MasterMetricManager::instance().inc_put_start_alloc_failures();
+            abort_reserved_quota();
+            return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+        }
+
+        auto gds_access = gds_ssd_segment_manager_.getGdsSsdSegmentAccess();
+        std::set<std::string> excluded_gds_segments;
+        ErrorCode first_gds_error = ErrorCode::OK;
+        while (allocated_gds_replicas < config.gds_replica_num) {
+            auto allocation_result = gds_access.AllocateReplica(
+                static_cast<size_t>(value_length),
+                config.preferred_gds_segments, excluded_gds_segments);
+            if (!allocation_result) {
+                first_gds_error = allocation_result.error();
+                break;
+            }
+
+            GdsSsdReplicaMeta meta = std::move(allocation_result.value());
+            excluded_gds_segments.insert(meta.segment_name);
+            replicas.emplace_back(std::move(meta), ReplicaStatus::PROCESSING);
+            ++allocated_gds_replicas;
+        }
+
+        if (allocated_gds_replicas != config.gds_replica_num) {
+            ReleaseGdsSsdAllocations(replicas);
+            MasterMetricManager::instance().inc_put_start_alloc_failures();
+            abort_reserved_quota();
+            if (first_gds_error == ErrorCode::INVALID_PARAMS) {
+                return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+            }
+            return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+        }
+    }
     if (!HasExpectedReplicaAllocation(config, allocated_memory_replicas,
-                                      allocated_nof_replicas)) {
+                                      allocated_nof_replicas,
+                                      allocated_gds_replicas)) {
         if ((config.replica_num > 0 &&
              allocated_memory_replicas != config.replica_num) ||
             (config.nof_replica_num > 0 &&
-             allocated_nof_replicas != config.nof_replica_num)) {
+             allocated_nof_replicas != config.nof_replica_num) ||
+            (config.gds_replica_num > 0 &&
+             allocated_gds_replicas != config.gds_replica_num)) {
             MasterMetricManager::instance().inc_put_start_alloc_failures();
             if (config.replica_num > 0 &&
                 allocated_memory_replicas != config.replica_num) {
@@ -2851,7 +3019,10 @@ auto MasterService::AllocateAndInsertMetadata(
                 << key << ", requested_memory_replicas=" << config.replica_num
                 << ", allocated_memory_replicas=" << allocated_memory_replicas
                 << ", requested_nof_replicas=" << config.nof_replica_num
-                << ", allocated_nof_replicas=" << allocated_nof_replicas;
+                << ", allocated_nof_replicas=" << allocated_nof_replicas
+                << ", requested_gds_replicas=" << config.gds_replica_num
+                << ", allocated_gds_replicas=" << allocated_gds_replicas;
+        ReleaseGdsSsdAllocations(replicas);
         abort_reserved_quota();
         return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
     }
@@ -2869,7 +3040,16 @@ auto MasterService::AllocateAndInsertMetadata(
     VLOG(1) << "PutStart, create replicas: client_id=" << client_id
             << ", key=" << key << ", value_length=" << value_length;
     for (const auto& replica : replicas) {
-        const auto desc = replica.get_descriptor();
+        auto descriptor_result = BuildReplicaDescriptorForClient(replica,
+                                                                 client_id);
+        if (!descriptor_result) {
+            LOG(WARNING) << "Failed to resolve replica descriptor for key="
+                         << key << ", error=" << descriptor_result.error();
+            ReleaseGdsSsdAllocations(replicas);
+            abort_reserved_quota();
+            return tl::make_unexpected(descriptor_result.error());
+        }
+        const auto desc = std::move(descriptor_result.value());
         replica_list.emplace_back(desc);
 
         if (replica.is_memory_replica()) {
@@ -2884,6 +3064,13 @@ auto MasterService::AllocateAndInsertMetadata(
                     << nof_desc.buffer_descriptor.buffer_address_
                     << ", transport_endpoint="
                     << nof_desc.buffer_descriptor.transport_endpoint_;
+        } else if (replica.is_gds_ssd_replica()) {
+            const auto& gds_desc = desc.get_gds_ssd_descriptor();
+            VLOG(1) << "Replica #" << ++i
+                    << ": segment_name=" << gds_desc.segment_name
+                    << ", segment_uri=" << gds_desc.segment_uri
+                    << ", offset=" << gds_desc.offset
+                    << ", object_size=" << gds_desc.object_size;
         }
     }
 
@@ -2894,6 +3081,7 @@ auto MasterService::AllocateAndInsertMetadata(
                               config.data_type, group_id, tenant_id, key));
     if (!inserted) {
         LOG(INFO) << "key=" << key << ", info=object_already_exists";
+        ReleaseGdsSsdAllocations(replicas);
         abort_reserved_quota();
         return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
     }
@@ -2915,10 +3103,12 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
         return tl::make_unexpected(normalized_tenant_result.error());
     }
     const ObjectIdentity object_id{normalized_tenant_result.value(), key};
-    if ((config.replica_num == 0 && config.nof_replica_num == 0) ||
+    if ((config.replica_num == 0 && config.nof_replica_num == 0 &&
+         config.gds_replica_num == 0) ||
         key.empty() || slice_length == 0) {
         LOG(ERROR) << "key=" << key << ", replica_num=" << config.replica_num
                    << ", nof_replica_num=" << config.nof_replica_num
+                   << ", gds_replica_num=" << config.gds_replica_num
                    << ", slice_length=" << slice_length
                    << ", key_size=" << key.size() << ", error=invalid_params";
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
@@ -3099,7 +3289,8 @@ auto MasterService::PutEnd(const UUID& client_id, const std::string& key,
                 return (replica.is_memory_replica() &&
                         !replica.has_invalid_mem_handle()) ||
                        (replica.is_nof_replica() &&
-                        !replica.has_invalid_nof_handle());
+                        !replica.has_invalid_nof_handle()) ||
+                       replica.is_gds_ssd_replica();
             }
             if (replica_type == ReplicaType::MEMORY) {
                 return replica.is_memory_replica() &&
@@ -3257,7 +3448,8 @@ auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
     auto processing_rep = metadata.GetFirstReplica([replica_type](
                                                        const Replica& replica) {
         if (replica_type == ReplicaType::ALL) {
-            return (replica.is_memory_replica() || replica.is_nof_replica()) &&
+            return (replica.is_memory_replica() || replica.is_nof_replica() ||
+                    replica.is_gds_ssd_replica()) &&
                    !replica.is_processing();
         }
         return replica.type() == replica_type && !replica.is_processing();
@@ -3272,7 +3464,8 @@ auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
     EraseReplicasWithCacheTotalAccounting(
         metadata, [replica_type](const Replica& replica) {
             if (replica_type == ReplicaType::ALL) {
-                return replica.is_memory_replica() || replica.is_nof_replica();
+                return replica.is_memory_replica() || replica.is_nof_replica() ||
+                       replica.is_gds_ssd_replica();
             }
             return replica.type() == replica_type;
         });
@@ -3346,10 +3539,12 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
     }
     const ObjectIdentity object_id{normalized_tenant_result.value(), key};
     // --- Parameter validation (same as PutStart) ---
-    if ((config.replica_num == 0 && config.nof_replica_num == 0) ||
+    if ((config.replica_num == 0 && config.nof_replica_num == 0 &&
+         config.gds_replica_num == 0) ||
         key.empty() || slice_length == 0) {
         LOG(ERROR) << "key=" << key << ", replica_num=" << config.replica_num
                    << ", nof_replica_num=" << config.nof_replica_num
+                   << ", gds_replica_num=" << config.gds_replica_num
                    << ", slice_length=" << slice_length
                    << ", key_size=" << key.size() << ", error=invalid_params";
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
@@ -3568,7 +3763,15 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                     const auto& all_replicas = metadata.GetAllReplicas();
                     replica_list.reserve(all_replicas.size());
                     for (const auto& replica : all_replicas) {
-                        replica_list.emplace_back(replica.get_descriptor());
+                        auto descriptor_result =
+                            BuildReplicaDescriptorForClient(replica,
+                                                            client_id);
+                        if (!descriptor_result) {
+                            return tl::make_unexpected(
+                                descriptor_result.error());
+                        }
+                        replica_list.emplace_back(
+                            std::move(descriptor_result.value()));
                     }
 
                     VLOG(1) << "key=" << key
@@ -5741,10 +5944,13 @@ uint64_t MasterService::ReleaseExpiredDiscardedReplicas(
     uint64_t released_cnt = 0;
     std::lock_guard lock(discarded_replicas_mutex_);
     discarded_replicas_.remove_if(
-        [&now, &released_cnt](const DiscardedReplicas& item) {
+        [this, &now, &released_cnt](const DiscardedReplicas& item) {
             const bool expired = item.isExpired(now);
             if (expired && item.memSize() > 0) {
                 released_cnt++;
+            }
+            if (expired) {
+                ReleaseGdsSsdAllocations(item.replicas());
             }
             return expired;
         });

@@ -788,4 +788,65 @@ TEST_F(SegmentTest, MountLocalDiskSegmentDuplicate) {
     ValidateMountedLocalDiskSegments(segment_manager, segments, client_ids);
 }
 
+
+TEST_F(SegmentTest, GdsSsdSegmentManagerAllocatesResolvesAndReleases) {
+    GdsSsdSegmentManager gds_segment_manager;
+
+    GdsSsdSegment segment;
+    segment.id = generate_uuid();
+    segment.name = "gds_pool_0";
+    segment.base = 0;
+    segment.size = 1024 * 1024;
+    segment.block_size = 4096;
+    segment.allocation_alignment = 4096;
+    segment.namespace_id = "nvme-ns-0";
+
+    GdsSsdAccessor accessor;
+    accessor.client_host = "host-a";
+    accessor.segment_uri = "block:///dev/disk/by-id/mooncake-gds-0";
+    accessor.namespace_id = segment.namespace_id;
+    accessor.size = segment.size;
+    accessor.block_size = segment.block_size;
+    accessor.allocation_alignment = segment.allocation_alignment;
+    accessor.gpu_device_ids = {0, 1};
+    accessor.numa_node = 0;
+    accessor.alive = true;
+    segment.accessors.push_back(accessor);
+
+    auto access = gds_segment_manager.getGdsSsdSegmentAccess();
+    ASSERT_EQ(access.MountSegment(segment), ErrorCode::OK);
+
+    auto allocation = access.AllocateReplica(8192, {"gds_pool_0"});
+    ASSERT_TRUE(allocation.has_value());
+    const GdsSsdReplicaMeta meta = allocation.value();
+    EXPECT_EQ(meta.segment_id, segment.id);
+    EXPECT_EQ(meta.segment_name, segment.name);
+    EXPECT_EQ(meta.object_size, 8192);
+    EXPECT_EQ(meta.block_size, segment.block_size);
+    EXPECT_EQ(meta.allocation_alignment, segment.allocation_alignment);
+
+    GdsSsdDescriptor descriptor;
+    EXPECT_EQ(access.ResolveDescriptor(meta, "host-a", descriptor),
+              ErrorCode::OK);
+    EXPECT_EQ(descriptor.segment_id, segment.id);
+    EXPECT_EQ(descriptor.segment_name, segment.name);
+    EXPECT_EQ(descriptor.segment_uri, accessor.segment_uri);
+    EXPECT_EQ(descriptor.offset, meta.offset);
+    EXPECT_EQ(descriptor.object_size, meta.object_size);
+    EXPECT_EQ(access.ResolveDescriptor(meta, "host-b", descriptor),
+              ErrorCode::NO_AVAILABLE_HANDLE);
+
+    size_t used = 0;
+    size_t capacity = 0;
+    ASSERT_EQ(access.QuerySegments(segment.name, used, capacity),
+              ErrorCode::OK);
+    EXPECT_EQ(used, 8192);
+    EXPECT_EQ(capacity, segment.size);
+
+    EXPECT_EQ(access.ReleaseReplica(meta), ErrorCode::OK);
+    ASSERT_EQ(access.QuerySegments(segment.name, used, capacity),
+              ErrorCode::OK);
+    EXPECT_EQ(used, 0);
+    EXPECT_EQ(capacity, segment.size);
+}
 }  // namespace mooncake

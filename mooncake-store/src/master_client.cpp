@@ -153,6 +153,16 @@ struct RpcNameTraits<&WrappedMasterService::MountNoFSegment> {
 };
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::MountGdsSsdSegment> {
+    static constexpr const char* value = "MountGdsSsdSegment";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::RegisterGdsSsdAccessor> {
+    static constexpr const char* value = "RegisterGdsSsdAccessor";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::ReMountSegment> {
     static constexpr const char* value = "ReMountSegment";
 };
@@ -180,6 +190,11 @@ struct RpcNameTraits<&WrappedMasterService::UnmountNoFSegment> {
 template <>
 struct RpcNameTraits<&WrappedMasterService::GetAllNoFSegments> {
     static constexpr const char* value = "GetAllNoFSegments";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::GetAllGdsSsdSegments> {
+    static constexpr const char* value = "GetAllGdsSsdSegments";
 };
 
 template <>
@@ -532,7 +547,7 @@ tl::expected<GetReplicaListResponse, ErrorCode> MasterClient::GetReplicaList(
     timer.LogRequest("object_key=", object_key, ", tenant_id=", tenant_id);
 
     auto result = invoke_rpc<&WrappedMasterService::GetReplicaList,
-                             GetReplicaListResponse>(object_key, tenant_id);
+                             GetReplicaListResponse>(client_id_, object_key, tenant_id);
     timer.LogResponseExpected(result);
     return result;
 }
@@ -551,7 +566,7 @@ MasterClient::BatchGetReplicaList(const std::vector<std::string>& object_keys,
 
     auto result = invoke_batch_rpc<&WrappedMasterService::BatchGetReplicaList,
                                    GetReplicaListResponse>(
-        object_keys.size(), object_keys, tenant_id);
+        object_keys.size(), client_id_, object_keys, tenant_id);
     timer.LogResponse("result=", result.size(), " operations");
     return result;
 }
@@ -802,6 +817,32 @@ tl::expected<void, ErrorCode> MasterClient::MountNoFSegment(
     return result;
 }
 
+tl::expected<void, ErrorCode> MasterClient::MountGdsSsdSegment(
+    const GdsSsdSegment& segment) {
+    ScopedVLogTimer timer(1, "MasterClient::MountGdsSsdSegment");
+    timer.LogRequest("GDS SSD segment mount: size=", segment.size,
+                     ", name=", segment.name, ", id=", segment.id,
+                     ", client_id=", client_id_);
+
+    auto result = invoke_rpc<&WrappedMasterService::MountGdsSsdSegment, void>(
+        segment);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<void, ErrorCode> MasterClient::RegisterGdsSsdAccessor(
+    const UUID& segment_id, const GdsSsdAccessor& accessor) {
+    ScopedVLogTimer timer(1, "MasterClient::RegisterGdsSsdAccessor");
+    timer.LogRequest("segment_id=", segment_id, ", client_host=",
+                     accessor.client_host, ", segment_uri=",
+                     accessor.segment_uri, ", client_id=", client_id_);
+
+    auto result =
+        invoke_rpc<&WrappedMasterService::RegisterGdsSsdAccessor, void>(
+            segment_id, accessor);
+    timer.LogResponseExpected(result);
+    return result;
+}
 tl::expected<void, ErrorCode> MasterClient::ReMountSegment(
     const std::vector<Segment>& segments) {
     ScopedVLogTimer timer(1, "MasterClient::ReMountSegment");
@@ -873,6 +914,16 @@ MasterClient::GetAllNoFSegments() {
     return result;
 }
 
+tl::expected<std::vector<GdsSsdSegment>, ErrorCode>
+MasterClient::GetAllGdsSsdSegments() {
+    ScopedVLogTimer timer(1, "MasterClient::GetAllGdsSsdSegments");
+    timer.LogRequest("Get all GDS SSD segments, client_id=", client_id_);
+
+    auto result = invoke_rpc<&WrappedMasterService::GetAllGdsSsdSegments,
+                             std::vector<GdsSsdSegment>>();
+    timer.LogResponseExpected(result);
+    return result;
+}
 tl::expected<std::vector<NoFSegmentOwnerInfo>, ErrorCode>
 MasterClient::GetNoFSegmentsByName(const std::string& segment_name) {
     ScopedVLogTimer timer(1, "MasterClient::GetNoFSegmentsByName");
