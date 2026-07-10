@@ -118,6 +118,9 @@ CachelibBufferAllocator::~CachelibBufferAllocator() {
     } else if (replica_type_ == ReplicaType::NOF_SSD) {
         MasterMetricManager::instance().dec_allocated_nof_size(segment_name_,
                                                                cur_size_);
+    } else if (replica_type_ == ReplicaType::GDS_SSD) {
+        MasterMetricManager::instance().dec_allocated_gds_size(segment_name_,
+                                                               cur_size_);
     }
 };
 
@@ -150,6 +153,9 @@ std::unique_ptr<AllocatedBuffer> CachelibBufferAllocator::allocate(
     } else if (replica_type_ == ReplicaType::NOF_SSD) {
         MasterMetricManager::instance().inc_allocated_nof_size(segment_name_,
                                                                size);
+    } else if (replica_type_ == ReplicaType::GDS_SSD) {
+        MasterMetricManager::instance().inc_allocated_gds_size(segment_name_,
+                                                               size);
     }
     return std::make_unique<AllocatedBuffer>(shared_from_this(), buffer, size);
 }
@@ -169,6 +175,9 @@ void CachelibBufferAllocator::deallocate(AllocatedBuffer* handle) {
                 segment_name_, freed_size);
         } else if (replica_type_ == ReplicaType::NOF_SSD) {
             MasterMetricManager::instance().dec_allocated_nof_size(
+                segment_name_, freed_size);
+        } else if (replica_type_ == ReplicaType::GDS_SSD) {
+            MasterMetricManager::instance().dec_allocated_gds_size(
                 segment_name_, freed_size);
         }
         VLOG(1) << "deallocation_succeeded address=" << handle->buffer_ptr_
@@ -231,6 +240,9 @@ OffsetBufferAllocator::~OffsetBufferAllocator() {
     } else if (replica_type_ == ReplicaType::NOF_SSD) {
         MasterMetricManager::instance().dec_allocated_nof_size(segment_name_,
                                                                cur_size_);
+    } else if (replica_type_ == ReplicaType::GDS_SSD) {
+        MasterMetricManager::instance().dec_allocated_gds_size(segment_name_,
+                                                               cur_size_);
     }
 };
 
@@ -275,6 +287,9 @@ std::unique_ptr<AllocatedBuffer> OffsetBufferAllocator::allocate(size_t size) {
     } else if (replica_type_ == ReplicaType::NOF_SSD) {
         MasterMetricManager::instance().inc_allocated_nof_size(segment_name_,
                                                                size);
+    } else if (replica_type_ == ReplicaType::GDS_SSD) {
+        MasterMetricManager::instance().inc_allocated_gds_size(segment_name_,
+                                                               size);
     }
     return allocated_buffer;
 }
@@ -291,6 +306,9 @@ void OffsetBufferAllocator::deallocate(AllocatedBuffer* handle) {
                 segment_name_, freed_size);
         } else if (replica_type_ == ReplicaType::NOF_SSD) {
             MasterMetricManager::instance().dec_allocated_nof_size(
+                segment_name_, freed_size);
+        } else if (replica_type_ == ReplicaType::GDS_SSD) {
+            MasterMetricManager::instance().dec_allocated_gds_size(
                 segment_name_, freed_size);
         }
         VLOG(1) << "deallocation_succeeded address=" << handle->data()

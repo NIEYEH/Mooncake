@@ -57,6 +57,15 @@ class MasterMetricManager {
     void reset_total_nof_capacity();
     double get_global_nof_used_ratio(void);
 
+    // GDS SSD segment Metrics
+    void inc_allocated_gds_size(const std::string& segment, int64_t val = 1);
+    void dec_allocated_gds_size(const std::string& segment, int64_t val = 1);
+    void reset_allocated_gds_size();
+    void inc_total_gds_capacity(const std::string& segment, int64_t val = 1);
+    void dec_total_gds_capacity(const std::string& segment, int64_t val = 1);
+    void reset_total_gds_capacity();
+    double get_global_gds_used_ratio(void);
+
     enum class CacheHitStat {
         MEMORY_HITS,
         SSD_HITS,
@@ -103,6 +112,17 @@ class MasterMetricManager {
     double get_segment_nof_used_ratio(const std::string& segment);
     int64_t get_segment_allocated_nof_size(const std::string& segment);
     int64_t get_segment_total_nof_capacity(const std::string& segment);
+
+    // GDS SSD segment Metrics
+    void inc_allocated_gds_size(int64_t val = 1);
+    void dec_allocated_gds_size(int64_t val = 1);
+    void inc_total_gds_capacity(int64_t val = 1);
+    void dec_total_gds_capacity(int64_t val = 1);
+    int64_t get_allocated_gds_size();
+    int64_t get_total_gds_capacity();
+    double get_segment_gds_used_ratio(const std::string& segment);
+    int64_t get_segment_allocated_gds_size(const std::string& segment);
+    int64_t get_segment_total_gds_capacity(const std::string& segment);
 
     // File Storage Metrics
     void inc_allocated_file_size(int64_t val = 1);
@@ -535,6 +555,18 @@ class MasterMetricManager {
                                           // gauge
     ylt::metric::dynamic_gauge_1t
         nof_total_capacity_per_segment_;  // NoF segment capacity update for
+                                          // gauge
+
+    // GDS SSD Segment Metrics
+    ylt::metric::gauge_t
+        gds_allocated_size_;  // Overall GDS SSD usage update for gauge
+    ylt::metric::gauge_t
+        gds_total_capacity_;  // Overall GDS SSD capacity update for gauge
+    ylt::metric::dynamic_gauge_1t
+        gds_allocated_size_per_segment_;  // GDS SSD segment usage update for
+                                          // gauge
+    ylt::metric::dynamic_gauge_1t
+        gds_total_capacity_per_segment_;  // GDS SSD segment capacity update for
                                           // gauge
 
     // File Storage Metrics

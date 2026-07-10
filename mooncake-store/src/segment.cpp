@@ -1622,6 +1622,8 @@ ErrorCode ScopedGdsSsdSegmentAccess::MountSegment(
     gds_segment_manager_->mounted_segments_[segment.id] = {
         segment, SegmentStatus::OK, std::move(allocator)};
     gds_segment_manager_->segment_id_by_name_[segment.name] = segment.id;
+    MasterMetricManager::instance().inc_total_gds_capacity(segment.name,
+                                                           segment.size);
     return ErrorCode::OK;
 }
 

@@ -44,6 +44,19 @@ MasterMetricManager::MasterMetricManager()
       nof_total_capacity_per_segment_(
           "nof_segment_total_capacity_bytes",
           "Total nof ssd capacity of the mounted segment", {"segment"}),
+      gds_allocated_size_(
+          "master_gds_ssd_allocated_bytes",
+          "Total GDS SSD bytes currently allocated across all segments"),
+      gds_total_capacity_(
+          "master_gds_ssd_total_capacity_bytes",
+          "Total GDS SSD capacity across all mounted segments"),
+      gds_allocated_size_per_segment_(
+          "gds_ssd_segment_allocated_bytes",
+          "Total GDS SSD bytes currently allocated of the segment",
+          {"segment"}),
+      gds_total_capacity_per_segment_(
+          "gds_ssd_segment_total_capacity_bytes",
+          "Total GDS SSD capacity of the mounted segment", {"segment"}),
       file_allocated_size_(
           "master_allocated_file_size_bytes",
           "Total bytes currently allocated for file storage in 3fs/nfs"),
@@ -462,6 +475,10 @@ void MasterMetricManager::update_metrics_for_zero_output() {
     // Update Gauges (use update(0) to mark as changed)
     mem_allocated_size_.update(0);
     mem_total_capacity_.update(0);
+    nof_allocated_size_.update(0);
+    nof_total_capacity_.update(0);
+    gds_allocated_size_.update(0);
+    gds_total_capacity_.update(0);
     file_allocated_size_.update(0);
     file_total_capacity_.update(0);
     key_count_.update(0);
@@ -746,6 +763,92 @@ double MasterMetricManager::get_segment_nof_used_ratio(
     const std::string& segment) {
     double allocated = get_segment_allocated_nof_size(segment);
     double capacity = get_segment_total_nof_capacity(segment);
+    if (capacity == 0) {
+        return 0.0;
+    }
+    return allocated / capacity;
+}
+
+// GDS SSD segment Metrics
+void MasterMetricManager::inc_allocated_gds_size(const std::string& segment,
+                                                 int64_t val) {
+    gds_allocated_size_.inc(val);
+    if (!segment.empty()) gds_allocated_size_per_segment_.inc({segment}, val);
+}
+
+void MasterMetricManager::dec_allocated_gds_size(const std::string& segment,
+                                                 int64_t val) {
+    gds_allocated_size_.dec(val);
+    if (!segment.empty()) gds_allocated_size_per_segment_.dec({segment}, val);
+}
+
+void MasterMetricManager::reset_allocated_gds_size() {
+    gds_allocated_size_.reset();
+}
+
+void MasterMetricManager::inc_total_gds_capacity(const std::string& segment,
+                                                 int64_t val) {
+    gds_total_capacity_.inc(val);
+    if (!segment.empty()) gds_total_capacity_per_segment_.inc({segment}, val);
+}
+
+void MasterMetricManager::dec_total_gds_capacity(const std::string& segment,
+                                                 int64_t val) {
+    gds_total_capacity_.dec(val);
+    if (!segment.empty()) gds_total_capacity_per_segment_.dec({segment}, val);
+}
+
+void MasterMetricManager::reset_total_gds_capacity() {
+    gds_total_capacity_.reset();
+}
+
+void MasterMetricManager::inc_allocated_gds_size(int64_t val) {
+    gds_allocated_size_.inc(val);
+}
+
+void MasterMetricManager::dec_allocated_gds_size(int64_t val) {
+    gds_allocated_size_.dec(val);
+}
+
+void MasterMetricManager::inc_total_gds_capacity(int64_t val) {
+    gds_total_capacity_.inc(val);
+}
+
+void MasterMetricManager::dec_total_gds_capacity(int64_t val) {
+    gds_total_capacity_.dec(val);
+}
+
+int64_t MasterMetricManager::get_allocated_gds_size() {
+    return gds_allocated_size_.value();
+}
+
+int64_t MasterMetricManager::get_total_gds_capacity() {
+    return gds_total_capacity_.value();
+}
+
+double MasterMetricManager::get_global_gds_used_ratio(void) {
+    double allocated = gds_allocated_size_.value();
+    double capacity = gds_total_capacity_.value();
+    if (capacity == 0) {
+        return 0.0;
+    }
+    return allocated / capacity;
+}
+
+int64_t MasterMetricManager::get_segment_allocated_gds_size(
+    const std::string& segment) {
+    return gds_allocated_size_per_segment_.value({segment});
+}
+
+int64_t MasterMetricManager::get_segment_total_gds_capacity(
+    const std::string& segment) {
+    return gds_total_capacity_per_segment_.value({segment});
+}
+
+double MasterMetricManager::get_segment_gds_used_ratio(
+    const std::string& segment) {
+    double allocated = get_segment_allocated_gds_size(segment);
+    double capacity = get_segment_total_gds_capacity(segment);
     if (capacity == 0) {
         return 0.0;
     }
@@ -1713,6 +1816,14 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(mem_total_capacity_);
     serialize_metric(mem_allocated_size_per_segment_);
     serialize_metric(mem_total_capacity_per_segment_);
+    serialize_metric(nof_allocated_size_);
+    serialize_metric(nof_total_capacity_);
+    serialize_metric(nof_allocated_size_per_segment_);
+    serialize_metric(nof_total_capacity_per_segment_);
+    serialize_metric(gds_allocated_size_);
+    serialize_metric(gds_total_capacity_);
+    serialize_metric(gds_allocated_size_per_segment_);
+    serialize_metric(gds_total_capacity_per_segment_);
     serialize_metric(file_allocated_size_);
     serialize_metric(file_total_capacity_);
     serialize_metric(key_count_);
@@ -1936,6 +2047,8 @@ std::string MasterMetricManager::get_summary_string(
     int64_t mem_capacity = mem_total_capacity_.value();
     int64_t nof_allocated = nof_allocated_size_.value();
     int64_t nof_capacity = nof_total_capacity_.value();
+    int64_t gds_allocated = gds_allocated_size_.value();
+    int64_t gds_capacity = gds_total_capacity_.value();
     int64_t file_allocated = file_allocated_size_.value();
     int64_t file_capacity = file_total_capacity_.value();
     int64_t keys = key_count_.value();
@@ -2232,6 +2345,12 @@ std::string MasterMetricManager::get_summary_string(
     if (nof_capacity > 0) {
         ss << " (" << std::fixed << std::setprecision(1)
            << ((double)nof_allocated / (double)nof_capacity * 100.0) << "%)";
+    }
+    ss << " | GDS SSD: " << byte_size_to_string(gds_allocated) << " / "
+       << byte_size_to_string(gds_capacity);
+    if (gds_capacity > 0) {
+        ss << " (" << std::fixed << std::setprecision(1)
+           << ((double)gds_allocated / (double)gds_capacity * 100.0) << "%)";
     }
     ss << " | SSD Storage: " << byte_size_to_string(file_allocated) << " / "
        << byte_size_to_string(file_display_capacity);
