@@ -149,33 +149,10 @@ struct FileSegmentDesc {
     NLOHMANN_DEFINE_TYPE_INTRUSIVE(FileSegmentDesc, buffers);
 };
 
-struct BlockSegmentDesc {
-    std::string path;
-    uint64_t length{0};
-    uint64_t offset{0};
-    uint64_t block_size{0};
-    uint64_t allocation_alignment{0};
-
-   public:
-    NLOHMANN_DEFINE_TYPE_INTRUSIVE(BlockSegmentDesc, path, length, offset,
-                                   block_size, allocation_alignment);
-};
-
-enum class SegmentType { Memory, File, Block };
+enum class SegmentType { Memory, File };
 
 inline void to_json(json& j, const SegmentType& t) {
-    switch (t) {
-        case SegmentType::Memory:
-            j = "memory";
-            return;
-        case SegmentType::File:
-            j = "file";
-            return;
-        case SegmentType::Block:
-            j = "block";
-            return;
-    }
-    throw std::runtime_error("unknown segment type");
+    j = (t == SegmentType::Memory ? "memory" : "file");
 }
 
 inline void from_json(const json& j, SegmentType& t) {
@@ -184,8 +161,6 @@ inline void from_json(const json& j, SegmentType& t) {
         t = SegmentType::Memory;
     else if (s == "file")
         t = SegmentType::File;
-    else if (s == "block")
-        t = SegmentType::Block;
     else
         throw std::runtime_error("unknown segment type: " + s);
 }
@@ -195,7 +170,7 @@ struct SegmentDesc {
     SegmentType type;
     std::string machine_id;
     std::string rpc_server_addr;
-    std::variant<MemorySegmentDesc, FileSegmentDesc, BlockSegmentDesc> detail;
+    std::variant<MemorySegmentDesc, FileSegmentDesc> detail;
 
     // In dual-NIC setups (MC_RDMA_BIND_ADDRESS), the RDMA-reachable
     // address may differ from the TCP-routable segment name.  When
@@ -208,12 +183,6 @@ struct SegmentDesc {
     DeviceDesc* findDevice(const std::string& name);
     const MemorySegmentDesc& getMemory() const {
         return std::get<MemorySegmentDesc>(detail);
-    }
-    const FileSegmentDesc& getFile() const {
-        return std::get<FileSegmentDesc>(detail);
-    }
-    const BlockSegmentDesc& getBlock() const {
-        return std::get<BlockSegmentDesc>(detail);
     }
 
     // Returns the server name to use for NIC path construction.
@@ -234,10 +203,8 @@ inline void to_json(json& j, const SegmentDesc& s) {
     }
     if (s.type == SegmentType::Memory) {
         j["detail"] = std::get<MemorySegmentDesc>(s.detail);
-    } else if (s.type == SegmentType::File) {
-        j["detail"] = std::get<FileSegmentDesc>(s.detail);
     } else {
-        j["detail"] = std::get<BlockSegmentDesc>(s.detail);
+        j["detail"] = std::get<FileSegmentDesc>(s.detail);
     }
 }
 
@@ -251,10 +218,8 @@ inline void from_json(const json& j, SegmentDesc& s) {
     }
     if (s.type == SegmentType::Memory) {
         s.detail = j.at("detail").get<MemorySegmentDesc>();
-    } else if (s.type == SegmentType::File) {
-        s.detail = j.at("detail").get<FileSegmentDesc>();
     } else {
-        s.detail = j.at("detail").get<BlockSegmentDesc>();
+        s.detail = j.at("detail").get<FileSegmentDesc>();
     }
 }
 

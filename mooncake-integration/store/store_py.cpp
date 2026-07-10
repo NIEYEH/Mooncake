@@ -1864,72 +1864,30 @@ PYBIND11_MODULE(store, m) {
         .def_readwrite("buffer_descriptor",
                        &MemoryDescriptor::buffer_descriptor);
 
-    py::class_<NoFDescriptor>(m, "NoFDescriptor")
-        .def_readwrite("buffer_descriptor", &NoFDescriptor::buffer_descriptor);
-
     py::class_<DiskDescriptor>(m, "DiskDescriptor")
         .def_readwrite("file_path", &DiskDescriptor::file_path)
         .def_readwrite("object_size", &DiskDescriptor::object_size);
-
-    py::class_<LocalDiskDescriptor>(m, "LocalDiskDescriptor")
-        .def_readwrite("client_id", &LocalDiskDescriptor::client_id)
-        .def_readwrite("object_size", &LocalDiskDescriptor::object_size)
-        .def_readwrite("transport_endpoint",
-                       &LocalDiskDescriptor::transport_endpoint);
-
-    py::class_<GdsSsdDescriptor>(m, "GdsSsdDescriptor")
-        .def_readwrite("segment_id", &GdsSsdDescriptor::segment_id)
-        .def_readwrite("segment_name", &GdsSsdDescriptor::segment_name)
-        .def_readwrite("segment_uri", &GdsSsdDescriptor::segment_uri)
-        .def_readwrite("offset", &GdsSsdDescriptor::offset)
-        .def_readwrite("object_size", &GdsSsdDescriptor::object_size)
-        .def_readwrite("block_size", &GdsSsdDescriptor::block_size)
-        .def_readwrite("allocation_alignment",
-                       &GdsSsdDescriptor::allocation_alignment);
 
     py::class_<Replica::Descriptor>(m, "ReplicaDescriptor")
         .def_readonly("status", &Replica::Descriptor::status)
         .def("is_memory_replica",
              static_cast<bool (Replica::Descriptor::*)() const noexcept>(
                  &Replica::Descriptor::is_memory_replica))
-        .def("is_nof_replica",
-             static_cast<bool (Replica::Descriptor::*)() const noexcept>(
-                 &Replica::Descriptor::is_nof_replica))
         .def("is_disk_replica",
              static_cast<bool (Replica::Descriptor::*)() const noexcept>(
                  &Replica::Descriptor::is_disk_replica))
         .def("is_local_disk_replica",
              static_cast<bool (Replica::Descriptor::*)() const noexcept>(
                  &Replica::Descriptor::is_local_disk_replica))
-        .def("is_gds_ssd_replica",
-             static_cast<bool (Replica::Descriptor::*)() const noexcept>(
-                 &Replica::Descriptor::is_gds_ssd_replica))
         .def(
             "get_memory_descriptor",
             static_cast<const MemoryDescriptor &(Replica::Descriptor::*)()
                             const>(&Replica::Descriptor::get_memory_descriptor),
             py::return_value_policy::reference_internal)
         .def(
-            "get_nof_descriptor",
-            static_cast<const NoFDescriptor &(Replica::Descriptor::*)() const>(
-                &Replica::Descriptor::get_nof_descriptor),
-            py::return_value_policy::reference_internal)
-        .def(
             "get_disk_descriptor",
             static_cast<const DiskDescriptor &(Replica::Descriptor::*)() const>(
                 &Replica::Descriptor::get_disk_descriptor),
-            py::return_value_policy::reference_internal)
-        .def(
-            "get_local_disk_descriptor",
-            static_cast<const LocalDiskDescriptor &(Replica::Descriptor::*)()
-                            const>(
-                &Replica::Descriptor::get_local_disk_descriptor),
-            py::return_value_policy::reference_internal)
-        .def(
-            "get_gds_ssd_descriptor",
-            static_cast<const GdsSsdDescriptor &(Replica::Descriptor::*)()
-                            const>(
-                &Replica::Descriptor::get_gds_ssd_descriptor),
             py::return_value_policy::reference_internal);
 
     py::class_<AllocatedBuffer::Descriptor>(
@@ -2872,7 +2830,7 @@ PYBIND11_MODULE(store, m) {
             [](MooncakeStorePyWrapper &self, const std::string &key,
                py::args parts,
                const ReplicateConfig &config = ReplicateConfig{}) {
-                // 1) Python buffer -> span
+                // 1) Python buffer 鈫?span
                 std::vector<py::buffer_info> infos;
                 std::vector<std::span<const char>> spans;
                 infos.reserve(parts.size());
