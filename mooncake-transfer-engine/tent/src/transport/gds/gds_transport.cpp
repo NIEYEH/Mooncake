@@ -21,9 +21,13 @@
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <iomanip>
 #include <memory>
 #include <mutex>
+
+#include <fcntl.h>
+#include <unistd.h>
 
 #include "tent/runtime/slab.h"
 
@@ -32,18 +36,21 @@ namespace tent {
 class GdsFileContext {
    public:
     explicit GdsFileContext(const std::string& path) : ready_(false) {
+        memset(&desc_, 0, sizeof(desc_));
+        desc_.handle.fd = -1;
         int fd = open(path.c_str(), O_RDWR | O_DIRECT);
         if (fd < 0) {
-            PLOG(ERROR) << "Failed to open file " << path;
+            PLOG(ERROR) << "Failed to open GDS storage path " << path;
             return;
         }
-        memset(&desc_, 0, sizeof(desc_));
         desc_.type = CU_FILE_HANDLE_TYPE_OPAQUE_FD;
         desc_.handle.fd = fd;
         auto result = cuFileHandleRegister(&handle_, &desc_);
         if (result.err != CU_FILE_SUCCESS) {
-            LOG(ERROR) << "Failed to register GDS file handle: Code "
+            LOG(ERROR) << "Failed to register GDS storage handle: Code "
                        << result.err;
+            close(desc_.handle.fd);
+            desc_.handle.fd = -1;
             return;
         }
         ready_ = true;
@@ -54,7 +61,7 @@ class GdsFileContext {
 
     ~GdsFileContext() {
         if (handle_) cuFileHandleDeregister(handle_);
-        if (desc_.handle.fd) close(desc_.handle.fd);
+        if (desc_.handle.fd >= 0) close(desc_.handle.fd);
     }
 
     CUfileHandle_t getHandle() const { return handle_; }
@@ -234,14 +241,24 @@ std::string GdsTransport::getGdsFilePath(SegmentID target_id) {
     std::string ret;
     auto status = metadata_->segmentManager().withCachedSegment(
         target_id, [&](SegmentDesc* segment) {
-            if (segment->type != SegmentType::File)
-                return Status::NeedsRefreshCache(
-                    "Segment type is not File" LOC_MARK);
-            auto& detail = std::get<FileSegmentDesc>(segment->detail);
-            if (detail.buffers.empty())
-                return Status::NeedsRefreshCache("No buffers found" LOC_MARK);
-            ret = detail.buffers[0].path;
-            return Status::OK();
+            if (segment->type == SegmentType::File) {
+                auto& detail = std::get<FileSegmentDesc>(segment->detail);
+                if (detail.buffers.empty())
+                    return Status::NeedsRefreshCache(
+                        "No buffers found" LOC_MARK);
+                ret = detail.buffers[0].path;
+                return Status::OK();
+            }
+            if (segment->type == SegmentType::Block) {
+                auto& detail = std::get<BlockSegmentDesc>(segment->detail);
+                if (detail.path.empty())
+                    return Status::NeedsRefreshCache(
+                        "Empty block path" LOC_MARK);
+                ret = detail.path;
+                return Status::OK();
+            }
+            return Status::NeedsRefreshCache(
+                "Segment type is not File or Block" LOC_MARK);
         });
     if (!status.ok()) return "";
     return ret;
@@ -340,7 +357,8 @@ Status GdsTransport::getTransferStatus(SubBatchRef batch, int task_id,
 
 Status GdsTransport::addMemoryBuffer(BufferDesc& desc,
                                      const MemoryOptions& options) {
-    LocationParser location(options.location);
+    (void)options;
+    LocationParser location(desc.location);
     if (location.type() != "cuda") return Status::OK();
     auto result = cuFileBufRegister((void*)desc.addr, desc.length, 0);
     if (result.err != CU_FILE_SUCCESS)

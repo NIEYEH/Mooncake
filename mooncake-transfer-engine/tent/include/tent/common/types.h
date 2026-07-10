@@ -121,6 +121,7 @@ struct MemoryOptions {
 };
 
 const std::string kLocalFileSegmentPrefix = "file://";
+const std::string kLocalBlockSegmentPrefix = "block://";
 
 struct SegmentInfo {
     enum Type { Memory, File };

@@ -20,7 +20,6 @@
 #include <algorithm>
 #include <glog/logging.h>
 
-#include <algorithm>
 #include <cctype>
 
 namespace mooncake {
@@ -50,6 +49,18 @@ static const std::string kMemoryTypeCpu = "cpu";
 static const std::string kMemoryTypeCuda = "cuda";
 static const std::string kMemoryTypeNpu = "npu";
 static const std::string kMemoryTypeWildcard = "*";
+
+static const char* segmentTypeName(SegmentType type) {
+    switch (type) {
+        case SegmentType::Memory:
+            return "memory";
+        case SegmentType::File:
+            return "file";
+        case SegmentType::Block:
+            return "block";
+    }
+    return "unknown";
+}
 
 std::string TransportSelector::transportTypeName(TransportType type) {
     auto it = kTransportTypeNames.find(type);
@@ -82,6 +93,18 @@ std::vector<SelectionPolicy> TransportSelector::getDefaultPolicies() {
             std::nullopt,   // priority
             {},             // devices (empty = all devices)
             {GDS, IOURING}  // File segment priority (original: GDS -> IOURING)
+        },
+        {
+            "block_storage",
+            SegmentType::Block,
+            std::nullopt,  // same_machine doesn't matter for block devices
+            std::nullopt,  // local_memory_pattern
+            std::nullopt,  // remote_memory_pattern
+            std::nullopt,  // min_size
+            std::nullopt,  // max_size
+            std::nullopt,  // priority
+            {},            // devices (empty = all devices)
+            {GDS}          // Block segment priority: GDS only
         },
         {
             "memory_default",
@@ -123,6 +146,8 @@ void TransportSelector::loadPolicies() {
         std::string segment_type_str = policy_json.value("segment_type", "");
         if (segment_type_str == "file") {
             policy.segment_type = SegmentType::File;
+        } else if (segment_type_str == "block") {
+            policy.segment_type = SegmentType::Block;
         } else if (segment_type_str == "memory") {
             policy.segment_type = SegmentType::Memory;
         } else {
@@ -330,8 +355,9 @@ bool TransportSelector::isTransportAvailable(
         return t == MTYPE_CUDA || t == MTYPE_ROCM;
     };
 
-    // For file segments, check file-specific capabilities (original logic)
-    if (context.segment_type == SegmentType::File) {
+    // For storage segments, check file-like capabilities.
+    if (context.segment_type == SegmentType::File ||
+        context.segment_type == SegmentType::Block) {
         if (context.local_memory_type == MTYPE_CPU) return caps.dram_to_file;
         if (is_gpu(context.local_memory_type)) return caps.gpu_to_file;
         return false;
@@ -377,8 +403,7 @@ SelectionResult TransportSelector::select(
 
     if (!matching_policy) {
         LOG(WARNING) << "No matching transport policy for segment_type="
-                     << (context.segment_type == SegmentType::File ? "file"
-                                                                   : "memory")
+                     << segmentTypeName(context.segment_type)
                      << ", size=" << context.transfer_size
                      << ", priority_level=" << context.priority_level;
         return result;  // UNSPEC, all devices

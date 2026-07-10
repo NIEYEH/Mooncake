@@ -137,6 +137,38 @@ TEST(TransportSelectorTest, DefaultPoliciesFileSegmentGpuMemory) {
         << "File segment with GPU should prefer GDS first";
 }
 
+TEST(TransportSelectorTest, DefaultPoliciesBlockSegmentUsesGdsOnly) {
+    auto conf = std::make_shared<Config>();
+    TransportSelector selector(conf);
+
+    std::array<std::shared_ptr<Transport>, kSupportedTransportTypes>
+        transports{};
+    transports[GDS] = std::make_shared<FakeTransport>(GDS);
+    transports[IOURING] = std::make_shared<FakeTransport>(IOURING);
+
+    auto* gds = static_cast<FakeTransport*>(transports[GDS].get());
+    auto* iouring = static_cast<FakeTransport*>(transports[IOURING].get());
+    gds->setDramToFile(true);
+    iouring->setDramToFile(true);
+
+    SelectionContext ctx;
+    ctx.segment_type = SegmentType::Block;
+    ctx.same_machine = true;
+    ctx.local_memory_type = MTYPE_CPU;
+    ctx.remote_memory_type = MTYPE_CPU;
+    ctx.transfer_size = 4096;
+    ctx.priority_level = 0;
+    ctx.buffer_transports = nullptr;
+
+    auto result = selector.select(ctx, transports);
+    EXPECT_EQ(result.transport, GDS)
+        << "Block segment should use GDS as the only default transport";
+
+    result = selector.select(ctx, transports, 1);
+    EXPECT_EQ(result.transport, UNSPEC)
+        << "Block segment should not fall back to IO_uring";
+}
+
 TEST(TransportSelectorTest, DefaultPoliciesMemorySegment) {
     auto conf = std::make_shared<Config>();
     TransportSelector selector(conf);

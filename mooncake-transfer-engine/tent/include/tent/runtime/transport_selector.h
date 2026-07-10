@@ -72,7 +72,7 @@ class Transport;
  * @brief Selection context for a single request
  */
 struct SelectionContext {
-    SegmentType segment_type;       // File or Memory
+    SegmentType segment_type;       // Memory, File, or Block
     bool same_machine;              // Local or remote
     MemoryType local_memory_type;   // CPU, CUDA, etc.
     MemoryType remote_memory_type;  // CPU, CUDA, etc. (for remote)

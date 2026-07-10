@@ -15,8 +15,15 @@
 #include "tent/runtime/segment_manager.h"
 
 #include <cassert>
+#include <algorithm>
 #include <filesystem>
 #include <set>
+
+#include <fcntl.h>
+#include <linux/fs.h>
+#include <sys/ioctl.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #include "tent/common/status.h"
 #include "tent/runtime/control_plane.h"
@@ -110,6 +117,8 @@ Status SegmentManager::getRemote(SegmentDescRef &desc, SegmentID handle) {
     }
     if (segment_name.starts_with(kLocalFileSegmentPrefix)) {
         CHECK_STATUS(makeFileRemote(desc, segment_name));
+    } else if (segment_name.starts_with(kLocalBlockSegmentPrefix)) {
+        CHECK_STATUS(makeBlockRemote(desc, segment_name));
     } else {
         CHECK_STATUS(registry_->getSegmentDesc(desc, segment_name));
     }
@@ -171,6 +180,55 @@ Status SegmentManager::makeFileRemote(SegmentDescRef &desc,
     buffer.length = st.st_size;
     buffer.offset = 0;
     detail.buffers.push_back(buffer);
+    desc->detail = detail;
+    return Status::OK();
+}
+
+Status SegmentManager::makeBlockRemote(SegmentDescRef &desc,
+                                       const std::string &segment_name) {
+    std::string path = segment_name.substr(kLocalBlockSegmentPrefix.length());
+
+    struct stat st;
+    if (stat(path.c_str(), &st) || !S_ISBLK(st.st_mode))
+        return Status::InvalidArgument(std::string("Invalid block path: ") +
+                                       path);
+
+    int fd = open(path.c_str(), O_RDWR | O_DIRECT);
+    if (fd < 0) {
+        PLOG(ERROR) << "Failed to open block device " << path;
+        return Status::InvalidArgument(std::string("Invalid block path: ") +
+                                       path);
+    }
+
+    uint64_t length = 0;
+    int logical_block_size = 0;
+    if (ioctl(fd, BLKGETSIZE64, &length) != 0) {
+        PLOG(ERROR) << "Failed to query block device size " << path;
+        close(fd);
+        return Status::InvalidArgument(
+            std::string("Failed to query block device size: ") + path);
+    }
+    if (ioctl(fd, BLKSSZGET, &logical_block_size) != 0 ||
+        logical_block_size <= 0) {
+        PLOG(ERROR) << "Failed to query block device logical block size "
+                    << path;
+        close(fd);
+        return Status::InvalidArgument(
+            std::string("Failed to query block device block size: ") + path);
+    }
+    close(fd);
+
+    const uint64_t block_size = static_cast<uint64_t>(logical_block_size);
+    desc = std::make_shared<SegmentDesc>();
+    desc->name = segment_name;
+    desc->type = SegmentType::Block;
+    desc->machine_id = local_desc_->machine_id;
+    BlockSegmentDesc detail;
+    detail.path = path;
+    detail.length = length;
+    detail.offset = 0;
+    detail.block_size = block_size;
+    detail.allocation_alignment = std::max<uint64_t>(block_size, 4096);
     desc->detail = detail;
     return Status::OK();
 }

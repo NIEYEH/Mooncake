@@ -529,6 +529,13 @@ Status TransferEngineImpl::getSegmentInfo(SegmentID handle, SegmentInfo& info) {
                                     .length = entry.length,
                                     .location = kWildcardLocation});
         }
+    } else if (desc->type == SegmentType::Block) {
+        info.type = SegmentInfo::File;
+        auto& detail = std::get<BlockSegmentDesc>(desc->detail);
+        info.buffers.emplace_back(
+            SegmentInfo::Buffer{.base = detail.offset,
+                                .length = detail.length,
+                                .location = kWildcardLocation});
     } else {
         info.type = SegmentInfo::Memory;
         auto& detail = std::get<MemorySegmentDesc>(desc->detail);
@@ -945,10 +952,12 @@ SelectionResult TransferEngineImpl::getTransportType(const Request& request,
     if (transport_selector_ && transport_selector_->isLegacyMode()) {
         SelectionResult result;
         std::vector<TransportType> raw;
-        if (desc->type == SegmentType::File) {
+        if (desc->type == SegmentType::File ||
+            desc->type == SegmentType::Block) {
             if (checkAvailability(transport_list_[GDS], local_mtype))
                 raw.push_back(GDS);
-            if (checkAvailability(transport_list_[IOURING], local_mtype))
+            if (desc->type == SegmentType::File &&
+                checkAvailability(transport_list_[IOURING], local_mtype))
                 raw.push_back(IOURING);
         } else {
             auto entry =
@@ -993,10 +1002,10 @@ SelectionResult TransferEngineImpl::getTransportType(const Request& request,
         request.priority;  // Use request priority for selection
     ctx.policy_name = request.policy_name;  // Optional: bind to specific policy
 
-    if (desc->type == SegmentType::File) {
-        // File segment: use selector with empty buffer_transports
-        ctx.segment_type = SegmentType::File;
-        ctx.same_machine = true;  // File is always local
+    if (desc->type == SegmentType::File || desc->type == SegmentType::Block) {
+        // Storage segments use selector policies with empty buffer_transports.
+        ctx.segment_type = desc->type;
+        ctx.same_machine = true;
         ctx.local_memory_type = local_mtype;
         ctx.remote_memory_type = MTYPE_CPU;
         ctx.buffer_transports = nullptr;  // Empty - use policy priority
@@ -1231,6 +1240,9 @@ std::vector<RequestBoundaryInfo> resolveRequestBoundaries(
     for (auto& [target_id, idxs] : by_target) {
         metadata->segmentManager().withCachedSegment(
             target_id, [&](SegmentDesc* target_desc) {
+                if (target_desc->type != SegmentType::Memory) {
+                    return Status::OK();
+                }
                 bool any_missing = false;
                 for (size_t i : idxs) {
                     const auto& r = requests[i];
@@ -1275,6 +1287,9 @@ void TransferEngineImpl::findStagingPolicy(const Request& request,
     auto status = metadata_->segmentManager().withCachedSegment(
         request.target_id, [&](SegmentDesc* segment) {
             desc = segment;
+            if (desc->type != SegmentType::Memory) {
+                return Status::OK();
+            }
             entry = desc->findBuffer(request.target_offset, request.length);
             if (!entry)
                 return Status::NeedsRefreshCache(
@@ -1282,7 +1297,7 @@ void TransferEngineImpl::findStagingPolicy(const Request& request,
             return Status::OK();
         });
 
-    if (!status.ok()) return;
+    if (!status.ok() || !entry) return;
     auto local =
         Platform::getLoader().getLocation(request.source, 1)[0].location;
     auto remote = entry->location;

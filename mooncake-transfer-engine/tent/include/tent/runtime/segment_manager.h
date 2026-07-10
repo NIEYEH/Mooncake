@@ -138,6 +138,9 @@ class SegmentManager {
     Status makeFileRemote(SegmentDescRef &desc,
                           const std::string &segment_name);
 
+    Status makeBlockRemote(SegmentDescRef &desc,
+                           const std::string &segment_name);
+
    private:
     struct RemoteSegmentCache {
         uint64_t last_refresh = 0;
