@@ -8,6 +8,7 @@
 #include <cerrno>
 #include <cstring>
 #include <cstdlib>
+#include <limits>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -150,6 +151,25 @@ static void nvmf_io_complete(void* ctx, const struct spdk_nvme_cpl* cpl) {
 }
 #endif
 namespace mooncake {
+namespace {
+
+// Matches mooncake::tent::TransportType::GDS. TransferRequest keeps the hint as
+// an int so the Store layer can avoid depending directly on TENT headers.
+constexpr int kTentGdsTransportHint = 5;
+
+bool IsAligned(uint64_t value, uint64_t alignment) {
+    return alignment != 0 && value % alignment == 0;
+}
+
+bool CheckedAdd(uint64_t lhs, uint64_t rhs, uint64_t& out) {
+    if (lhs > std::numeric_limits<uint64_t>::max() - rhs) {
+        return false;
+    }
+    out = lhs + rhs;
+    return true;
+}
+
+}  // namespace
 
 #ifdef USE_NOF
 SpdkNofQos::SpdkNofQos(uint32_t block_size) {
@@ -1023,6 +1043,8 @@ std::optional<TransferFuture> TransferSubmitter::submit(
         LOG(ERROR) << "NoF transfer requested while USE_NOF is disabled";
         return std::nullopt;
 #endif
+    } else if (replica.is_gds_ssd_replica()) {
+        future = submitGdsSsdOperation(replica, slices, op_code);
     } else {
         future = submitFileReadOperation(replica, slices, op_code);
     }
@@ -1327,6 +1349,121 @@ std::optional<TransferFuture> TransferSubmitter::submitSpdkNofOperation(
     return TransferFuture(state);
 }
 #endif
+
+std::optional<TransferFuture> TransferSubmitter::submitGdsSsdOperation(
+    const Replica::Descriptor& replica, const std::vector<Slice>& slices,
+    TransferRequest::OpCode op_code) {
+    if (!engine_.isUsingTent()) {
+        LOG(ERROR) << "GDS SSD transfer requires the TENT transfer engine";
+        return std::nullopt;
+    }
+
+    const auto& descriptor = replica.get_gds_ssd_descriptor();
+    const uint64_t alignment = descriptor.allocation_alignment;
+    if (descriptor.segment_uri.empty() || descriptor.object_size == 0 ||
+        descriptor.block_size == 0 || alignment == 0 ||
+        alignment % descriptor.block_size != 0) {
+        LOG(ERROR) << "Invalid GDS SSD descriptor: segment_uri='"
+                   << descriptor.segment_uri
+                   << "', object_size=" << descriptor.object_size
+                   << ", block_size=" << descriptor.block_size
+                   << ", allocation_alignment=" << alignment;
+        return std::nullopt;
+    }
+    if (!IsAligned(descriptor.offset, alignment) ||
+        !IsAligned(descriptor.object_size, alignment)) {
+        LOG(ERROR) << "Unaligned GDS SSD descriptor: segment_name="
+                   << descriptor.segment_name
+                   << ", offset=" << descriptor.offset
+                   << ", object_size=" << descriptor.object_size
+                   << ", alignment=" << alignment;
+        return std::nullopt;
+    }
+
+    uint64_t replica_end = 0;
+    if (!CheckedAdd(descriptor.offset, descriptor.object_size, replica_end)) {
+        LOG(ERROR) << "GDS SSD descriptor range overflows: segment_name="
+                   << descriptor.segment_name
+                   << ", offset=" << descriptor.offset
+                   << ", object_size=" << descriptor.object_size;
+        return std::nullopt;
+    }
+
+    SegmentHandle seg = engine_.openSegment(descriptor.segment_uri);
+    if (seg == static_cast<uint64_t>(ERR_INVALID_ARGUMENT)) {
+        LOG(ERROR) << "Failed to open GDS SSD segment uri='"
+                   << descriptor.segment_uri << "'";
+        return std::nullopt;
+    }
+
+    std::vector<TransferRequest> requests;
+    requests.reserve(slices.size());
+    uint64_t logical_offset = 0;
+    for (const auto& slice : slices) {
+        if (slice.size == 0) {
+            continue;
+        }
+        if (slice.ptr == nullptr) {
+            LOG(ERROR) << "GDS SSD transfer got a null slice pointer";
+            return std::nullopt;
+        }
+        if (!IsAligned(static_cast<uint64_t>(slice.size), alignment)) {
+            LOG(ERROR) << "Unaligned GDS SSD slice: segment_name="
+                       << descriptor.segment_name
+                       << ", slice_size=" << slice.size
+                       << ", alignment=" << alignment;
+            return std::nullopt;
+        }
+
+        uint64_t next_offset = 0;
+        if (!CheckedAdd(logical_offset, static_cast<uint64_t>(slice.size),
+                        next_offset) ||
+            next_offset > descriptor.object_size) {
+            LOG(ERROR) << "GDS SSD transfer range exceeds object: segment_name="
+                       << descriptor.segment_name
+                       << ", logical_offset=" << logical_offset
+                       << ", slice_size=" << slice.size
+                       << ", object_size=" << descriptor.object_size;
+            return std::nullopt;
+        }
+
+        uint64_t target_offset = 0;
+        if (!CheckedAdd(descriptor.offset, logical_offset, target_offset) ||
+            !IsAligned(target_offset, alignment) ||
+            target_offset >= replica_end) {
+            LOG(ERROR) << "Invalid GDS SSD target offset: segment_name="
+                       << descriptor.segment_name
+                       << ", target_offset=" << target_offset
+                       << ", replica_end=" << replica_end
+                       << ", alignment=" << alignment;
+            return std::nullopt;
+        }
+
+        TransferRequest request;
+        request.opcode = op_code;
+        request.source = static_cast<char*>(slice.ptr);
+        request.target_id = seg;
+        request.target_offset = target_offset;
+        request.length = slice.size;
+        request.transport_hint = kTentGdsTransportHint;
+        requests.emplace_back(request);
+        logical_offset = next_offset;
+    }
+
+    if (logical_offset != descriptor.object_size) {
+        LOG(ERROR) << "GDS SSD transfer size mismatch: segment_name="
+                   << descriptor.segment_name
+                   << ", slices_size=" << logical_offset
+                   << ", object_size=" << descriptor.object_size;
+        return std::nullopt;
+    }
+    if (requests.empty()) {
+        LOG(ERROR) << "GDS SSD transfer has no requests";
+        return std::nullopt;
+    }
+
+    return submitTransfer(requests);
+}
 
 std::optional<TransferFuture> TransferSubmitter::submitFileReadOperation(
     const Replica::Descriptor& replica, std::vector<Slice>& slices,

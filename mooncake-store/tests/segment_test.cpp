@@ -816,8 +816,14 @@ TEST_F(SegmentTest, GdsSsdSegmentManagerAllocatesResolvesAndReleases) {
     auto access = gds_segment_manager.getGdsSsdSegmentAccess();
     ASSERT_EQ(access.MountSegment(segment), ErrorCode::OK);
 
-    auto allocation = access.AllocateReplica(8192, {"gds_pool_0"});
+    auto allocation =
+        access.AllocateReplica(8192, {"gds_pool_0"}, {}, "host-a");
     ASSERT_TRUE(allocation.has_value());
+
+    auto inaccessible_allocation =
+        access.AllocateReplica(4096, {}, {}, "host-b");
+    EXPECT_FALSE(inaccessible_allocation.has_value());
+    EXPECT_EQ(inaccessible_allocation.error(), ErrorCode::NO_AVAILABLE_HANDLE);
     const GdsSsdReplicaMeta meta = allocation.value();
     EXPECT_EQ(meta.segment_id, segment.id);
     EXPECT_EQ(meta.segment_name, segment.name);

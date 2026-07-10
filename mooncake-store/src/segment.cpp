@@ -3,6 +3,7 @@
 #include "master_metric_manager.h"
 #include "utils/zstd_util.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <functional>
 #include <limits>
@@ -1489,6 +1490,18 @@ bool CheckedRangeEnd(uint64_t base, uint64_t size, uint64_t& end) {
     return true;
 }
 
+bool HasAliveGdsSsdAccessor(const GdsSsdSegment& segment,
+                            const std::string& client_host) {
+    if (client_host.empty()) {
+        return true;
+    }
+    return std::any_of(segment.accessors.begin(), segment.accessors.end(),
+                       [&client_host](const GdsSsdAccessor& accessor) {
+                           return accessor.client_host == client_host &&
+                                  accessor.alive;
+                       });
+}
+
 ErrorCode ValidateGdsSsdAccessor(const GdsSsdSegment& segment,
                                  const GdsSsdAccessor& accessor) {
     if (accessor.client_host.empty() || accessor.segment_uri.empty()) {
@@ -1615,7 +1628,8 @@ ErrorCode ScopedGdsSsdSegmentAccess::MountSegment(
 tl::expected<GdsSsdReplicaMeta, ErrorCode>
 ScopedGdsSsdSegmentAccess::AllocateReplica(
     size_t object_size, const std::vector<std::string>& preferred_segments,
-    const std::set<std::string>& excluded_segments) {
+    const std::set<std::string>& excluded_segments,
+    const std::string& client_host) {
     if (object_size == 0) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
@@ -1630,27 +1644,30 @@ ScopedGdsSsdSegmentAccess::AllocateReplica(
         }
         const auto& segment = segment_it->second.segment;
         if (excluded_segments.contains(segment.name) ||
-            candidate_names.contains(segment.name)) {
+            candidate_names.contains(segment.name) ||
+            !HasAliveGdsSsdAccessor(segment, client_host)) {
             return;
         }
         candidate_names.insert(segment.name);
         candidates.push_back(segment_id);
     };
 
-    for (const auto& segment_name : preferred_segments) {
-        if (excluded_segments.contains(segment_name)) {
-            continue;
+    if (!preferred_segments.empty()) {
+        for (const auto& segment_name : preferred_segments) {
+            if (excluded_segments.contains(segment_name)) {
+                continue;
+            }
+            auto name_it = gds_segment_manager_->segment_id_by_name_.find(
+                segment_name);
+            if (name_it != gds_segment_manager_->segment_id_by_name_.end()) {
+                add_candidate(name_it->second);
+            }
         }
-        auto name_it = gds_segment_manager_->segment_id_by_name_.find(
-            segment_name);
-        if (name_it != gds_segment_manager_->segment_id_by_name_.end()) {
-            add_candidate(name_it->second);
+    } else {
+        for (const auto& segment_entry :
+             gds_segment_manager_->mounted_segments_) {
+            add_candidate(segment_entry.first);
         }
-    }
-
-    for (const auto& [segment_id, mounted_segment] :
-         gds_segment_manager_->mounted_segments_) {
-        add_candidate(segment_id);
     }
 
     if (candidates.empty()) {

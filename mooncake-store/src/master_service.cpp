@@ -2968,13 +2968,25 @@ auto MasterService::AllocateAndInsertMetadata(
             return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
         }
 
+        const std::string writer_host_id =
+            config.host_id.empty() ? GetClientHostId(client_id)
+                                   : config.host_id;
+        if (writer_host_id.empty()) {
+            VLOG(1) << "Failed to allocate GDS SSD replicas for key=" << key
+                    << ", error=missing_client_host";
+            MasterMetricManager::instance().inc_put_start_alloc_failures();
+            abort_reserved_quota();
+            return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+        }
+
         auto gds_access = gds_ssd_segment_manager_.getGdsSsdSegmentAccess();
         std::set<std::string> excluded_gds_segments;
         ErrorCode first_gds_error = ErrorCode::OK;
         while (allocated_gds_replicas < config.gds_replica_num) {
             auto allocation_result = gds_access.AllocateReplica(
                 static_cast<size_t>(value_length),
-                config.preferred_gds_segments, excluded_gds_segments);
+                config.preferred_gds_segments, excluded_gds_segments,
+                writer_host_id);
             if (!allocation_result) {
                 first_gds_error = allocation_result.error();
                 break;

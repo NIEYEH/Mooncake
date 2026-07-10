@@ -379,7 +379,8 @@ class ScopedGdsSsdSegmentAccess {
     tl::expected<GdsSsdReplicaMeta, ErrorCode> AllocateReplica(
         size_t object_size,
         const std::vector<std::string>& preferred_segments = {},
-        const std::set<std::string>& excluded_segments = {});
+        const std::set<std::string>& excluded_segments = {},
+        const std::string& client_host = {});
 
     ErrorCode ReleaseReplica(const GdsSsdReplicaMeta& meta);
 
