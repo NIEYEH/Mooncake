@@ -6,11 +6,190 @@
 #include <boost/functional/hash.hpp>
 
 #include <algorithm>
+#include <cerrno>
+#include <cstdlib>
+#include <cstring>
 #include <functional>
+#include <memory>
 #include <string>
 #include <vector>
 
+#ifdef __linux__
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
+
+#if defined(USE_TENT) && defined(USE_GDS)
+#include <cufile.h>
+
+#include "tent/common/config.h"
+#include "tent/transfer_engine.h"
+#endif
+
 namespace mooncake {
+
+namespace {
+
+#if defined(__linux__) && defined(USE_TENT) && defined(USE_GDS)
+constexpr char kGdsTestPathEnv[] = "MOONCAKE_GDS_TEST_PATH";
+constexpr size_t kGdsTestFileSize = 4 * 1024 * 1024;
+
+class ScopedFd {
+   public:
+    explicit ScopedFd(int fd) : fd_(fd) {}
+    ~ScopedFd() {
+        if (fd_ >= 0) {
+            close(fd_);
+        }
+    }
+
+    ScopedFd(const ScopedFd&) = delete;
+    ScopedFd& operator=(const ScopedFd&) = delete;
+
+    int get() const { return fd_; }
+
+   private:
+    int fd_;
+};
+
+class GdsTestTarget {
+   public:
+    ~GdsTestTarget() {
+        if (remove_on_destroy && !path.empty()) {
+            unlink(path.c_str());
+        }
+    }
+
+    GdsTestTarget(const GdsTestTarget&) = delete;
+    GdsTestTarget& operator=(const GdsTestTarget&) = delete;
+
+    static std::unique_ptr<GdsTestTarget> Prepare(const std::string& input,
+                                                  std::string& error) {
+        auto target = std::unique_ptr<GdsTestTarget>(new GdsTestTarget());
+        std::string requested_scheme;
+        target->path = input;
+
+        constexpr char kBlockPrefix[] = "block://";
+        constexpr char kFilePrefix[] = "file://";
+        if (input.rfind(kBlockPrefix, 0) == 0) {
+            requested_scheme = "block";
+            target->path = input.substr(std::strlen(kBlockPrefix));
+        } else if (input.rfind(kFilePrefix, 0) == 0) {
+            requested_scheme = "file";
+            target->path = input.substr(std::strlen(kFilePrefix));
+        }
+
+        if (target->path.empty()) {
+            error = "test path is empty";
+            return nullptr;
+        }
+
+        struct stat st{};
+        if (stat(target->path.c_str(), &st) != 0) {
+            error = "stat failed for '" + target->path + "': " +
+                    std::strerror(errno);
+            return nullptr;
+        }
+
+        if (S_ISDIR(st.st_mode)) {
+            if (requested_scheme == "block") {
+                error = "block:// target is a directory: " + target->path;
+                return nullptr;
+            }
+            if (!target->path.empty() && target->path.back() != '/') {
+                target->path += '/';
+            }
+            target->path += ".mooncake-gds-segment-test-" +
+                            std::to_string(static_cast<uint64_t>(getpid()));
+
+            ScopedFd fd(open(target->path.c_str(),
+                             O_CREAT | O_EXCL | O_RDWR | O_DIRECT, 0600));
+            if (fd.get() < 0) {
+                error = "failed to create an O_DIRECT test file in the "
+                        "mount directory '" +
+                        target->path + "': " + std::strerror(errno);
+                return nullptr;
+            }
+            target->remove_on_destroy = true;
+            if (ftruncate(fd.get(), kGdsTestFileSize) != 0) {
+                error = "failed to size test file '" + target->path +
+                        "': " + std::strerror(errno);
+                return nullptr;
+            }
+            target->uri = std::string(kFilePrefix) + target->path;
+            target->expected_size = kGdsTestFileSize;
+            return target;
+        }
+
+        const bool is_block = S_ISBLK(st.st_mode);
+        const bool is_regular_file = S_ISREG(st.st_mode);
+        if (!is_block && !is_regular_file) {
+            error = "target is neither a block device, regular file, nor "
+                    "directory: " +
+                    target->path;
+            return nullptr;
+        }
+        if (requested_scheme == "block" && !is_block) {
+            error = "block:// target is not a block device: " + target->path;
+            return nullptr;
+        }
+        if (requested_scheme == "file" && !is_regular_file) {
+            error = "file:// target is not a regular file: " + target->path;
+            return nullptr;
+        }
+
+        ScopedFd fd(open(target->path.c_str(), O_RDWR | O_DIRECT));
+        if (fd.get() < 0) {
+            error = "failed to open '" + target->path +
+                    "' with O_RDWR | O_DIRECT: " + std::strerror(errno);
+            return nullptr;
+        }
+
+        target->uri = std::string(is_block ? kBlockPrefix : kFilePrefix) +
+                      target->path;
+        target->is_block_device = is_block;
+        target->expected_size = is_regular_file
+                                    ? static_cast<uint64_t>(st.st_size)
+                                    : 0;
+        return target;
+    }
+
+    std::string path;
+    std::string uri;
+    uint64_t expected_size{0};
+    bool is_block_device{false};
+    bool remove_on_destroy{false};
+
+   private:
+    GdsTestTarget() = default;
+};
+
+bool RegisterGdsStorageHandle(const std::string& path, std::string& error) {
+    ScopedFd fd(open(path.c_str(), O_RDWR | O_DIRECT));
+    if (fd.get() < 0) {
+        error = "failed to reopen '" + path +
+                "' for cuFile registration: " + std::strerror(errno);
+        return false;
+    }
+
+    CUfileDescr_t descriptor{};
+    descriptor.type = CU_FILE_HANDLE_TYPE_OPAQUE_FD;
+    descriptor.handle.fd = fd.get();
+
+    CUfileHandle_t handle = nullptr;
+    const auto result = cuFileHandleRegister(&handle, &descriptor);
+    if (result.err != CU_FILE_SUCCESS) {
+        error = "cuFileHandleRegister failed for '" + path +
+                "' with error code " + std::to_string(result.err);
+        return false;
+    }
+    cuFileHandleDeregister(handle);
+    return true;
+}
+#endif
+
+}  // namespace
 
 // Test fixture for Segment tests
 class SegmentTest : public ::testing::Test {
@@ -854,5 +1033,67 @@ TEST_F(SegmentTest, GdsSsdSegmentManagerAllocatesResolvesAndReleases) {
               ErrorCode::OK);
     EXPECT_EQ(used, 0);
     EXPECT_EQ(capacity, segment.size);
+}
+
+TEST_F(SegmentTest, GdsSsdLocalNvmeOfPathCanBeOpenedByTent) {
+#if !defined(__linux__)
+    GTEST_SKIP() << "GDS storage path probing requires Linux";
+#elif !defined(USE_TENT) || !defined(USE_GDS)
+    GTEST_SKIP() << "Rebuild with USE_TENT=ON, USE_CUDA=ON, and cuFile "
+                    "available to run the GDS storage path probe";
+#else
+    const char* configured_path = std::getenv(kGdsTestPathEnv);
+    if (configured_path == nullptr || configured_path[0] == '\0') {
+        GTEST_SKIP() << "Set " << kGdsTestPathEnv
+                     << " to a locally visible NVMe-oF block device, regular "
+                        "file, or mounted directory";
+    }
+
+    std::string prepare_error;
+    auto target = GdsTestTarget::Prepare(configured_path, prepare_error);
+    ASSERT_NE(target, nullptr) << prepare_error;
+
+    auto config = std::make_shared<tent::Config>();
+    config->set("metadata_type", "p2p");
+    config->set("metadata_servers", "");
+    config->set("rpc_server_hostname", "127.0.0.1");
+    config->set("rpc_server_port", "0");
+    config->set("local_segment_name", "gds_path_probe");
+    config->set("metrics/enabled", false);
+    config->set("transports/tcp/enable", false);
+    config->set("transports/shm/enable", false);
+    config->set("transports/rdma/enable", false);
+    config->set("transports/io_uring/enable", false);
+    config->set("transports/nvlink/enable", false);
+    config->set("transports/mnnvl/enable", false);
+    config->set("transports/gds/enable", true);
+
+    tent::TransferEngine engine(config);
+    ASSERT_TRUE(engine.available()) << "failed to initialize TENT";
+
+    tent::SegmentID segment_id = 0;
+    auto status = engine.openSegment(segment_id, target->uri);
+    ASSERT_TRUE(status.ok()) << status.ToString();
+
+    tent::SegmentInfo info;
+    status = engine.getSegmentInfo(segment_id, info);
+    ASSERT_TRUE(status.ok())
+        << "TENT could not resolve/open " << target->uri << ": "
+        << status.ToString();
+    ASSERT_EQ(info.type, tent::SegmentInfo::File);
+    ASSERT_EQ(info.buffers.size(), 1u);
+    if (target->is_block_device) {
+        EXPECT_GT(info.buffers[0].length, 0u);
+    } else {
+        EXPECT_EQ(info.buffers[0].length, target->expected_size);
+    }
+
+    std::string cufile_error;
+    EXPECT_TRUE(RegisterGdsStorageHandle(target->path, cufile_error))
+        << cufile_error;
+
+    status = engine.closeSegment(segment_id);
+    EXPECT_TRUE(status.ok()) << status.ToString();
+#endif
 }
 }  // namespace mooncake
