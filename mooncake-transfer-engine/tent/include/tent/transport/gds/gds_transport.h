@@ -18,6 +18,8 @@
 #include <bits/stdint-uintn.h>
 
 #include <cstddef>
+#include <cstdint>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -53,6 +55,9 @@ struct GdsSubBatch : public Transport::SubBatch {
     std::vector<IOParamRange> io_param_ranges;
     std::vector<CUfileIOParams_t> io_params;
     std::vector<CUfileIOEvents_t> io_events;
+    std::vector<TransferStatusEnum> io_statuses;
+    std::vector<size_t> io_transferred_bytes;
+    std::mutex status_lock;
     virtual size_t size() const { return io_param_ranges.size(); }
 };
 
@@ -91,6 +96,15 @@ class GdsTransport : public Transport {
 
     GdsFileContext* findFileContext(SegmentID target_id);
 
+    Status validateRequest(const Request& request);
+
+    bool findRegisteredBuffer(const void* addr, size_t length,
+                              void*& registered_base,
+                              size_t& registered_offset);
+
+    Status resolveIoBuffer(const Request& request, void*& io_base,
+                           size_t& io_offset);
+
    private:
     bool installed_;
     std::string local_segment_name_;
@@ -112,6 +126,9 @@ class GdsTransport : public Transport {
     // Track all allocated sub-batches to clean up on uninstall
     std::vector<GdsSubBatch*> allocated_batches_;
     std::mutex allocated_batches_lock_;
+
+    std::map<std::uintptr_t, size_t> registered_buffers_;
+    std::mutex registered_buffers_lock_;
 };
 }  // namespace tent
 }  // namespace mooncake

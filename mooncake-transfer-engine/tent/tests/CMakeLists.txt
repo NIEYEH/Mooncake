@@ -95,6 +95,15 @@ target_include_directories(tent_rdma_transport_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME tent_rdma_transport_test COMMAND tent_rdma_transport_test)
 
+if(TARGET tent_xport_gds)
+  add_executable(tent_gds_block_io_test gds_block_io_test.cpp)
+  target_link_libraries(tent_gds_block_io_test
+                        PRIVATE gtest gtest_main tent_link_group)
+  target_include_directories(tent_gds_block_io_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  add_test(NAME tent_gds_block_io_test COMMAND tent_gds_block_io_test)
+endif()
+
 if(USE_HIP)
   find_package(HIP REQUIRED)
   add_executable(tent_rocm_platform_test rocm_platform_test.cpp)

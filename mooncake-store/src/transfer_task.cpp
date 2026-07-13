@@ -1401,15 +1401,20 @@ std::optional<TransferFuture> TransferSubmitter::submitGdsSsdOperation(
     uint64_t logical_offset = 0;
     for (const auto& slice : slices) {
         if (slice.size == 0) {
-            continue;
+            LOG(ERROR) << "GDS SSD transfer got a zero-length slice";
+            return std::nullopt;
         }
         if (slice.ptr == nullptr) {
             LOG(ERROR) << "GDS SSD transfer got a null slice pointer";
             return std::nullopt;
         }
-        if (!IsAligned(static_cast<uint64_t>(slice.size), alignment)) {
+        const auto source_address = static_cast<uint64_t>(
+            reinterpret_cast<std::uintptr_t>(slice.ptr));
+        if (!IsAligned(source_address, alignment) ||
+            !IsAligned(static_cast<uint64_t>(slice.size), alignment)) {
             LOG(ERROR) << "Unaligned GDS SSD slice: segment_name="
                        << descriptor.segment_name
+                       << ", ptr=" << slice.ptr
                        << ", slice_size=" << slice.size
                        << ", alignment=" << alignment;
             return std::nullopt;

@@ -23,6 +23,7 @@
 #include <cstdint>
 #include <cstring>
 #include <iomanip>
+#include <limits>
 #include <memory>
 #include <mutex>
 
@@ -115,8 +116,13 @@ Status GdsTransport::install(std::string& local_segment_name,
     local_segment_name_ = local_segment_name;
     local_topology_ = local_topology;
     conf_ = conf;
+    const int configured_batch_depth =
+        conf_->get("transports/gds/io_batch_depth", 32);
+    if (configured_batch_depth <= 0)
+        return Status::InvalidArgument(
+            "GDS io_batch_depth must be greater than zero" LOC_MARK);
+    io_batch_depth_ = static_cast<size_t>(configured_batch_depth);
     installed_ = true;
-    io_batch_depth_ = conf_->get("transports/gds/io_batch_depth", 32);
     caps.dram_to_file = true;
     caps.gpu_to_file = true;
     return Status::OK();
@@ -169,7 +175,8 @@ Status GdsTransport::allocateSubBatch(SubBatchRef& batch, size_t max_size) {
 
     // If pool is empty or handle size mismatch, create new handle (expensive
     // operation)
-    if (!batch_handle || batch_handle->max_nr != io_batch_depth_) {
+    if (!batch_handle ||
+        batch_handle->max_nr != static_cast<int>(io_batch_depth_)) {
         // Destroy mismatched handle if exists
         if (batch_handle) {
             cuFileBatchIODestroy(batch_handle->handle);
@@ -177,10 +184,10 @@ Status GdsTransport::allocateSubBatch(SubBatchRef& batch, size_t max_size) {
         }
 
         batch_handle = new BatchHandle();
-        batch_handle->max_nr = io_batch_depth_;
+        batch_handle->max_nr = static_cast<int>(io_batch_depth_);
         // cuFileBatchIOSetUp is time-costly, so we reuse handles
-        auto result =
-            cuFileBatchIOSetUp(&batch_handle->handle, io_batch_depth_);
+        auto result = cuFileBatchIOSetUp(
+            &batch_handle->handle, static_cast<int>(io_batch_depth_));
         if (result.err != CU_FILE_SUCCESS) {
             delete batch_handle;
             Slab<GdsSubBatch>::Get().deallocate(gds_batch);
@@ -196,6 +203,10 @@ Status GdsTransport::allocateSubBatch(SubBatchRef& batch, size_t max_size) {
     gds_batch->io_params.clear();
     gds_batch->io_params.reserve(io_batch_depth_);
     gds_batch->io_param_ranges.clear();
+    gds_batch->io_statuses.clear();
+    gds_batch->io_statuses.reserve(io_batch_depth_);
+    gds_batch->io_transferred_bytes.clear();
+    gds_batch->io_transferred_bytes.reserve(io_batch_depth_);
 
     // Track this batch for cleanup on uninstall
     {
@@ -280,78 +291,301 @@ GdsFileContext* GdsTransport::findFileContext(SegmentID target_id) {
     return tl_file_context_map[target_id].get();
 }
 
+bool GdsTransport::findRegisteredBuffer(const void* addr, size_t length,
+                                        void*& registered_base,
+                                        size_t& registered_offset) {
+    if (!addr || length == 0) return false;
+
+    const auto begin = reinterpret_cast<std::uintptr_t>(addr);
+    if (length > std::numeric_limits<std::uintptr_t>::max() - begin)
+        return false;
+    const auto end = begin + length;
+
+    std::lock_guard<std::mutex> lock(registered_buffers_lock_);
+    auto it = registered_buffers_.upper_bound(begin);
+    if (it == registered_buffers_.begin()) return false;
+    --it;
+    if (it->second > std::numeric_limits<std::uintptr_t>::max() - it->first)
+        return false;
+    if (begin < it->first || end > it->first + it->second) return false;
+    registered_base = reinterpret_cast<void*>(it->first);
+    registered_offset = begin - it->first;
+    return true;
+}
+
+Status GdsTransport::resolveIoBuffer(const Request& request, void*& io_base,
+                                     size_t& io_offset) {
+    if (findRegisteredBuffer(request.source, request.length, io_base,
+                             io_offset))
+        return Status::OK();
+
+    if (Platform::getLoader().getMemoryType(request.source) == MTYPE_CPU) {
+        io_base = request.source;
+        io_offset = 0;
+        return Status::OK();
+    }
+
+    return Status::AddressNotRegistered(
+        "GDS CUDA request is outside a cuFile-registered buffer" LOC_MARK);
+}
+
+Status GdsTransport::validateRequest(const Request& request) {
+    if (request.length == 0)
+        return Status::InvalidArgument(
+            "GDS request length must be greater than zero" LOC_MARK);
+    void* registered_base = nullptr;
+    size_t registered_offset = 0;
+    CHECK_STATUS(resolveIoBuffer(request, registered_base, registered_offset));
+    (void)registered_base;
+    if (registered_offset >
+            static_cast<size_t>(std::numeric_limits<off_t>::max()) ||
+        request.length > static_cast<size_t>(
+                             std::numeric_limits<off_t>::max() -
+                             static_cast<off_t>(registered_offset)))
+        return Status::InvalidArgument(
+            "GDS GPU buffer offset exceeds off_t range" LOC_MARK);
+    const uint64_t max_file_offset =
+        static_cast<uint64_t>(std::numeric_limits<off_t>::max());
+    if (request.target_offset > max_file_offset)
+        return Status::InvalidArgument(
+            "GDS target offset exceeds off_t range" LOC_MARK);
+    if (request.length > max_file_offset - request.target_offset)
+        return Status::InvalidArgument(
+            "GDS target range exceeds off_t range" LOC_MARK);
+
+    const uint64_t request_end = request.target_offset + request.length;
+    return metadata_->segmentManager().withCachedSegment(
+        request.target_id, [&](SegmentDesc* segment) {
+            if (segment->type == SegmentType::File) {
+                const auto& detail =
+                    std::get<FileSegmentDesc>(segment->detail);
+                if (detail.buffers.empty())
+                    return Status::InvalidArgument(
+                        "GDS file segment has no buffers" LOC_MARK);
+
+                const auto& buffer = detail.buffers.front();
+                if (buffer.length >
+                    std::numeric_limits<uint64_t>::max() - buffer.offset)
+                    return Status::InvalidArgument(
+                        "GDS file segment range overflows" LOC_MARK);
+                const uint64_t buffer_end = buffer.offset + buffer.length;
+                if (request.target_offset < buffer.offset ||
+                    request_end > buffer_end)
+                    return Status::InvalidArgument(
+                        "GDS request is outside the file segment" LOC_MARK);
+                return Status::OK();
+            }
+
+            if (segment->type == SegmentType::Block) {
+                const auto& detail =
+                    std::get<BlockSegmentDesc>(segment->detail);
+                if (detail.length >
+                    std::numeric_limits<uint64_t>::max() - detail.offset)
+                    return Status::InvalidArgument(
+                        "GDS block segment range overflows" LOC_MARK);
+                const uint64_t segment_end = detail.offset + detail.length;
+                if (request.target_offset < detail.offset ||
+                    request_end > segment_end)
+                    return Status::InvalidArgument(
+                        "GDS request is outside the block segment" LOC_MARK);
+
+                const uint64_t alignment = detail.allocation_alignment;
+                const auto source =
+                    reinterpret_cast<std::uintptr_t>(request.source);
+                if (alignment == 0 || request.target_offset % alignment != 0 ||
+                    request.length % alignment != 0 || source % alignment != 0)
+                    return Status::InvalidArgument(
+                        "GDS block request is not allocation-aligned" LOC_MARK);
+                return Status::OK();
+            }
+
+            return Status::InvalidArgument(
+                "GDS target is not a file or block segment" LOC_MARK);
+        });
+}
+
 Status GdsTransport::submitTransferTasks(
     SubBatchRef batch, const std::vector<Request>& request_list) {
     const static size_t kMaxSliceSize = 16ull << 20;
     auto gds_batch = dynamic_cast<GdsSubBatch*>(batch);
     if (!gds_batch)
         return Status::InvalidArgument("Invalid GDS sub-batch" LOC_MARK);
+
+    if (request_list.empty())
+        return Status::InvalidArgument("Empty GDS request list" LOC_MARK);
+
+    std::lock_guard<std::mutex> status_guard(gds_batch->status_lock);
+    if (gds_batch->io_param_ranges.size() > gds_batch->max_size ||
+        request_list.size() >
+            gds_batch->max_size - gds_batch->io_param_ranges.size())
+        return Status::TooManyRequests(
+            "Exceed GDS logical batch capacity" LOC_MARK);
     size_t num_params = 0;
     size_t first_param_index = gds_batch->io_params.size();
-    for (auto& request : request_list)
-        num_params += (request.length + kMaxSliceSize - 1) / kMaxSliceSize;
-    if (first_param_index + num_params > io_batch_depth_)
-        return Status::TooManyRequests("Exceed batch capacity" LOC_MARK);
-    for (auto& request : request_list) {
+    std::vector<GdsFileContext*> contexts;
+    std::vector<void*> registered_bases;
+    std::vector<size_t> registered_offsets;
+    contexts.reserve(request_list.size());
+    registered_bases.reserve(request_list.size());
+    registered_offsets.reserve(request_list.size());
+    for (const auto& request : request_list) {
+        auto status = validateRequest(request);
+        if (!status.ok()) {
+            LOG(ERROR) << "Rejected GDS request: target_id="
+                       << request.target_id << ", opcode="
+                       << (request.opcode == Request::READ ? "READ" : "WRITE")
+                       << ", offset=" << request.target_offset
+                       << ", length=" << request.length << ": "
+                       << status.ToString();
+            return status;
+        }
+
+        const size_t request_params =
+            1 + (request.length - 1) / kMaxSliceSize;
+        if (request_params > std::numeric_limits<size_t>::max() - num_params)
+            return Status::TooManyRequests(
+                "GDS request count overflows" LOC_MARK);
+        num_params += request_params;
+
         GdsFileContext* context = findFileContext(request.target_id);
         if (!context || !context->ready())
             return Status::InvalidArgument("Invalid remote segment" LOC_MARK);
+        contexts.push_back(context);
+
+        void* registered_base = nullptr;
+        size_t registered_offset = 0;
+        CHECK_STATUS(
+            resolveIoBuffer(request, registered_base, registered_offset));
+        registered_bases.push_back(registered_base);
+        registered_offsets.push_back(registered_offset);
+    }
+    if (first_param_index > io_batch_depth_ ||
+        num_params > io_batch_depth_ - first_param_index)
+        return Status::TooManyRequests("Exceed batch capacity" LOC_MARK);
+
+    const size_t first_range_index = gds_batch->io_param_ranges.size();
+    for (size_t request_index = 0; request_index < request_list.size();
+         ++request_index) {
+        const auto& request = request_list[request_index];
+        GdsFileContext* context = contexts[request_index];
         IOParamRange range{gds_batch->io_params.size(), 0};
         for (size_t offset = 0; offset < request.length;
              offset += kMaxSliceSize) {
             size_t length = std::min(kMaxSliceSize, request.length - offset);
-            CUfileIOParams_t params;
+            const size_t param_index = gds_batch->io_params.size();
+            CUfileIOParams_t params{};
             params.mode = CUFILE_BATCH;
             params.opcode =
                 (request.opcode == Request::READ) ? CUFILE_READ : CUFILE_WRITE;
-            params.cookie = (void*)0;
-            params.u.batch.devPtr_base = request.source;
-            params.u.batch.devPtr_offset = offset;
+            params.cookie = reinterpret_cast<void*>(
+                static_cast<std::uintptr_t>(param_index + 1));
+            params.u.batch.devPtr_base = registered_bases[request_index];
+            params.u.batch.devPtr_offset =
+                registered_offsets[request_index] + offset;
             params.u.batch.file_offset = request.target_offset + offset;
             params.u.batch.size = length;
             params.fh = context->getHandle();
             gds_batch->io_params.push_back(params);
+            gds_batch->io_statuses.push_back(PENDING);
+            gds_batch->io_transferred_bytes.push_back(0);
             range.count++;
         }
         gds_batch->io_param_ranges.push_back(range);
     }
 
-    auto result =
-        cuFileBatchIOSubmit(gds_batch->batch_handle->handle, num_params,
-                            &gds_batch->io_params[first_param_index], 0);
-    if (result.err != CU_FILE_SUCCESS)
+    auto result = cuFileBatchIOSubmit(
+        gds_batch->batch_handle->handle, static_cast<unsigned>(num_params),
+        &gds_batch->io_params[first_param_index], 0);
+    if (result.err != CU_FILE_SUCCESS) {
+        gds_batch->io_params.resize(first_param_index);
+        gds_batch->io_statuses.resize(first_param_index);
+        gds_batch->io_transferred_bytes.resize(first_param_index);
+        gds_batch->io_param_ranges.resize(first_range_index);
+        LOG(ERROR) << "Failed to submit GDS batch IO: request_count="
+                   << request_list.size() << ", io_count=" << num_params
+                   << ", cuFile_error=" << result.err;
         return Status::InternalError(
             std::string("Failed to submit GDS batch IO: Code ") +
             std::to_string(result.err) + LOC_MARK);
+    }
     return Status::OK();
 }
 
 Status GdsTransport::getTransferStatus(SubBatchRef batch, int task_id,
                                        TransferStatus& status) {
     auto gds_batch = dynamic_cast<GdsSubBatch*>(batch);
-    unsigned num_tasks = gds_batch->io_param_ranges.size();
-    if (task_id < 0 || task_id >= (int)num_tasks)
+    if (!gds_batch)
+        return Status::InvalidArgument("Invalid GDS sub-batch" LOC_MARK);
+
+    std::lock_guard<std::mutex> status_guard(gds_batch->status_lock);
+    const size_t num_tasks = gds_batch->io_param_ranges.size();
+    if (task_id < 0 || static_cast<size_t>(task_id) >= num_tasks)
         return Status::InvalidArgument("Invalid task ID");
     auto range = gds_batch->io_param_ranges[task_id];
-    auto result =
-        cuFileBatchIOGetStatus(gds_batch->batch_handle->handle, 0, &num_tasks,
-                               gds_batch->io_events.data(), nullptr);
-    if (result.err != CU_FILE_SUCCESS)
-        return Status::InternalError(
-            std::string("Failed to get GDS batch status: Code ") +
-            std::to_string(result.err) + LOC_MARK);
-    status.s = PENDING;
-    size_t complete_count = 0;
-    for (size_t index = range.base; index < range.base + range.count; ++index) {
-        auto& event = gds_batch->io_events[index];
-        auto s = parseTransferStatus(event.status);
-        if (s == COMPLETED)
-            complete_count++;
-        else if (s != PENDING)
-            status.s = s;
-        status.transferred_bytes += event.ret;
+
+    size_t pending_count = 0;
+    for (auto io_status : gds_batch->io_statuses) {
+        if (io_status == PENDING) ++pending_count;
     }
-    if (complete_count == range.count) status.s = COMPLETED;
+    if (pending_count != 0) {
+        unsigned num_events = static_cast<unsigned>(std::min<size_t>(
+            pending_count, gds_batch->io_events.size()));
+        auto result = cuFileBatchIOGetStatus(
+            gds_batch->batch_handle->handle, 0, &num_events,
+            gds_batch->io_events.data(), nullptr);
+        if (result.err != CU_FILE_SUCCESS)
+            return Status::InternalError(
+                std::string("Failed to get GDS batch status: Code ") +
+                std::to_string(result.err) + LOC_MARK);
+
+        for (unsigned event_index = 0; event_index < num_events;
+             ++event_index) {
+            const auto& event = gds_batch->io_events[event_index];
+            const std::uintptr_t cookie =
+                reinterpret_cast<std::uintptr_t>(event.cookie);
+            if (cookie == 0 || cookie > gds_batch->io_statuses.size())
+                return Status::InternalError(
+                    "GDS completion returned an invalid cookie" LOC_MARK);
+
+            const size_t param_index = cookie - 1;
+            auto event_status = parseTransferStatus(event.status);
+            if (event_status == COMPLETED) {
+                const size_t expected =
+                    gds_batch->io_params[param_index].u.batch.size;
+                const size_t transferred = static_cast<size_t>(event.ret);
+                if (transferred != expected) {
+                    LOG(ERROR) << "Short GDS IO completion: io_index="
+                               << param_index << ", expected=" << expected
+                               << ", actual=" << transferred;
+                    event_status = FAILED;
+                } else {
+                    gds_batch->io_transferred_bytes[param_index] = transferred;
+                }
+            }
+            gds_batch->io_statuses[param_index] = event_status;
+        }
+        if (num_events != 0) batch->notifyProgress();
+    }
+
+    status = TransferStatus{PENDING, 0};
+    size_t complete_count = 0;
+    size_t terminal_count = 0;
+    for (size_t index = range.base; index < range.base + range.count; ++index) {
+        auto s = gds_batch->io_statuses[index];
+        if (s == COMPLETED) {
+            complete_count++;
+            terminal_count++;
+        } else if (s != PENDING) {
+            terminal_count++;
+            status.s = s;
+        }
+        status.transferred_bytes +=
+            gds_batch->io_transferred_bytes[index];
+    }
+    if (terminal_count != range.count)
+        status.s = PENDING;
+    else if (complete_count == range.count)
+        status.s = COMPLETED;
     return Status::OK();
 }
 
@@ -361,10 +595,21 @@ Status GdsTransport::addMemoryBuffer(BufferDesc& desc,
     LocationParser location(desc.location);
     if (location.type() != "cuda") return Status::OK();
     auto result = cuFileBufRegister((void*)desc.addr, desc.length, 0);
-    if (result.err != CU_FILE_SUCCESS)
+    if (result.err != CU_FILE_SUCCESS) {
+        LOG(ERROR) << "Failed to register GDS buffer: addr="
+                   << reinterpret_cast<void*>(desc.addr)
+                   << ", length=" << desc.length
+                   << ", location=" << desc.location
+                   << ", cuFile_error=" << result.err;
         return Status::InternalError(
             std::string("Failed to register GDS buffer: Code ") +
             std::to_string(result.err) + LOC_MARK);
+    }
+    {
+        std::lock_guard<std::mutex> lock(registered_buffers_lock_);
+        registered_buffers_[static_cast<std::uintptr_t>(desc.addr)] =
+            desc.length;
+    }
     desc.transports.push_back(GDS);
     return Status::OK();
 }
@@ -373,10 +618,20 @@ Status GdsTransport::removeMemoryBuffer(BufferDesc& desc) {
     LocationParser location(desc.location);
     if (location.type() != "cuda") return Status::OK();
     auto result = cuFileBufDeregister((void*)desc.addr);
-    if (result.err != CU_FILE_SUCCESS)
+    {
+        std::lock_guard<std::mutex> lock(registered_buffers_lock_);
+        registered_buffers_.erase(static_cast<std::uintptr_t>(desc.addr));
+    }
+    if (result.err != CU_FILE_SUCCESS) {
+        LOG(ERROR) << "Failed to deregister GDS buffer: addr="
+                   << reinterpret_cast<void*>(desc.addr)
+                   << ", length=" << desc.length
+                   << ", location=" << desc.location
+                   << ", cuFile_error=" << result.err;
         return Status::InternalError(
             std::string("Failed to deregister GDS buffer: Code ") +
             std::to_string(result.err) + LOC_MARK);
+    }
     return Status::OK();
 }
 
