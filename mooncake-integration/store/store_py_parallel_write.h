@@ -745,7 +745,7 @@ int execute_parallelism_tensor_write_from_route(
 int put_tensor_with_writer_shards(
     const std::string &key, pybind11::object tensor,
     const WriterPartitionSpec &writer,
-    const ReplicateConfig &config = ReplicateConfig{}) {
+    const ReplicateConfig &config = DefaultReplicateConfig()) {
     if (!ensure_tensor_write_supported("put_tensor_with_writer_shards")) {
         return to_py_ret(ErrorCode::INVALID_PARAMS);
     }
@@ -826,7 +826,7 @@ int put_direct_parallelism_shard(const std::string &key,
 int put_tensor_with_writer_shards_from(
     const std::string &key, uintptr_t buffer_ptr, size_t size,
     const WriterPartitionSpec &writer,
-    const ReplicateConfig &config = ReplicateConfig{}) {
+    const ReplicateConfig &config = DefaultReplicateConfig()) {
     return execute_writer_partition_shard_write_from(
         key, buffer_ptr, size, writer, config,
         "put_tensor_with_parallelism_from", TensorWriteStoreOps{"put_parts"},
@@ -901,7 +901,7 @@ int execute_put_tensor_with_parallelism_route(
 int put_tensor_with_parallelism(
     const std::string &key, pybind11::object tensor,
     const py::object &parallelism = py::none(),
-    const ReplicateConfig &config = ReplicateConfig{},
+    const ReplicateConfig &config = DefaultReplicateConfig(),
     const py::object &writer_partition = py::none()) {
     auto request = resolve_parallelism_write_request(
         parallelism, writer_partition, "put_tensor_with_parallelism");
@@ -915,7 +915,7 @@ int put_tensor_with_parallelism(
 std::vector<int> batch_put_tensor_with_parallelism(
     const std::vector<std::string> &keys, const pybind11::list &tensors_list,
     const py::object &parallelisms = py::none(),
-    const ReplicateConfig &config = ReplicateConfig{},
+    const ReplicateConfig &config = DefaultReplicateConfig(),
     const py::object &writer_partitions = py::none()) {
     auto group_ids_error = ValidateGroupIdsForBatchConfig(
         config, keys.size(), "batch_put_tensor_with_parallelism");
@@ -1032,7 +1032,7 @@ int execute_put_tensor_with_parallelism_from_route(
 int put_tensor_with_parallelism_from(
     const std::string &key, uintptr_t buffer_ptr, size_t size,
     const py::object &parallelism = py::none(),
-    const ReplicateConfig &config = ReplicateConfig{},
+    const ReplicateConfig &config = DefaultReplicateConfig(),
     const py::object &writer_partition = py::none()) {
     auto request = resolve_parallelism_write_request(
         parallelism, writer_partition, "put_tensor_with_parallelism_from");
@@ -1047,7 +1047,7 @@ std::vector<int> batch_put_tensor_with_parallelism_from(
     const std::vector<std::string> &keys,
     const std::vector<uintptr_t> &buffer_ptrs, const std::vector<size_t> &sizes,
     const py::object &parallelisms = py::none(),
-    const ReplicateConfig &config = ReplicateConfig{},
+    const ReplicateConfig &config = DefaultReplicateConfig(),
     const py::object &writer_partitions = py::none()) {
     auto group_ids_error = ValidateGroupIdsForBatchConfig(
         config, keys.size(), "batch_put_tensor_with_parallelism_from");
@@ -1113,7 +1113,7 @@ std::vector<int> batch_put_tensor_with_parallelism_from(
 int upsert_tensor_with_writer_shards(
     const std::string &key, pybind11::object tensor,
     const WriterPartitionSpec &writer,
-    const ReplicateConfig &config = ReplicateConfig{}) {
+    const ReplicateConfig &config = DefaultReplicateConfig()) {
     if (!ensure_tensor_write_supported("upsert_tensor_with_writer_shards")) {
         return to_py_ret(ErrorCode::INVALID_PARAMS);
     }
@@ -1193,7 +1193,7 @@ int upsert_direct_parallelism_shard(const std::string &key,
 int upsert_tensor_with_writer_shards_from(
     const std::string &key, uintptr_t buffer_ptr, size_t size,
     const WriterPartitionSpec &writer,
-    const ReplicateConfig &config = ReplicateConfig{}) {
+    const ReplicateConfig &config = DefaultReplicateConfig()) {
     return execute_writer_partition_shard_write_from(
         key, buffer_ptr, size, writer, config,
         "upsert_tensor_with_parallelism_from",
@@ -1269,7 +1269,7 @@ int execute_upsert_tensor_with_parallelism_route(
 int upsert_tensor_with_parallelism(
     const std::string &key, pybind11::object tensor,
     const py::object &parallelism = py::none(),
-    const ReplicateConfig &config = ReplicateConfig{},
+    const ReplicateConfig &config = DefaultReplicateConfig(),
     const py::object &writer_partition = py::none()) {
     auto request = resolve_parallelism_write_request(
         parallelism, writer_partition, "upsert_tensor_with_parallelism");
@@ -1357,7 +1357,7 @@ int execute_upsert_tensor_with_parallelism_from_route(
 int upsert_tensor_with_parallelism_from(
     const std::string &key, uintptr_t buffer_ptr, size_t size,
     const py::object &parallelism = py::none(),
-    const ReplicateConfig &config = ReplicateConfig{},
+    const ReplicateConfig &config = DefaultReplicateConfig(),
     const py::object &writer_partition = py::none()) {
     auto request = resolve_parallelism_write_request(
         parallelism, writer_partition, "upsert_tensor_with_parallelism_from");
@@ -1371,7 +1371,7 @@ int upsert_tensor_with_parallelism_from(
 std::vector<int> batch_upsert_tensor_with_parallelism(
     const std::vector<std::string> &keys, const pybind11::list &tensors_list,
     const py::object &parallelisms = py::none(),
-    const ReplicateConfig &config = ReplicateConfig{},
+    const ReplicateConfig &config = DefaultReplicateConfig(),
     const py::object &writer_partitions = py::none()) {
     auto group_ids_error = ValidateGroupIdsForBatchConfig(
         config, keys.size(), "batch_upsert_tensor_with_parallelism");
@@ -1413,7 +1413,7 @@ std::vector<int> batch_upsert_tensor_with_parallelism_from(
     const std::vector<std::string> &keys,
     const std::vector<uintptr_t> &buffer_ptrs, const std::vector<size_t> &sizes,
     const py::object &parallelisms = py::none(),
-    const ReplicateConfig &config = ReplicateConfig{},
+    const ReplicateConfig &config = DefaultReplicateConfig(),
     const py::object &writer_partitions = py::none()) {
     auto group_ids_error = ValidateGroupIdsForBatchConfig(
         config, keys.size(), "batch_upsert_tensor_with_parallelism_from");

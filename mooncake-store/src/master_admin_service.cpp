@@ -28,6 +28,8 @@ const uint64_t kMetricReportIntervalSeconds = 10;
 
 namespace {
 
+const UUID kAdminQueryClientId{0, 0};
+
 std::string AppendMetricSections(std::string primary, std::string secondary) {
     if (!primary.empty() && primary.back() != '\n') {
         primary.push_back('\n');
@@ -566,7 +568,8 @@ void MasterAdminServer::HandleQueryKey(coro_http::coro_http_request& req,
                                        coro_http::coro_http_response& resp) {
     WithActiveService(resp, [&](auto service) {
         auto key = req.get_query_value("key");
-        auto get_result = service->GetReplicaList(std::string(key), "default");
+        auto get_result = service->GetReplicaList(
+            kAdminQueryClientId, std::string(key), "default");
         resp.add_header("Content-Type", "application/json; charset=utf-8");
         if (get_result) {
             std::string ss = "{\"success\":true,\"data\":[";
@@ -961,7 +964,8 @@ void MasterAdminServer::HandleBatchQueryKeys(
         return;
     }
 
-    auto results = service->BatchGetReplicaList(keys, "default");
+    auto results =
+        service->BatchGetReplicaList(kAdminQueryClientId, keys, "default");
     const size_t n = std::min(keys.size(), results.size());
     HttpBatchQueryKeysResponse payload;
     payload.success = true;

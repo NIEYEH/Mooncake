@@ -2,9 +2,11 @@
 #include <pybind11/stl.h>
 #include <numa.h>
 
+#include <cctype>
 #include <functional>
 #include <limits>
 #include <numeric>
+#include <stdexcept>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -350,6 +352,95 @@ std::vector<std::vector<void *>> CastAddrs2Ptrs(
 // ErrorCode values are already negative, so just cast to int
 inline int to_py_ret(ErrorCode error_code) {
     return static_cast<int>(error_code);
+}
+
+size_t ParseReplicaCountEnv(const char *env_name, size_t default_value) {
+    const char *raw_value = std::getenv(env_name);
+    if (raw_value == nullptr) {
+        return default_value;
+    }
+
+    std::string value(raw_value);
+    if (value.empty()) {
+        throw std::invalid_argument(std::string(env_name) +
+                                    " must not be empty");
+    }
+
+    for (char ch : value) {
+        if (!std::isdigit(static_cast<unsigned char>(ch))) {
+            throw std::invalid_argument(std::string(env_name) +
+                                        " must be a non-negative integer");
+        }
+    }
+
+    unsigned long long parsed = 0;
+    try {
+        parsed = std::stoull(value);
+    } catch (const std::exception &) {
+        throw std::invalid_argument(std::string(env_name) +
+                                    " is outside the supported range");
+    }
+
+    if (parsed > std::numeric_limits<size_t>::max()) {
+        throw std::invalid_argument(std::string(env_name) +
+                                    " is outside the supported range");
+    }
+    return static_cast<size_t>(parsed);
+}
+
+std::vector<std::string> ParsePreferredGdsSegmentsEnv() {
+    const char *raw_value = std::getenv("MOONCAKE_PREFERRED_GDS_SEGMENTS");
+    if (raw_value == nullptr) {
+        return {};
+    }
+
+    std::string value(raw_value);
+    if (value.empty()) {
+        throw std::invalid_argument(
+            "MOONCAKE_PREFERRED_GDS_SEGMENTS must not be empty when set");
+    }
+
+    std::vector<std::string> segments;
+    std::unordered_set<std::string> seen_segments;
+    size_t start = 0;
+    while (start <= value.size()) {
+        const size_t end = value.find(',', start);
+        std::string segment = value.substr(
+            start, end == std::string::npos ? std::string::npos : end - start);
+        if (segment.empty()) {
+            throw std::invalid_argument(
+                "MOONCAKE_PREFERRED_GDS_SEGMENTS contains an empty segment");
+        }
+        for (char ch : segment) {
+            if (std::isspace(static_cast<unsigned char>(ch))) {
+                throw std::invalid_argument(
+                    "MOONCAKE_PREFERRED_GDS_SEGMENTS must not contain "
+                    "whitespace");
+            }
+        }
+        if (!seen_segments.insert(segment).second) {
+            throw std::invalid_argument(
+                "MOONCAKE_PREFERRED_GDS_SEGMENTS contains a duplicate "
+                "segment: " +
+                segment);
+        }
+        segments.emplace_back(std::move(segment));
+        if (end == std::string::npos) {
+            break;
+        }
+        start = end + 1;
+    }
+
+    return segments;
+}
+
+ReplicateConfig DefaultReplicateConfig() {
+    ReplicateConfig config;
+    config.replica_num =
+        ParseReplicaCountEnv("MOONCAKE_MEMORY_REPLICA_NUM", 1);
+    config.gds_replica_num = ParseReplicaCountEnv("MOONCAKE_GDS_REPLICA_NUM", 0);
+    config.preferred_gds_segments = ParsePreferredGdsSegmentsEnv();
+    return config;
 }
 
 #include "store_py_internal.h"
@@ -780,7 +871,7 @@ class MooncakeStorePyWrapper {
             return to_py_ret(ErrorCode::INVALID_PARAMS);
         }
         return put_tensor_impl(key, tensor,
-                               ReplicateConfig{});  // Default config
+                               DefaultReplicateConfig());  // Default config
     }
 
     ReplicateConfig MakeIndexedConfig(
@@ -835,7 +926,7 @@ class MooncakeStorePyWrapper {
 
     int put_tensor_with_tp_impl(
         const std::string &key, pybind11::object tensor,
-        const ReplicateConfig &config = ReplicateConfig{}, int tp_rank = 0,
+        const ReplicateConfig &config = DefaultReplicateConfig(), int tp_rank = 0,
         int tp_size = 1, int split_dim = 0) {
         try {
             std::vector<std::string> tp_keys;
@@ -871,14 +962,14 @@ class MooncakeStorePyWrapper {
         }
         if (tp_size <= 1) return put_tensor(key, tensor);
 
-        return put_tensor_with_tp_impl(key, tensor, ReplicateConfig{}, tp_rank,
+        return put_tensor_with_tp_impl(key, tensor, DefaultReplicateConfig(), tp_rank,
                                        tp_size, split_dim);
     }
 
     std::vector<int> batch_put_tensor_infos_impl(
         const std::vector<std::string> &keys,
         const std::vector<PyTensorInfo> &infos,
-        const ReplicateConfig &config = ReplicateConfig{}) {
+        const ReplicateConfig &config = DefaultReplicateConfig()) {
         return batch_write_tensor_impl(
             keys, infos, config, "put",
             [this](const std::vector<std::string> &write_keys,
@@ -893,7 +984,7 @@ class MooncakeStorePyWrapper {
     std::vector<int> batch_put_tensor_impl(
         const std::vector<std::string> &keys,
         const pybind11::list &tensors_list,
-        const ReplicateConfig &config = ReplicateConfig{}) {
+        const ReplicateConfig &config = DefaultReplicateConfig()) {
         std::vector<PyTensorInfo> infos(keys.size());
         for (size_t i = 0; i < keys.size(); ++i) {
             infos[i] = extract_tensor_info(tensors_list[i], keys[i]);
@@ -913,13 +1004,13 @@ class MooncakeStorePyWrapper {
                                     to_py_ret(ErrorCode::INVALID_PARAMS));
         }
 
-        return batch_put_tensor_impl(keys, tensors_list, ReplicateConfig{});
+        return batch_put_tensor_impl(keys, tensors_list, DefaultReplicateConfig());
     }
 
     std::vector<int> batch_put_tensor_with_tp_impl(
         const std::vector<std::string> &base_keys,
         const pybind11::list &tensors_list,
-        const ReplicateConfig &config = ReplicateConfig{}, int tp_rank = 0,
+        const ReplicateConfig &config = DefaultReplicateConfig(), int tp_rank = 0,
         int tp_size = 1, int split_dim = 0) {
         std::vector<std::string> all_chunk_keys;
         std::vector<PyTensorInfo> all_chunk_infos;
@@ -1004,7 +1095,7 @@ class MooncakeStorePyWrapper {
         }
 
         return batch_put_tensor_with_tp_impl(base_keys, tensors_list,
-                                             ReplicateConfig{}, tp_rank,
+                                             DefaultReplicateConfig(), tp_rank,
                                              tp_size, split_dim);
     }
 
@@ -1034,7 +1125,7 @@ class MooncakeStorePyWrapper {
             return to_py_ret(ErrorCode::INVALID_PARAMS);
         }
         py::gil_scoped_release release_gil;
-        return store_->put_from(key, buffer, size, ReplicateConfig{});
+        return store_->put_from(key, buffer, size, DefaultReplicateConfig());
     }
 
     std::vector<int> batch_put_tensor_from(
@@ -1088,7 +1179,7 @@ class MooncakeStorePyWrapper {
             buffers.push_back(reinterpret_cast<void *>(ptr));
         }
         py::gil_scoped_release release_gil;
-        return store_->batch_put_from(keys, buffers, sizes, ReplicateConfig{});
+        return store_->batch_put_from(keys, buffers, sizes, DefaultReplicateConfig());
     }
 
     int put_tensor_info_impl(const std::string &key, const PyTensorInfo &info,
@@ -1160,7 +1251,7 @@ class MooncakeStorePyWrapper {
                           "put_tensor_with_tp_from";
             return to_py_ret(ErrorCode::INVALID_PARAMS);
         }
-        return put_tensor_with_tp_impl(key, tensor, ReplicateConfig{}, tp_rank,
+        return put_tensor_with_tp_impl(key, tensor, DefaultReplicateConfig(), tp_rank,
                                        tp_size, split_dim);
     }
 
@@ -1235,7 +1326,7 @@ class MooncakeStorePyWrapper {
         }
 
         std::vector<int> op_results = batch_put_tensor_with_tp_impl(
-            valid_keys, tensors_list, ReplicateConfig{}, tp_rank, tp_size,
+            valid_keys, tensors_list, DefaultReplicateConfig(), tp_rank, tp_size,
             split_dim);
         for (size_t i = 0; i < processed_indices.size(); ++i) {
             final_results[processed_indices[i]] = op_results[i];
@@ -1344,12 +1435,12 @@ class MooncakeStorePyWrapper {
                           "supported for tensors";
             return to_py_ret(ErrorCode::INVALID_PARAMS);
         }
-        return upsert_tensor_impl(key, tensor, ReplicateConfig{});
+        return upsert_tensor_impl(key, tensor, DefaultReplicateConfig());
     }
 
     int upsert_tensor_with_tp_impl(
         const std::string &key, pybind11::object tensor,
-        const ReplicateConfig &config = ReplicateConfig{}, int tp_size = 1,
+        const ReplicateConfig &config = DefaultReplicateConfig(), int tp_size = 1,
         int split_dim = 0) {
         try {
             auto infos = build_tp_shard_infos(
@@ -1424,13 +1515,13 @@ class MooncakeStorePyWrapper {
         }
         py::gil_scoped_release release_gil;
         return store_->batch_upsert_from(keys, buffers, sizes,
-                                         ReplicateConfig{});
+                                         DefaultReplicateConfig());
     }
 
     std::vector<int> batch_upsert_tensor_impl(
         const std::vector<std::string> &keys,
         const pybind11::list &tensors_list,
-        const ReplicateConfig &config = ReplicateConfig{}) {
+        const ReplicateConfig &config = DefaultReplicateConfig()) {
         auto group_ids_error = ValidateGroupIdsForBatchConfig(
             config, keys.size(), "batch_upsert_tensor");
         if (!group_ids_error.empty()) {
@@ -1517,7 +1608,7 @@ class MooncakeStorePyWrapper {
                                     to_py_ret(ErrorCode::INVALID_PARAMS));
         }
 
-        return batch_upsert_tensor_impl(keys, tensors_list, ReplicateConfig{});
+        return batch_upsert_tensor_impl(keys, tensors_list, DefaultReplicateConfig());
     }
 
     int upsert_tensor_from(const std::string &key, uintptr_t buffer_ptr,
@@ -1546,11 +1637,11 @@ class MooncakeStorePyWrapper {
             return to_py_ret(ErrorCode::INVALID_PARAMS);
         }
         py::gil_scoped_release release_gil;
-        return store_->upsert_from(key, buffer, size, ReplicateConfig{});
+        return store_->upsert_from(key, buffer, size, DefaultReplicateConfig());
     }
 
     int validate_replicate_config(
-        const ReplicateConfig &config = ReplicateConfig{}) {
+        const ReplicateConfig &config = DefaultReplicateConfig()) {
         if (!config.preferred_segments.empty() &&
             config.preferred_segments.size() != config.replica_num) {
             LOG(ERROR) << "Preferred segments size ("
@@ -1563,7 +1654,7 @@ class MooncakeStorePyWrapper {
     }
 
     int upsert_pub_tensor(const std::string &key, pybind11::object tensor,
-                          const ReplicateConfig &config = ReplicateConfig{}) {
+                          const ReplicateConfig &config = DefaultReplicateConfig()) {
         if (!is_client_initialized() || use_dummy_client_) {
             LOG(ERROR) << "Client not initialized or Dummy client not "
                           "supported for tensors";
@@ -1579,7 +1670,7 @@ class MooncakeStorePyWrapper {
     std::vector<int> batch_upsert_pub_tensor(
         const std::vector<std::string> &keys,
         const pybind11::list &tensors_list,
-        const ReplicateConfig &config = ReplicateConfig{}) {
+        const ReplicateConfig &config = DefaultReplicateConfig()) {
         if (!is_client_initialized() || use_dummy_client_)
             return std::vector<int>(keys.size(),
                                     to_py_ret(ErrorCode::INVALID_PARAMS));
@@ -1601,7 +1692,7 @@ class MooncakeStorePyWrapper {
 
     // --- End Upsert tensor methods ---
     int pub_tensor(const std::string &key, pybind11::object tensor,
-                   const ReplicateConfig &config = ReplicateConfig{}) {
+                   const ReplicateConfig &config = DefaultReplicateConfig()) {
         if (!is_client_initialized() || use_dummy_client_) {
             LOG(ERROR) << "Client not initialized or Dummy client not "
                           "supported for tensors";
@@ -1615,7 +1706,7 @@ class MooncakeStorePyWrapper {
     }
 
     int pub_tensor_with_tp(const std::string &key, pybind11::object tensor,
-                           const ReplicateConfig &config = ReplicateConfig{},
+                           const ReplicateConfig &config = DefaultReplicateConfig(),
                            int tp_rank = 0, int tp_size = 1,
                            int split_dim = 0) {
         if (!is_client_initialized() || use_dummy_client_) {
@@ -1636,7 +1727,7 @@ class MooncakeStorePyWrapper {
     std::vector<int> batch_pub_tensor(
         const std::vector<std::string> &keys,
         const pybind11::list &tensors_list,
-        const ReplicateConfig &config = ReplicateConfig{}) {
+        const ReplicateConfig &config = DefaultReplicateConfig()) {
         if (!is_client_initialized() || use_dummy_client_)
             return std::vector<int>(keys.size(),
                                     to_py_ret(ErrorCode::INVALID_PARAMS));
@@ -1659,7 +1750,7 @@ class MooncakeStorePyWrapper {
     std::vector<int> batch_pub_tensor_with_tp(
         const std::vector<std::string> &base_keys,
         const pybind11::list &tensors_list,
-        const ReplicateConfig &config = ReplicateConfig{}, int tp_rank = 0,
+        const ReplicateConfig &config = DefaultReplicateConfig(), int tp_rank = 0,
         int tp_size = 1, int split_dim = 0) {
         if (tp_size <= 1)
             return batch_pub_tensor(base_keys, tensors_list, config);
@@ -1803,6 +1894,231 @@ class MooncakeDistributedNoFRegisterPyWrapper {
     MooncakeDistributedNoFRegisterPyWrapper() = default;
 };
 
+class MooncakeGdsSsdRegisterPyWrapper {
+   public:
+    MooncakeGdsSsdRegisterPyWrapper() = default;
+
+    int real_register(const std::string &master_server_addr,
+                      const std::string &segment_name,
+                      const std::string &client_host,
+                      const std::string &segment_uri,
+                      const std::string &namespace_id, uint64_t base,
+                      uint64_t size, uint64_t device_size,
+                      uint64_t block_size, uint64_t allocation_alignment,
+                      uint64_t metadata_reserved_bytes,
+                      const std::vector<int32_t> &gpu_device_ids,
+                      int32_t numa_node) {
+        if (master_server_addr.empty() || segment_name.empty() ||
+            client_host.empty() || segment_uri.empty() ||
+            namespace_id.empty() || size == 0 || block_size == 0 ||
+            allocation_alignment == 0) {
+            LOG(ERROR) << "Invalid GDS SSD registration parameters";
+            return OPERATION_FAILED;
+        }
+        if (device_size == 0) {
+            device_size = size;
+        }
+
+        GdsSsdAccessor accessor;
+        accessor.client_host = client_host;
+        accessor.segment_uri = segment_uri;
+        accessor.namespace_id = namespace_id;
+        accessor.size = device_size;
+        accessor.block_size = block_size;
+        accessor.allocation_alignment = allocation_alignment;
+        accessor.gpu_device_ids = gpu_device_ids;
+        accessor.numa_node = numa_node;
+        accessor.alive = true;
+
+        MasterClient master_client(generate_uuid(), nullptr);
+        auto err = master_client.Connect(master_server_addr);
+        if (err != ErrorCode::OK) {
+            LOG(ERROR) << "Failed to connect to master: "
+                       << static_cast<int>(err);
+            return OPERATION_FAILED;
+        }
+
+        auto segments_result = master_client.GetAllGdsSsdSegments();
+        if (!segments_result) {
+            LOG(ERROR) << "Failed to query GDS SSD segments: "
+                       << static_cast<int>(segments_result.error());
+            return OPERATION_FAILED;
+        }
+
+        const GdsSsdSegment *existing_segment = nullptr;
+        for (const auto &segment : segments_result.value()) {
+            if (segment.name == segment_name) {
+                existing_segment = &segment;
+                break;
+            }
+        }
+
+        if (existing_segment != nullptr) {
+            if (!SegmentMatches(*existing_segment, base, size, block_size,
+                                allocation_alignment,
+                                metadata_reserved_bytes, namespace_id)) {
+                return OPERATION_FAILED;
+            }
+            auto register_result = master_client.RegisterGdsSsdAccessor(
+                existing_segment->id, accessor);
+            if (!register_result) {
+                LOG(ERROR) << "Failed to register GDS SSD accessor: "
+                           << static_cast<int>(register_result.error());
+                return OPERATION_FAILED;
+            }
+            return OPERATION_OK;
+        }
+
+        GdsSsdSegment segment;
+        segment.id = generate_uuid();
+        segment.name = segment_name;
+        segment.base = base;
+        segment.size = size;
+        segment.block_size = block_size;
+        segment.allocation_alignment = allocation_alignment;
+        segment.metadata_reserved_bytes = metadata_reserved_bytes;
+        segment.namespace_id = namespace_id;
+        segment.accessors.push_back(accessor);
+
+        auto mount_result = master_client.MountGdsSsdSegment(segment);
+        if (!mount_result) {
+            LOG(ERROR) << "Failed to mount GDS SSD segment: "
+                       << static_cast<int>(mount_result.error());
+            return OPERATION_FAILED;
+        }
+        return OPERATION_OK;
+    }
+
+    int real_unregister(const std::string &master_server_addr,
+                        const std::string &segment_name,
+                        const std::string &client_host) {
+        if (master_server_addr.empty() || segment_name.empty() ||
+            client_host.empty()) {
+            LOG(ERROR) << "Invalid GDS SSD unregister parameters";
+            return OPERATION_FAILED;
+        }
+
+        MasterClient master_client(generate_uuid(), nullptr);
+        auto err = master_client.Connect(master_server_addr);
+        if (err != ErrorCode::OK) {
+            LOG(ERROR) << "Failed to connect to master: "
+                       << static_cast<int>(err);
+            return OPERATION_FAILED;
+        }
+
+        auto segments_result = master_client.GetAllGdsSsdSegments();
+        if (!segments_result) {
+            LOG(ERROR) << "Failed to query GDS SSD segments: "
+                       << static_cast<int>(segments_result.error());
+            return OPERATION_FAILED;
+        }
+
+        for (const auto &segment : segments_result.value()) {
+            if (segment.name != segment_name) {
+                continue;
+            }
+            for (const auto &accessor : segment.accessors) {
+                if (accessor.client_host != client_host) {
+                    continue;
+                }
+                if (!accessor.alive) {
+                    return OPERATION_OK;
+                }
+                GdsSsdAccessor updated_accessor = accessor;
+                updated_accessor.alive = false;
+                auto register_result = master_client.RegisterGdsSsdAccessor(
+                    segment.id, updated_accessor);
+                if (!register_result) {
+                    LOG(ERROR) << "Failed to mark GDS SSD accessor offline: "
+                               << static_cast<int>(register_result.error());
+                    return OPERATION_FAILED;
+                }
+                return OPERATION_OK;
+            }
+            LOG(WARNING) << "GDS SSD accessor not found for segment="
+                         << segment_name << ", client_host=" << client_host;
+            return OPERATION_OK;
+        }
+
+        LOG(WARNING) << "GDS SSD segment not found: " << segment_name;
+        return OPERATION_OK;
+    }
+
+    py::list list_segments(const std::string &master_server_addr) {
+        MasterClient master_client(generate_uuid(), nullptr);
+        auto err = master_client.Connect(master_server_addr);
+        if (err != ErrorCode::OK) {
+            throw std::runtime_error("failed to connect to master");
+        }
+        auto segments_result = master_client.GetAllGdsSsdSegments();
+        if (!segments_result) {
+            throw std::runtime_error("failed to query GDS SSD segments");
+        }
+
+        py::list result;
+        for (const auto &segment : segments_result.value()) {
+            result.append(SegmentToDict(segment));
+        }
+        return result;
+    }
+
+   private:
+    static bool SegmentMatches(const GdsSsdSegment &segment, uint64_t base,
+                               uint64_t size, uint64_t block_size,
+                               uint64_t allocation_alignment,
+                               uint64_t metadata_reserved_bytes,
+                               const std::string &namespace_id) {
+        if (segment.base != base || segment.size != size ||
+            segment.block_size != block_size ||
+            segment.allocation_alignment != allocation_alignment ||
+            segment.metadata_reserved_bytes != metadata_reserved_bytes ||
+            segment.namespace_id != namespace_id) {
+            LOG(ERROR) << "GDS SSD segment metadata mismatch: name="
+                       << segment.name;
+            return false;
+        }
+        return true;
+    }
+
+    static std::string UuidToString(const UUID &uuid) {
+        std::ostringstream oss;
+        oss << uuid;
+        return oss.str();
+    }
+
+    static py::dict AccessorToDict(const GdsSsdAccessor &accessor) {
+        py::dict dict;
+        dict["client_host"] = accessor.client_host;
+        dict["segment_uri"] = accessor.segment_uri;
+        dict["namespace_id"] = accessor.namespace_id;
+        dict["size"] = accessor.size;
+        dict["block_size"] = accessor.block_size;
+        dict["allocation_alignment"] = accessor.allocation_alignment;
+        dict["gpu_device_ids"] = accessor.gpu_device_ids;
+        dict["numa_node"] = accessor.numa_node;
+        dict["alive"] = accessor.alive;
+        return dict;
+    }
+
+    static py::dict SegmentToDict(const GdsSsdSegment &segment) {
+        py::dict dict;
+        dict["id"] = UuidToString(segment.id);
+        dict["name"] = segment.name;
+        dict["base"] = segment.base;
+        dict["size"] = segment.size;
+        dict["block_size"] = segment.block_size;
+        dict["allocation_alignment"] = segment.allocation_alignment;
+        dict["metadata_reserved_bytes"] = segment.metadata_reserved_bytes;
+        dict["namespace_id"] = segment.namespace_id;
+        py::list accessors;
+        for (const auto &accessor : segment.accessors) {
+            accessors.append(AccessorToDict(accessor));
+        }
+        dict["accessors"] = accessors;
+        return dict;
+    }
+};
+
 PYBIND11_MODULE(store, m) {
     m.def("_serialize_tensor", &serialize_tensor_metadata,
           "Inspect a torch tensor as Mooncake tensor metadata, data pointer, "
@@ -1829,6 +2145,7 @@ PYBIND11_MODULE(store, m) {
     // Define the ReplicateConfig class
     py::class_<ReplicateConfig>(m, "ReplicateConfig")
         .def(py::init<>())
+        .def_static("from_env", []() { return DefaultReplicateConfig(); })
         .def_readwrite("replica_num", &ReplicateConfig::replica_num)
         .def_readwrite("nof_replica_num", &ReplicateConfig::nof_replica_num)
         .def_readwrite("gds_replica_num", &ReplicateConfig::gds_replica_num)
@@ -2071,6 +2388,25 @@ PYBIND11_MODULE(store, m) {
                  return self.register_->set_unregister_by_endpoint(
                      nqn, nsid, traddr, trsvcid, master_server_addr);
              });
+
+    py::class_<MooncakeGdsSsdRegisterPyWrapper>(m, "MooncakeGdsSsdRegister")
+        .def(py::init<>())
+        .def("real_register", &MooncakeGdsSsdRegisterPyWrapper::real_register,
+             py::arg("master_server_addr") = "127.0.0.1:50051",
+             py::arg("segment_name") = "", py::arg("client_host") = "",
+             py::arg("segment_uri") = "", py::arg("namespace_id") = "",
+             py::arg("base") = 0, py::arg("size") = 0,
+             py::arg("device_size") = 0, py::arg("block_size") = 0,
+             py::arg("allocation_alignment") = 0,
+             py::arg("metadata_reserved_bytes") = 0,
+             py::arg("gpu_device_ids") = std::vector<int32_t>{},
+             py::arg("numa_node") = -1)
+        .def("real_unregister",
+             &MooncakeGdsSsdRegisterPyWrapper::real_unregister,
+             py::arg("master_server_addr") = "127.0.0.1:50051",
+             py::arg("segment_name") = "", py::arg("client_host") = "")
+        .def("list_segments", &MooncakeGdsSsdRegisterPyWrapper::list_segments,
+             py::arg("master_server_addr") = "127.0.0.1:50051");
     // Create a wrapper that exposes DistributedObjectStore with Python-specific
     // methods
     // Helper function to extract PyClient shared_ptr from
@@ -2364,16 +2700,16 @@ PYBIND11_MODULE(store, m) {
              "If the provided key is not found in the safetensor file, the "
              "first tensor in the file is used and a warning is logged.")
         .def("pub_tensor", &MooncakeStorePyWrapper::pub_tensor, py::arg("key"),
-             py::arg("tensor"), py::arg("config") = ReplicateConfig{},
+             py::arg("tensor"), py::arg("config") = DefaultReplicateConfig(),
              "Publish a PyTorch tensor with configurable replication settings")
         .def("batch_pub_tensor", &MooncakeStorePyWrapper::batch_pub_tensor,
              py::arg("keys"), py::arg("tensors_list"),
-             py::arg("config") = ReplicateConfig{},
+             py::arg("config") = DefaultReplicateConfig(),
              "Publish a batch of PyTorch tensors into the store with "
              "configurable replication settings")
         .def("pub_tensor_with_tp", &MooncakeStorePyWrapper::pub_tensor_with_tp,
              py::arg("key"), py::arg("tensor"),
-             py::arg("config") = ReplicateConfig{}, py::arg("tp_rank") = 0,
+             py::arg("config") = DefaultReplicateConfig(), py::arg("tp_rank") = 0,
              py::arg("tp_size") = 1, py::arg("split_dim") = 0,
              "Publish a PyTorch tensor into the store with configurable "
              "replication settings, split into shards for "
@@ -2383,7 +2719,7 @@ PYBIND11_MODULE(store, m) {
         .def("batch_pub_tensor_with_tp",
              &MooncakeStorePyWrapper::batch_pub_tensor_with_tp,
              py::arg("base_keys"), py::arg("tensors_list"),
-             py::arg("config") = ReplicateConfig{}, py::arg("tp_rank") = 0,
+             py::arg("config") = DefaultReplicateConfig(), py::arg("tp_rank") = 0,
              py::arg("tp_size") = 1, py::arg("split_dim") = 0,
              "Publish a batch of PyTorch tensors into the store with "
              "configurable replication settings, splitting each "
@@ -2463,11 +2799,11 @@ PYBIND11_MODULE(store, m) {
              "update)")
         .def("upsert_pub_tensor", &MooncakeStorePyWrapper::upsert_pub_tensor,
              py::arg("key"), py::arg("tensor"),
-             py::arg("config") = ReplicateConfig{},
+             py::arg("config") = DefaultReplicateConfig(),
              "Upsert a PyTorch tensor with configurable replication settings")
         .def("batch_upsert_pub_tensor",
              &MooncakeStorePyWrapper::batch_upsert_pub_tensor, py::arg("keys"),
-             py::arg("tensors_list"), py::arg("config") = ReplicateConfig{},
+             py::arg("tensors_list"), py::arg("config") = DefaultReplicateConfig(),
              "Batch upsert PyTorch tensors with configurable replication "
              "settings")
         .def("get_tensor_with_parallelism",
@@ -2495,7 +2831,7 @@ PYBIND11_MODULE(store, m) {
              &MooncakeStorePyWrapper::put_tensor_with_parallelism,
              py::arg("key"), py::arg("tensor"),
              py::arg("parallelism") = py::none(),
-             py::arg("config") = ReplicateConfig{},
+             py::arg("config") = DefaultReplicateConfig(),
              py::arg("writer_partition") = py::none(),
              "Put a PyTorch tensor into the store using a TensorParallelism "
              "request or a writer_partition request.")
@@ -2503,7 +2839,7 @@ PYBIND11_MODULE(store, m) {
              &MooncakeStorePyWrapper::batch_put_tensor_with_parallelism,
              py::arg("keys"), py::arg("tensors_list"),
              py::arg("parallelisms") = py::none(),
-             py::arg("config") = ReplicateConfig{},
+             py::arg("config") = DefaultReplicateConfig(),
              py::arg("writer_partitions") = py::none(),
              "Put a batch of PyTorch tensors into the store using "
              "TensorParallelism requests or writer_partition requests.")
@@ -2511,7 +2847,7 @@ PYBIND11_MODULE(store, m) {
              &MooncakeStorePyWrapper::put_tensor_with_parallelism_from,
              py::arg("key"), py::arg("buffer_ptr"), py::arg("size"),
              py::arg("parallelism") = py::none(),
-             py::arg("config") = ReplicateConfig{},
+             py::arg("config") = DefaultReplicateConfig(),
              py::arg("writer_partition") = py::none(),
              "Put a tensor directly from a pre-allocated buffer using a "
              "TensorParallelism request or a writer_partition request.")
@@ -2519,7 +2855,7 @@ PYBIND11_MODULE(store, m) {
              &MooncakeStorePyWrapper::batch_put_tensor_with_parallelism_from,
              py::arg("keys"), py::arg("buffer_ptrs"), py::arg("sizes"),
              py::arg("parallelisms") = py::none(),
-             py::arg("config") = ReplicateConfig{},
+             py::arg("config") = DefaultReplicateConfig(),
              py::arg("writer_partitions") = py::none(),
              "Put a batch of tensors directly from pre-allocated buffers using "
              "TensorParallelism requests or writer_partition requests.")
@@ -2527,7 +2863,7 @@ PYBIND11_MODULE(store, m) {
              &MooncakeStorePyWrapper::upsert_tensor_with_parallelism,
              py::arg("key"), py::arg("tensor"),
              py::arg("parallelism") = py::none(),
-             py::arg("config") = ReplicateConfig{},
+             py::arg("config") = DefaultReplicateConfig(),
              py::arg("writer_partition") = py::none(),
              "Upsert a PyTorch tensor into the store using a TensorParallelism "
              "request or a writer_partition request.")
@@ -2535,7 +2871,7 @@ PYBIND11_MODULE(store, m) {
              &MooncakeStorePyWrapper::upsert_tensor_with_parallelism_from,
              py::arg("key"), py::arg("buffer_ptr"), py::arg("size"),
              py::arg("parallelism") = py::none(),
-             py::arg("config") = ReplicateConfig{},
+             py::arg("config") = DefaultReplicateConfig(),
              py::arg("writer_partition") = py::none(),
              "Upsert a tensor directly from a pre-allocated buffer using a "
              "TensorParallelism request or a writer_partition request.")
@@ -2543,7 +2879,7 @@ PYBIND11_MODULE(store, m) {
              &MooncakeStorePyWrapper::batch_upsert_tensor_with_parallelism_from,
              py::arg("keys"), py::arg("buffer_ptrs"), py::arg("sizes"),
              py::arg("parallelisms") = py::none(),
-             py::arg("config") = ReplicateConfig{},
+             py::arg("config") = DefaultReplicateConfig(),
              py::arg("writer_partitions") = py::none(),
              "Upsert a batch of tensors directly from pre-allocated buffers "
              "using TensorParallelism requests or writer_partition requests.")
@@ -2551,7 +2887,7 @@ PYBIND11_MODULE(store, m) {
              &MooncakeStorePyWrapper::batch_upsert_tensor_with_parallelism,
              py::arg("keys"), py::arg("tensors_list"),
              py::arg("parallelisms") = py::none(),
-             py::arg("config") = ReplicateConfig{},
+             py::arg("config") = DefaultReplicateConfig(),
              py::arg("writer_partitions") = py::none(),
              "Upsert a batch of PyTorch tensors into the store using "
              "TensorParallelism requests or writer_partition requests.")
@@ -2559,7 +2895,7 @@ PYBIND11_MODULE(store, m) {
             "upsert_from",
             [](MooncakeStorePyWrapper &self, const std::string &key,
                uintptr_t buffer_ptr, size_t size,
-               const ReplicateConfig &config = ReplicateConfig{}) {
+               const ReplicateConfig &config = DefaultReplicateConfig()) {
                 if (!self.is_client_initialized()) {
                     LOG(ERROR) << "Client is not initialized";
                     return to_py_ret(ErrorCode::INVALID_PARAMS);
@@ -2569,7 +2905,7 @@ PYBIND11_MODULE(store, m) {
                 return self.store_->upsert_from(key, buffer, size, config);
             },
             py::arg("key"), py::arg("buffer_ptr"), py::arg("size"),
-            py::arg("config") = ReplicateConfig{},
+            py::arg("config") = DefaultReplicateConfig(),
             "Upsert object data directly from a pre-allocated buffer")
         .def(
             "batch_upsert_from",
@@ -2577,7 +2913,7 @@ PYBIND11_MODULE(store, m) {
                const std::vector<std::string> &keys,
                const std::vector<uintptr_t> &buffer_ptrs,
                const std::vector<size_t> &sizes,
-               const ReplicateConfig &config = ReplicateConfig{}) {
+               const ReplicateConfig &config = DefaultReplicateConfig()) {
                 if (!self.is_client_initialized()) {
                     LOG(ERROR) << "Client is not initialized";
                     return std::vector<int>(
@@ -2593,14 +2929,14 @@ PYBIND11_MODULE(store, m) {
                                                       config);
             },
             py::arg("keys"), py::arg("buffer_ptrs"), py::arg("sizes"),
-            py::arg("config") = ReplicateConfig{},
+            py::arg("config") = DefaultReplicateConfig(),
             "Upsert object data directly from pre-allocated buffers for "
             "multiple keys")
         .def(
             "upsert",
             [](MooncakeStorePyWrapper &self, const std::string &key,
                py::buffer buf,
-               const ReplicateConfig &config = ReplicateConfig{}) {
+               const ReplicateConfig &config = DefaultReplicateConfig()) {
                 if (!self.is_client_initialized()) {
                     LOG(ERROR) << "Client is not initialized";
                     return to_py_ret(ErrorCode::INVALID_PARAMS);
@@ -2614,13 +2950,13 @@ PYBIND11_MODULE(store, m) {
                     config);
             },
             py::arg("key"), py::arg("value"),
-            py::arg("config") = ReplicateConfig{},
+            py::arg("config") = DefaultReplicateConfig(),
             "Upsert raw bytes into the store (insert or update)")
         .def(
             "upsert_parts",
             [](MooncakeStorePyWrapper &self, const std::string &key,
                py::args parts,
-               const ReplicateConfig &config = ReplicateConfig{}) {
+               const ReplicateConfig &config = DefaultReplicateConfig()) {
                 if (!self.is_client_initialized()) {
                     LOG(ERROR) << "Client is not initialized";
                     return to_py_ret(ErrorCode::INVALID_PARAMS);
@@ -2645,14 +2981,14 @@ PYBIND11_MODULE(store, m) {
                 py::gil_scoped_release unlock;
                 return self.store_->upsert_parts(key, spans, config);
             },
-            py::arg("key"), py::arg("config") = ReplicateConfig{},
+            py::arg("key"), py::arg("config") = DefaultReplicateConfig(),
             "Upsert multiple byte parts as a single object (insert or update)")
         .def(
             "upsert_batch",
             [](MooncakeStorePyWrapper &self,
                const std::vector<std::string> &keys,
                const std::vector<py::buffer> &buffers,
-               const ReplicateConfig &config = ReplicateConfig{}) {
+               const ReplicateConfig &config = DefaultReplicateConfig()) {
                 if (!self.is_client_initialized()) {
                     LOG(ERROR) << "Client is not initialized";
                     return to_py_ret(ErrorCode::INVALID_PARAMS);
@@ -2673,7 +3009,7 @@ PYBIND11_MODULE(store, m) {
                 return self.store_->upsert_batch(keys, spans, config);
             },
             py::arg("keys"), py::arg("values"),
-            py::arg("config") = ReplicateConfig{},
+            py::arg("config") = DefaultReplicateConfig(),
             "Batch upsert raw bytes for multiple keys (insert or update)")
         .def(
             "register_buffer",
@@ -2755,7 +3091,7 @@ PYBIND11_MODULE(store, m) {
             "put_from",
             [](MooncakeStorePyWrapper &self, const std::string &key,
                uintptr_t buffer_ptr, size_t size,
-               const ReplicateConfig &config = ReplicateConfig{}) {
+               const ReplicateConfig &config = DefaultReplicateConfig()) {
                 if (!self.is_client_initialized()) {
                     LOG(ERROR) << "Client is not initialized";
                     return to_py_ret(ErrorCode::INVALID_PARAMS);
@@ -2765,14 +3101,14 @@ PYBIND11_MODULE(store, m) {
                 return self.store_->put_from(key, buffer, size, config);
             },
             py::arg("key"), py::arg("buffer_ptr"), py::arg("size"),
-            py::arg("config") = ReplicateConfig{},
+            py::arg("config") = DefaultReplicateConfig(),
             "Put object data directly from a pre-allocated buffer")
         .def(
             "put_from_with_metadata",
             [](MooncakeStorePyWrapper &self, const std::string &key,
                uintptr_t buffer_ptr, uintptr_t metadata_buffer_ptr, size_t size,
                size_t metadata_size,
-               const ReplicateConfig &config = ReplicateConfig{}) {
+               const ReplicateConfig &config = DefaultReplicateConfig()) {
                 if (!self.is_client_initialized()) {
                     LOG(ERROR) << "Client is not initialized";
                     return to_py_ret(ErrorCode::INVALID_PARAMS);
@@ -2786,7 +3122,7 @@ PYBIND11_MODULE(store, m) {
             },
             py::arg("key"), py::arg("buffer_ptr"),
             py::arg("metadata_buffer_ptr"), py::arg("size"),
-            py::arg("metadata_size"), py::arg("config") = ReplicateConfig{},
+            py::arg("metadata_size"), py::arg("config") = DefaultReplicateConfig(),
             "Put object data directly from a pre-allocated buffer with "
             "metadata")
         .def(
@@ -2795,7 +3131,7 @@ PYBIND11_MODULE(store, m) {
                const std::vector<std::string> &keys,
                const std::vector<uintptr_t> &buffer_ptrs,
                const std::vector<size_t> &sizes,
-               const ReplicateConfig &config = ReplicateConfig{}) {
+               const ReplicateConfig &config = DefaultReplicateConfig()) {
                 std::vector<void *> buffers;
                 buffers.reserve(buffer_ptrs.size());
                 for (uintptr_t ptr : buffer_ptrs) {
@@ -2806,7 +3142,7 @@ PYBIND11_MODULE(store, m) {
                                                    config);
             },
             py::arg("keys"), py::arg("buffer_ptrs"), py::arg("sizes"),
-            py::arg("config") = ReplicateConfig{},
+            py::arg("config") = DefaultReplicateConfig(),
             "Put object data directly from pre-allocated buffers for "
             "multiple "
             "keys")
@@ -2814,7 +3150,7 @@ PYBIND11_MODULE(store, m) {
             "put",
             [](MooncakeStorePyWrapper &self, const std::string &key,
                py::buffer buf,
-               const ReplicateConfig &config = ReplicateConfig{}) {
+               const ReplicateConfig &config = DefaultReplicateConfig()) {
                 py::buffer_info info = buf.request(/*writable=*/false);
                 py::gil_scoped_release release;
                 return self.store_->put(
@@ -2824,12 +3160,12 @@ PYBIND11_MODULE(store, m) {
                     config);
             },
             py::arg("key"), py::arg("value"),
-            py::arg("config") = ReplicateConfig{})
+            py::arg("config") = DefaultReplicateConfig())
         .def(
             "put_parts",
             [](MooncakeStorePyWrapper &self, const std::string &key,
                py::args parts,
-               const ReplicateConfig &config = ReplicateConfig{}) {
+               const ReplicateConfig &config = DefaultReplicateConfig()) {
                 // 1) Python buffer 鈫?span
                 std::vector<py::buffer_info> infos;
                 std::vector<std::span<const char>> spans;
@@ -2852,13 +3188,13 @@ PYBIND11_MODULE(store, m) {
                 py::gil_scoped_release unlock;
                 return self.store_->put_parts(key, spans, config);
             },
-            py::arg("key"), py::arg("config") = ReplicateConfig{})
+            py::arg("key"), py::arg("config") = DefaultReplicateConfig())
         .def(
             "put_batch",
             [](MooncakeStorePyWrapper &self,
                const std::vector<std::string> &keys,
                const std::vector<py::buffer> &buffers,
-               const ReplicateConfig &config = ReplicateConfig{}) {
+               const ReplicateConfig &config = DefaultReplicateConfig()) {
                 // Convert pybuffers to spans without copying
                 std::vector<py::buffer_info> infos;
                 std::vector<std::span<const char>> spans;
@@ -2876,7 +3212,7 @@ PYBIND11_MODULE(store, m) {
                 return self.store_->put_batch(keys, spans, config);
             },
             py::arg("keys"), py::arg("values"),
-            py::arg("config") = ReplicateConfig{})
+            py::arg("config") = DefaultReplicateConfig())
         .def("get_hostname",
              [](MooncakeStorePyWrapper &self) {
                  return self.store_->get_hostname();
@@ -2887,7 +3223,7 @@ PYBIND11_MODULE(store, m) {
                const std::vector<std::string> &keys,
                const std::vector<std::vector<uintptr_t>> &all_buffer_ptrs,
                const std::vector<std::vector<size_t>> &all_sizes,
-               const ReplicateConfig &config = ReplicateConfig{}) {
+               const ReplicateConfig &config = DefaultReplicateConfig()) {
                 if (!self.is_client_initialized()) {
                     LOG(ERROR) << "Client is not initialized";
                     return std::vector<int>{};
@@ -2897,7 +3233,7 @@ PYBIND11_MODULE(store, m) {
                     keys, CastAddrs2Ptrs(all_buffer_ptrs), all_sizes, config);
             },
             py::arg("keys"), py::arg("all_buffer_ptrs"), py::arg("all_sizes"),
-            py::arg("config") = ReplicateConfig{},
+            py::arg("config") = DefaultReplicateConfig(),
             "Put object data directly from multiple pre-allocated buffers for "
             "multiple "
             "keys")

@@ -173,6 +173,7 @@ if(WITH_STORE)
       "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-wheel/mooncake/mooncake_store_service.py"
       "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-wheel/mooncake/mooncake_config.py"
       "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-wheel/mooncake/cli.py"
+      "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-wheel/mooncake/mooncake_gds_ssd_register.py"
     DESTINATION ${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME})
 
   if(USE_NOF)
