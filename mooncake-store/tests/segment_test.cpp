@@ -20,7 +20,7 @@
 #include <unistd.h>
 #endif
 
-#if defined(USE_TENT) && defined(USE_GDS)
+#ifdef USE_GDS
 #include <cufile.h>
 
 #include "tent/common/config.h"
@@ -31,7 +31,7 @@ namespace mooncake {
 
 namespace {
 
-#if defined(__linux__) && defined(USE_TENT) && defined(USE_GDS)
+#if defined(__linux__) && defined(USE_GDS)
 constexpr char kGdsTestPathEnv[] = "MOONCAKE_GDS_TEST_PATH";
 constexpr size_t kGdsTestFileSize = 4 * 1024 * 1024;
 
@@ -1038,9 +1038,9 @@ TEST_F(SegmentTest, GdsSsdSegmentManagerAllocatesResolvesAndReleases) {
 TEST_F(SegmentTest, GdsSsdLocalNvmeOfPathCanBeOpenedByTent) {
 #if !defined(__linux__)
     GTEST_SKIP() << "GDS storage path probing requires Linux";
-#elif !defined(USE_TENT) || !defined(USE_GDS)
-    GTEST_SKIP() << "Rebuild with USE_TENT=ON, USE_CUDA=ON, and cuFile "
-                    "available to run the GDS storage path probe";
+#elif !defined(USE_GDS)
+    GTEST_SKIP() << "Rebuild with USE_CUDA=ON and cuFile available to run the "
+                    "GDS storage path probe";
 #else
     const char* configured_path = std::getenv(kGdsTestPathEnv);
     if (configured_path == nullptr || configured_path[0] == '\0') {
