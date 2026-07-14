@@ -636,7 +636,8 @@ TEST_F(MasterMetricsTest, BatchRequestTest) {
     ASSERT_EQ(metrics.get_batch_put_start_failed_items(), 0);
 
     // Test BatchGetReplicaList request (should all fail)
-    auto batch_get_replica_result = service_.BatchGetReplicaList(client_id, keys);
+    auto batch_get_replica_result =
+        service_.BatchGetReplicaList(client_id, keys, "default");
     ASSERT_EQ(batch_get_replica_result.size(), 3);
     ASSERT_EQ(metrics.get_batch_get_replica_list_requests(), 1);
     ASSERT_EQ(metrics.get_batch_get_replica_list_partial_successes(), 0);
@@ -663,7 +664,8 @@ TEST_F(MasterMetricsTest, BatchRequestTest) {
     ASSERT_EQ(metrics.get_batch_exist_key_failed_items(), 0);
 
     // Test BatchGetReplicaList again (should all succeed now)
-    auto batch_get_replica_result2 = service_.BatchGetReplicaList(client_id, keys);
+    auto batch_get_replica_result2 =
+        service_.BatchGetReplicaList(client_id, keys, "default");
     ASSERT_EQ(batch_get_replica_result2.size(), 3);
     ASSERT_EQ(metrics.get_batch_get_replica_list_requests(), 2);
     ASSERT_EQ(metrics.get_batch_get_replica_list_partial_successes(), 0);
@@ -683,7 +685,8 @@ TEST_F(MasterMetricsTest, BatchRequestTest) {
     // Test partial success
     keys.push_back("test_key4");
     value_lengths.push_back(512);
-    auto batch_get_replica_result3 = service_.BatchGetReplicaList(client_id, keys);
+    auto batch_get_replica_result3 =
+        service_.BatchGetReplicaList(client_id, keys, "default");
     ASSERT_EQ(batch_get_replica_result3.size(), 4);
     ASSERT_EQ(metrics.get_batch_get_replica_list_requests(), 3);
     ASSERT_EQ(metrics.get_batch_get_replica_list_partial_successes(), 1);
