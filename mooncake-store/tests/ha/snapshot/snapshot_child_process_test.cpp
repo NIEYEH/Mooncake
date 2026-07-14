@@ -523,7 +523,7 @@ TEST_F(SnapshotChildProcessTest, RestoreRebuildsGroupedObjectRouting) {
     service_.reset();
     service_ = std::make_unique<MasterService>(make_config());
 
-    auto restored_replicas = service_->GetReplicaList(key, "default");
+    auto restored_replicas = service_->GetReplicaList(UUID{}, key, "default");
     ASSERT_TRUE(restored_replicas.has_value())
         << "Grouped key should remain reachable by key after restore";
     ASSERT_TRUE(service_->Remove(key, "default", /*force=*/true).has_value());

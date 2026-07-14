@@ -124,7 +124,7 @@ TEST_F(MasterServiceSSDTest, PutEndBothReplica) {
     EXPECT_TRUE(has_mem);
     EXPECT_TRUE(has_disk);
 
-    auto get_result = service_->GetReplicaList(key, "default");
+    auto get_result = service_->GetReplicaList(UUID{}, key, "default");
     ASSERT_FALSE(get_result.has_value());
     EXPECT_EQ(ErrorCode::REPLICA_IS_NOT_READY, get_result.error());
 
@@ -134,7 +134,7 @@ TEST_F(MasterServiceSSDTest, PutEndBothReplica) {
     EXPECT_TRUE(service_->PutEnd(client_id, key, "default", ReplicaType::DISK)
                     .has_value());
 
-    get_result = service_->GetReplicaList(key, "default");
+    get_result = service_->GetReplicaList(UUID{}, key, "default");
     ASSERT_TRUE(get_result.has_value());
     EXPECT_EQ(2, get_result.value().replicas.size());
 
@@ -171,7 +171,7 @@ TEST_F(MasterServiceSSDTest, PutRevokeDiskReplica) {
     EXPECT_TRUE(service_->PutEnd(client_id, key, "default", ReplicaType::MEMORY)
                     .has_value());
 
-    auto get_result = service_->GetReplicaList(key, "default");
+    auto get_result = service_->GetReplicaList(UUID{}, key, "default");
     ASSERT_TRUE(get_result.has_value());
     EXPECT_EQ(1, get_result.value().replicas.size());
     ASSERT_TRUE(get_result.value().replicas[0].is_memory_replica());
@@ -180,7 +180,7 @@ TEST_F(MasterServiceSSDTest, PutRevokeDiskReplica) {
         service_->PutRevoke(client_id, key, "default", ReplicaType::DISK)
             .has_value());
 
-    get_result = service_->GetReplicaList(key, "default");
+    get_result = service_->GetReplicaList(UUID{}, key, "default");
     ASSERT_TRUE(get_result.has_value());
     EXPECT_EQ(1, get_result.value().replicas.size());
     ASSERT_TRUE(get_result.value().replicas[0].is_memory_replica());
@@ -260,13 +260,13 @@ TEST_F(MasterServiceSSDTest, PutRevokeMemoryReplica) {
         service_->PutRevoke(client_id, key, "default", ReplicaType::MEMORY)
             .has_value());
 
-    auto get_result = service_->GetReplicaList(key, "default");
+    auto get_result = service_->GetReplicaList(UUID{}, key, "default");
     ASSERT_FALSE(get_result.has_value());
     EXPECT_EQ(ErrorCode::REPLICA_IS_NOT_READY, get_result.error());
 
     EXPECT_TRUE(service_->PutEnd(client_id, key, "default", ReplicaType::DISK)
                     .has_value());
-    get_result = service_->GetReplicaList(key, "default");
+    get_result = service_->GetReplicaList(UUID{}, key, "default");
     ASSERT_TRUE(get_result.has_value());
     EXPECT_EQ(1, get_result.value().replicas.size());
     ASSERT_TRUE(get_result.value().replicas[0].is_disk_replica());
@@ -301,14 +301,14 @@ TEST_F(MasterServiceSSDTest, PutRevokeBothReplica) {
         service_->PutRevoke(client_id, key, "default", ReplicaType::DISK)
             .has_value());
 
-    auto get_result = service_->GetReplicaList(key, "default");
+    auto get_result = service_->GetReplicaList(UUID{}, key, "default");
     ASSERT_FALSE(get_result.has_value());
     EXPECT_EQ(ErrorCode::REPLICA_IS_NOT_READY, get_result.error());
 
     EXPECT_TRUE(
         service_->PutRevoke(client_id, key, "default", ReplicaType::MEMORY)
             .has_value());
-    get_result = service_->GetReplicaList(key, "default");
+    get_result = service_->GetReplicaList(UUID{}, key, "default");
     ASSERT_FALSE(get_result.has_value());
     EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, get_result.error());
 }
@@ -345,7 +345,7 @@ TEST_F(MasterServiceSSDTest, RemoveKey) {
 
     EXPECT_TRUE(service_->Remove(key, "default").has_value());
 
-    auto get_result = service_->GetReplicaList(key, "default");
+    auto get_result = service_->GetReplicaList(UUID{}, key, "default");
     EXPECT_FALSE(get_result.has_value());
     EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, get_result.error());
 }
@@ -398,7 +398,7 @@ TEST_F(MasterServiceSSDTest, EvictObject) {
     int success_gets = 0;
     for (int i = 0; i < 1024 * 16 + 50; ++i) {
         std::string key = "test_key" + std::to_string(i);
-        auto get_result = service_->GetReplicaList(key, "default");
+        auto get_result = service_->GetReplicaList(UUID{}, key, "default");
         if (get_result.has_value()) {
             success_gets++;
         }
@@ -469,7 +469,7 @@ TEST_F(MasterServiceSSDTest, PutStartExpires) {
             auto result = service_->Ping(client_id);
             EXPECT_TRUE(result.has_value());
             // Protect the key from eviction.
-            auto get_result = service_->GetReplicaList(key, "default");
+            auto get_result = service_->GetReplicaList(UUID{}, key, "default");
             EXPECT_TRUE(get_result.has_value());
             std::this_thread::sleep_for(std::chrono::seconds(1));
         }
@@ -488,7 +488,7 @@ TEST_F(MasterServiceSSDTest, PutStartExpires) {
             auto result = service_->Ping(client_id);
             EXPECT_TRUE(result.has_value());
             // Protect the key from eviction.
-            auto get_result = service_->GetReplicaList(key, "default");
+            auto get_result = service_->GetReplicaList(UUID{}, key, "default");
             EXPECT_TRUE(get_result.has_value());
             std::this_thread::sleep_for(std::chrono::seconds(1));
         }
@@ -499,7 +499,7 @@ TEST_F(MasterServiceSSDTest, PutStartExpires) {
         EXPECT_TRUE(put_end_result.has_value());
 
         // Check that the key has only one replica.
-        auto get_result = service_->GetReplicaList(key, "default");
+        auto get_result = service_->GetReplicaList(UUID{}, key, "default");
         EXPECT_TRUE(get_result.has_value());
         EXPECT_EQ(get_result.value().replicas.size(), 1);
         if (reserve_type == ReplicaType::MEMORY) {
@@ -549,7 +549,7 @@ TEST_F(MasterServiceSSDTest, EvictDiskReplica_RemovesDiskReplica) {
                     .has_value());
 
     // Verify we have 2 replicas (MEM + DISK)
-    auto get_result = service_->GetReplicaList(key, "default");
+    auto get_result = service_->GetReplicaList(UUID{}, key, "default");
     ASSERT_TRUE(get_result.has_value());
     EXPECT_EQ(2, get_result.value().replicas.size());
 
@@ -559,7 +559,7 @@ TEST_F(MasterServiceSSDTest, EvictDiskReplica_RemovesDiskReplica) {
     ASSERT_TRUE(evict_result.has_value());
 
     // Verify only memory replica remains
-    get_result = service_->GetReplicaList(key, "default");
+    get_result = service_->GetReplicaList(UUID{}, key, "default");
     ASSERT_TRUE(get_result.has_value());
     EXPECT_EQ(1, get_result.value().replicas.size());
     EXPECT_TRUE(get_result.value().replicas[0].is_memory_replica());

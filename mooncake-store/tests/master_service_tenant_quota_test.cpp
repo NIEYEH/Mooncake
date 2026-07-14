@@ -434,7 +434,7 @@ TEST_F(MasterServiceTenantQuotaTest,
     auto result = service.NotifyOffloadSuccess(client_id, tasks, {metadata});
 
     ASSERT_TRUE(result.has_value()) << toString(result.error());
-    auto replicas = service.GetReplicaList("warming", "tenant-b");
+    auto replicas = service.GetReplicaList(UUID{}, "warming", "tenant-b");
     ASSERT_TRUE(replicas.has_value()) << toString(replicas.error());
     EXPECT_TRUE(std::any_of(replicas->replicas.begin(),
                             replicas->replicas.end(),
@@ -836,7 +836,7 @@ TEST_F(MasterServiceTenantQuotaTest,
     EXPECT_EQ(orphan.effective_quota_bytes, 0);
     EXPECT_TRUE(orphan.over_quota);
 
-    EXPECT_TRUE(service.GetReplicaList("orphan-key", "tenant-b").has_value());
+    EXPECT_TRUE(service.GetReplicaList(UUID{}, "orphan-key", "tenant-b").has_value());
     auto write =
         service.PutStart(client_id, "new-key", "tenant-b", 1, MemoryConfig());
     ASSERT_FALSE(write.has_value());

@@ -96,7 +96,7 @@ TEST_F(MasterServicePromotionSnapshotTest, LocalDiskReplicaRoundTrip) {
     ASSERT_TRUE(
         InjectLocalDiskReplica(client_id, "k_cold", 1024, "seg_a_endpoint"));
 
-    auto before = service_->GetReplicaList("k_cold", "default");
+    auto before = service_->GetReplicaList(UUID{}, "k_cold", "default");
     ASSERT_TRUE(before.has_value());
     ASSERT_EQ(before->replicas.size(), 1u);
     EXPECT_TRUE(before->replicas[0].is_local_disk_replica());
@@ -122,7 +122,7 @@ TEST_F(MasterServicePromotionSnapshotTest, MixedMemoryAndLocalDiskRoundTrip) {
     ASSERT_TRUE(
         InjectLocalDiskReplica(client_id, "k_mixed", 1024, "seg_a_endpoint"));
 
-    auto descs = service_->GetReplicaList("k_mixed", "default");
+    auto descs = service_->GetReplicaList(UUID{}, "k_mixed", "default");
     ASSERT_TRUE(descs.has_value());
     EXPECT_EQ(descs->replicas.size(), 2u);
 }
@@ -153,8 +153,8 @@ TEST_F(MasterServicePromotionSnapshotTest, MultipleLocalDiskHoldersRoundTrip) {
     ASSERT_TRUE(
         InjectLocalDiskReplica(client_b, "k_b", 2048, "seg_b_endpoint"));
 
-    auto a = service_->GetReplicaList("k_a", "default");
-    auto b = service_->GetReplicaList("k_b", "default");
+    auto a = service_->GetReplicaList(UUID{}, "k_a", "default");
+    auto b = service_->GetReplicaList(UUID{}, "k_b", "default");
     ASSERT_TRUE(a.has_value());
     ASSERT_TRUE(b.has_value());
     EXPECT_EQ(a->replicas[0].get_local_disk_descriptor().client_id, client_a);
@@ -177,7 +177,7 @@ TEST_F(MasterServicePromotionSnapshotTest, InFlightPromotionTaskSnapshotSafe) {
     // Trigger promotion gate to enqueue a task. This pins the source
     // replica's refcnt and adds a per-shard PromotionTask plus a per-
     // segment promotion_objects entry.
-    auto get = service_->GetReplicaList("k_cold", "default");
+    auto get = service_->GetReplicaList(UUID{}, "k_cold", "default");
     ASSERT_TRUE(get.has_value());
 
     // The visible replica list should still expose exactly one LOCAL_DISK

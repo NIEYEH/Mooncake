@@ -321,7 +321,7 @@ TEST_F(MasterMetricsTest, BasicRequestTest) {
     ASSERT_EQ(metrics.get_exist_key_failures(), 0);
 
     // Test GetReplicaList request
-    auto get_replica_result = service_.GetReplicaList(key, "default");
+    auto get_replica_result = service_.GetReplicaList(client_id, key, "default");
     ASSERT_TRUE(get_replica_result.has_value());
     ASSERT_EQ(metrics.get_get_replica_list_requests(), 1);
     ASSERT_EQ(metrics.get_get_replica_list_failures(), 0);
@@ -473,7 +473,7 @@ TEST_F(MasterMetricsTest, CalcCacheStatsTest) {
     ASSERT_EQ(stats_dict[CacheHitStat::MEMORY_HITS], base_memory_hits);
     ASSERT_EQ(stats_dict[CacheHitStat::MEMORY_TOTAL], base_memory_total + 1);
 
-    auto get_replica_result = service_.GetReplicaList(key, "default");
+    auto get_replica_result = service_.GetReplicaList(client_id, key, "default");
     ASSERT_TRUE(get_replica_result.has_value());
     stats_dict = metrics.calculate_cache_stats();
     expect_aliases(stats_dict);
@@ -491,7 +491,7 @@ TEST_F(MasterMetricsTest, CalcCacheStatsTest) {
                                 stats_dict[CacheHitStat::MEMORY_HITS]) +
                1);
     for (int64_t i = 0; i < extra_gets; ++i) {
-        get_replica_result = service_.GetReplicaList(key, "default");
+        get_replica_result = service_.GetReplicaList(client_id, key, "default");
         ASSERT_TRUE(get_replica_result.has_value());
     }
     stats_dict = metrics.calculate_cache_stats();
@@ -636,7 +636,7 @@ TEST_F(MasterMetricsTest, BatchRequestTest) {
     ASSERT_EQ(metrics.get_batch_put_start_failed_items(), 0);
 
     // Test BatchGetReplicaList request (should all fail)
-    auto batch_get_replica_result = service_.BatchGetReplicaList(keys);
+    auto batch_get_replica_result = service_.BatchGetReplicaList(client_id, keys);
     ASSERT_EQ(batch_get_replica_result.size(), 3);
     ASSERT_EQ(metrics.get_batch_get_replica_list_requests(), 1);
     ASSERT_EQ(metrics.get_batch_get_replica_list_partial_successes(), 0);
@@ -663,7 +663,7 @@ TEST_F(MasterMetricsTest, BatchRequestTest) {
     ASSERT_EQ(metrics.get_batch_exist_key_failed_items(), 0);
 
     // Test BatchGetReplicaList again (should all succeed now)
-    auto batch_get_replica_result2 = service_.BatchGetReplicaList(keys);
+    auto batch_get_replica_result2 = service_.BatchGetReplicaList(client_id, keys);
     ASSERT_EQ(batch_get_replica_result2.size(), 3);
     ASSERT_EQ(metrics.get_batch_get_replica_list_requests(), 2);
     ASSERT_EQ(metrics.get_batch_get_replica_list_partial_successes(), 0);
@@ -683,7 +683,7 @@ TEST_F(MasterMetricsTest, BatchRequestTest) {
     // Test partial success
     keys.push_back("test_key4");
     value_lengths.push_back(512);
-    auto batch_get_replica_result3 = service_.BatchGetReplicaList(keys);
+    auto batch_get_replica_result3 = service_.BatchGetReplicaList(client_id, keys);
     ASSERT_EQ(batch_get_replica_result3.size(), 4);
     ASSERT_EQ(metrics.get_batch_get_replica_list_requests(), 3);
     ASSERT_EQ(metrics.get_batch_get_replica_list_partial_successes(), 1);
@@ -1016,7 +1016,7 @@ TEST_F(MasterMetricsTest, SsdOffloadCacheHitAndTotalConsistent) {
               base_ssd_total + 1);
 
     // GetReplicaList should hit LOCAL_DISK, incrementing SSD hit counters.
-    auto get_result = service_.GetReplicaList(ssd_only_key, "default");
+    auto get_result = service_.GetReplicaList(client_id, ssd_only_key, "default");
     ASSERT_TRUE(get_result.has_value());
 
     stats = metrics.calculate_cache_stats();

@@ -233,7 +233,7 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
         }
 
         for (const auto& key : state.all_keys) {
-            auto replica_result = service->GetReplicaList(key, "default");
+            auto replica_result = service->GetReplicaList(UUID{}, key, "default");
             if (replica_result.has_value()) {
                 state.replica_lists[key] = std::move(replica_result.value());
             }
