@@ -438,6 +438,29 @@ TEST_F(ClientBufferTest, AllocateSlicesZeroSizeMemoryReplica) {
     EXPECT_EQ(slices[0].ptr, handle.ptr());
 }
 
+TEST_F(ClientBufferTest, GdsSsdDescriptorSizeAndSlices) {
+    constexpr uint64_t kObjectSize = 8192;
+    std::vector<uint8_t> buffer(kObjectSize);
+
+    GdsSsdDescriptor gds_descriptor;
+    gds_descriptor.segment_name = "gds_pool_0";
+    gds_descriptor.segment_uri = "block:///dev/mooncake/gds_pool_0";
+    gds_descriptor.object_size = kObjectSize;
+    gds_descriptor.block_size = 4096;
+    gds_descriptor.allocation_alignment = 4096;
+
+    Replica::Descriptor replica;
+    replica.descriptor_variant = gds_descriptor;
+    replica.status = ReplicaStatus::COMPLETE;
+
+    EXPECT_EQ(calculate_total_size(replica), kObjectSize);
+    std::vector<Slice> slices;
+    ASSERT_EQ(allocateSlices(slices, replica, buffer.data()), 0);
+    ASSERT_EQ(slices.size(), 1u);
+    EXPECT_EQ(slices[0].ptr, buffer.data());
+    EXPECT_EQ(slices[0].size, kObjectSize);
+}
+
 }  // namespace mooncake
 
 int main(int argc, char** argv) {

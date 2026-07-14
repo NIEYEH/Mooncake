@@ -10,6 +10,7 @@ import socket
 import stat
 import subprocess
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -30,6 +31,34 @@ BLKSSZGET = 0x1268
 
 class GdsSsdRegisterError(RuntimeError):
     pass
+
+
+@dataclass
+class StablePathUpdate:
+    path: str
+    device: str
+    changed: bool = False
+    previous_symlink_target: Optional[str] = None
+
+    def rollback(self) -> None:
+        if not self.changed:
+            return
+        if os.path.lexists(self.path):
+            if not os.path.islink(self.path):
+                logging.warning(
+                    "Not rolling back %s because it is no longer a symlink",
+                    self.path,
+                )
+                return
+            if os.path.realpath(self.path) != os.path.realpath(self.device):
+                logging.warning(
+                    "Not rolling back %s because its target changed concurrently",
+                    self.path,
+                )
+                return
+            os.unlink(self.path)
+        if self.previous_symlink_target is not None:
+            os.symlink(self.previous_symlink_target, self.path)
 
 
 def parse_size(value: str) -> int:
@@ -306,12 +335,15 @@ def default_segment_name(namespace_id: str) -> str:
     return f"gds_{digest}"
 
 
-def prepare_stable_path(device: str, stable_path: str, force: bool, dry_run: bool) -> None:
+def prepare_stable_path(
+    device: str, stable_path: str, force: bool, dry_run: bool
+) -> StablePathUpdate:
+    update = StablePathUpdate(stable_path, device)
     if os.path.realpath(device) == os.path.realpath(stable_path):
-        return
+        return update
     if dry_run:
         logging.info("dry-run: would point %s at %s", stable_path, device)
-        return
+        return update
 
     parent = os.path.dirname(stable_path)
     if parent:
@@ -321,22 +353,39 @@ def prepare_stable_path(device: str, stable_path: str, force: bool, dry_run: boo
             current = os.path.realpath(stable_path)
             expected = os.path.realpath(device)
             if current == expected:
-                return
+                return update
             if not force:
                 raise GdsSsdRegisterError(
                     f"stable path {stable_path} points to {current}, not {expected}; use --force"
                 )
+            update.previous_symlink_target = os.readlink(stable_path)
             os.unlink(stable_path)
         else:
             if os.path.realpath(stable_path) == os.path.realpath(device):
-                return
+                return update
             raise GdsSsdRegisterError(
                 f"stable path {stable_path} exists and is not a symlink"
             )
-    os.symlink(device, stable_path)
+    try:
+        os.symlink(device, stable_path)
+    except OSError as exc:
+        if update.previous_symlink_target is not None:
+            os.symlink(update.previous_symlink_target, stable_path)
+        raise GdsSsdRegisterError(
+            f"failed to create stable path {stable_path}: {exc}"
+        ) from exc
+    update.changed = True
+    return update
 
 
 def build_registration_plan(args: argparse.Namespace) -> Dict[str, Any]:
+    if args.nsid is not None and args.nsid <= 0:
+        raise GdsSsdRegisterError("nsid must be positive")
+    if args.numa_node < -1:
+        raise GdsSsdRegisterError("numa_node must be -1 or non-negative")
+    if args.metadata_reserved_bytes < 0:
+        raise GdsSsdRegisterError("metadata_reserved_bytes must be non-negative")
+
     nqn = discover_nqn(args)
     connect_namespace(args, nqn)
     device = find_device(args, nqn)
@@ -372,6 +421,10 @@ def build_registration_plan(args: argparse.Namespace) -> Dict[str, Any]:
         raise GdsSsdRegisterError("segment range exceeds device size")
 
     alignment = args.allocation_alignment or max(block_size, 4096)
+    if alignment <= 0 or alignment % block_size != 0:
+        raise GdsSsdRegisterError(
+            "allocation_alignment must be a positive multiple of block_size"
+        )
     if args.base % alignment != 0:
         raise GdsSsdRegisterError("base must be aligned to allocation_alignment")
 
@@ -381,13 +434,21 @@ def build_registration_plan(args: argparse.Namespace) -> Dict[str, Any]:
         segment_uri = args.segment_uri
         if not segment_uri.startswith("block://"):
             raise GdsSsdRegisterError("segment_uri must use block://")
-        stable_path = args.stable_path or segment_uri[len("block://") :]
-        if args.stable_path:
-            prepare_stable_path(device, stable_path, args.force, args.dry_run)
+        uri_path = segment_uri[len("block://") :]
+        if not uri_path:
+            raise GdsSsdRegisterError("segment_uri block path must not be empty")
+        if args.stable_path and os.path.abspath(args.stable_path) != os.path.abspath(
+            uri_path
+        ):
+            raise GdsSsdRegisterError(
+                "stable_path must match the path encoded in segment_uri"
+            )
+        stable_path = args.stable_path or uri_path
+        manage_stable_path = bool(args.stable_path)
     else:
         stable_path = args.stable_path or f"/dev/mooncake/{segment_name}"
         segment_uri = f"block://{stable_path}"
-        prepare_stable_path(device, stable_path, args.force, args.dry_run)
+        manage_stable_path = True
 
     return {
         "master_server_address": args.master_server_address,
@@ -405,31 +466,44 @@ def build_registration_plan(args: argparse.Namespace) -> Dict[str, Any]:
         "numa_node": args.numa_node,
         "device": device,
         "stable_path": stable_path,
+        "manage_stable_path": manage_stable_path,
         "nqn": nqn,
         "nsid": args.nsid,
     }
 
 
-def register(plan: Dict[str, Any], dry_run: bool) -> int:
+def register(plan: Dict[str, Any], dry_run: bool, force: bool = False) -> int:
     print(json.dumps(plan, indent=2, sort_keys=True))
+    stable_path_update = StablePathUpdate(plan["stable_path"], plan["device"])
+    if plan.get("manage_stable_path", False):
+        stable_path_update = prepare_stable_path(
+            plan["device"], plan["stable_path"], force, dry_run
+        )
     if dry_run:
         return OPERATION_OK
-    registrar = MooncakeGdsSsdRegister()
-    return registrar.real_register(
-        plan["master_server_address"],
-        plan["segment_name"],
-        plan["client_host"],
-        plan["segment_uri"],
-        plan["namespace_id"],
-        plan["base"],
-        plan["size"],
-        plan["device_size"],
-        plan["block_size"],
-        plan["allocation_alignment"],
-        plan["metadata_reserved_bytes"],
-        plan["gpu_device_ids"],
-        plan["numa_node"],
-    )
+    try:
+        registrar = MooncakeGdsSsdRegister()
+        result = registrar.real_register(
+            plan["master_server_address"],
+            plan["segment_name"],
+            plan["client_host"],
+            plan["segment_uri"],
+            plan["namespace_id"],
+            plan["base"],
+            plan["size"],
+            plan["device_size"],
+            plan["block_size"],
+            plan["allocation_alignment"],
+            plan["metadata_reserved_bytes"],
+            plan["gpu_device_ids"],
+            plan["numa_node"],
+        )
+    except Exception:
+        stable_path_update.rollback()
+        raise
+    if result != OPERATION_OK:
+        stable_path_update.rollback()
+    return result
 
 
 def print_status(master_server_address: str) -> int:
@@ -508,7 +582,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if args.unregister:
             return unregister(args)
         plan = build_registration_plan(args)
-        return register(plan, args.dry_run)
+        return register(plan, args.dry_run, args.force)
     except GdsSsdRegisterError as exc:
         logging.error("%s", exc)
         return 1

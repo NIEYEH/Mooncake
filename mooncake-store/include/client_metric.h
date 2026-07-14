@@ -101,6 +101,8 @@ Result execute_timed_operation(Operation&& operation, SuccessFn&& success_fn,
 
 enum class TransferOperationKind { kRead, kWrite };
 
+enum class GdsTransferOperation { kRead, kWrite };
+
 struct TransferMetric {
     TransferMetric(std::map<std::string, std::string> labels = {})
         : total_read_bytes("mooncake_transfer_read_bytes", "Total bytes read",
@@ -657,11 +659,61 @@ struct SsdMetric {
     }
 };
 
+struct GdsTransferMetric {
+    std::array<std::string, 2> label_names = {"operation", "result"};
+
+    explicit GdsTransferMetric(
+        std::map<std::string, std::string> labels = {})
+        : operation_count(
+              "mooncake_gds_ssd_transfer_operations_total",
+              "Total GDS SSD transfer operations by operation and result",
+              AddStaticLabels(labels), label_names),
+          operation_bytes(
+              "mooncake_gds_ssd_transfer_bytes_total",
+              "Requested GDS SSD transfer bytes by operation and result",
+              AddStaticLabels(labels), label_names),
+          operation_latency_us(
+              "mooncake_gds_ssd_transfer_latency_us",
+              "GDS SSD transfer completion latency in microseconds",
+              kSsdLatencyBucket, AddStaticLabels(labels),
+              label_names) {}
+
+    ylt::metric::hybrid_counter_2t operation_count;
+    ylt::metric::hybrid_counter_2t operation_bytes;
+    ylt::metric::hybrid_histogram_2t operation_latency_us;
+
+    void Observe(GdsTransferOperation operation, bool success, uint64_t bytes,
+                 uint64_t latency_us) {
+        const std::array<std::string, 2> label = {
+            operation == GdsTransferOperation::kRead ? "READ" : "WRITE",
+            success ? "success" : "failure"};
+        operation_count.inc(label);
+        operation_bytes.inc(label, bytes);
+        operation_latency_us.observe(label, latency_us);
+    }
+
+    void serialize(std::string& str) {
+        operation_count.serialize(str);
+        operation_bytes.serialize(str);
+        operation_latency_us.serialize(str);
+    }
+
+   private:
+    static std::map<std::string, std::string> AddStaticLabels(
+        const std::map<std::string, std::string>& source_labels) {
+        auto labels = source_labels;
+        labels["replica_type"] = "GDS_SSD";
+        labels["transport"] = "GDS";
+        return labels;
+    }
+};
+
 struct ClientMetric {
     TransferMetric transfer_metric;
     MasterClientMetric master_client_metric;
     TransferOperationMetric transfer_operation_metric;
     SsdMetric ssd_metric;
+    GdsTransferMetric gds_transfer_metric;
 
     /**
      * @brief Creates a ClientMetric instance based on environment variables

@@ -120,6 +120,7 @@ struct GdsSsdAllocationKeyHash {
 struct GdsSsdAllocationRecord {
     GdsSsdReplicaMeta meta;
     std::unique_ptr<AllocatedBuffer> buffer;
+    bool committed{false};
 };
 
 inline std::ostream& operator<<(
@@ -384,8 +385,17 @@ class ScopedGdsSsdSegmentAccess {
 
     ErrorCode ReleaseReplica(const GdsSsdReplicaMeta& meta);
 
+    ErrorCode CommitReplicas(
+        const std::vector<GdsSsdReplicaMeta>& replicas);
+
     ErrorCode RegisterAccessor(const UUID& segment_id,
                                const GdsSsdAccessor& accessor);
+
+    ErrorCode UnregisterAccessor(const UUID& segment_id,
+                                 const std::string& client_host);
+
+    tl::expected<GdsSsdAccessor, ErrorCode> GetAccessor(
+        const UUID& segment_id, const std::string& client_host) const;
 
     ErrorCode ResolveDescriptor(const GdsSsdReplicaMeta& meta,
                                 const std::string& client_host,
@@ -650,6 +660,8 @@ class NoFSegmentManager {
 
 class GdsSsdSegmentManager {
    public:
+    ~GdsSsdSegmentManager();
+
     ScopedGdsSsdSegmentAccess getGdsSsdSegmentAccess() {
         return ScopedGdsSsdSegmentAccess(this, segment_mutex_);
     }

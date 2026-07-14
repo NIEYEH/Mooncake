@@ -888,11 +888,13 @@ void Client::InitTransferSubmitter() {
         GetConfiguredNumaSocketId().value_or(GetCurrentNumaSocketId());
     transfer_submitter_ = std::make_unique<TransferSubmitter>(
         *transfer_engine_, storage_backend_, local_hostname_,
-        metrics_ ? &metrics_->transfer_metric : nullptr, numa_socket_id);
+        metrics_ ? &metrics_->transfer_metric : nullptr, numa_socket_id,
+        metrics_ ? &metrics_->gds_transfer_metric : nullptr);
 #else
     transfer_submitter_ = std::make_unique<TransferSubmitter>(
         *transfer_engine_, storage_backend_, local_hostname_,
-        metrics_ ? &metrics_->transfer_metric : nullptr);
+        metrics_ ? &metrics_->transfer_metric : nullptr, 0,
+        metrics_ ? &metrics_->gds_transfer_metric : nullptr);
 #endif
 }
 
@@ -3549,7 +3551,8 @@ ErrorCode Client::TransferRead(const Replica::Descriptor& replica_descriptor,
     } else if (replica_descriptor.is_gds_ssd_replica()) {
         auto& gds_desc = replica_descriptor.get_gds_ssd_descriptor();
         total_size = gds_desc.object_size;
-    } else if (replica_descriptor.is_disk_replica()) {        auto& disk_desc = replica_descriptor.get_disk_descriptor();
+    } else if (replica_descriptor.is_disk_replica()) {
+        auto& disk_desc = replica_descriptor.get_disk_descriptor();
         total_size = disk_desc.object_size;
     } else if (replica_descriptor.is_local_disk_replica()) {
         auto& disk_desc = replica_descriptor.get_local_disk_descriptor();
@@ -3926,16 +3929,12 @@ void Client::StorageHeartbeatThreadMain() {
 ErrorCode Client::FindFirstCompleteReplica(
     const std::vector<Replica::Descriptor>& replica_list,
     Replica::Descriptor& replica) {
-    // Find the first complete replica
-    for (size_t i = 0; i < replica_list.size(); ++i) {
-        if (replica_list[i].status == ReplicaStatus::COMPLETE) {
-            replica = replica_list[i];
-            return ErrorCode::OK;
-        }
+    auto preferred = GetPreferredReplica(replica_list);
+    if (!preferred.has_value()) {
+        return ErrorCode::INVALID_REPLICA;
     }
-
-    // No complete replica found
-    return ErrorCode::INVALID_REPLICA;
+    replica = std::move(preferred.value());
+    return ErrorCode::OK;
 }
 
 tl::expected<Replica::Descriptor, ErrorCode> Client::GetPreferredReplica(
@@ -3943,10 +3942,6 @@ tl::expected<Replica::Descriptor, ErrorCode> Client::GetPreferredReplica(
     if (replica_list.empty()) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
-    if (replica_list.size() == 1) {
-        return replica_list[0];
-    }
-
     std::unordered_set<std::string> local_endpoints;
     {
         std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
@@ -3957,7 +3952,8 @@ tl::expected<Replica::Descriptor, ErrorCode> Client::GetPreferredReplica(
 
     // Prefer local MEMORY replicas first
     for (const auto& rep : replica_list) {
-        if (rep.is_memory_replica()) {
+        if (rep.status == ReplicaStatus::COMPLETE &&
+            rep.is_memory_replica()) {
             const auto& mem_desc = rep.get_memory_descriptor();
             const std::string& endpoint =
                 mem_desc.buffer_descriptor.transport_endpoint_;
@@ -3969,7 +3965,8 @@ tl::expected<Replica::Descriptor, ErrorCode> Client::GetPreferredReplica(
 
     // Then prefer GDS SSD replicas that the master resolved for this client.
     for (const auto& rep : replica_list) {
-        if (rep.is_gds_ssd_replica()) {
+        if (rep.status == ReplicaStatus::COMPLETE &&
+            rep.is_gds_ssd_replica()) {
             const auto& gds_desc = rep.get_gds_ssd_descriptor();
             if (!gds_desc.segment_uri.empty()) {
                 return rep;
@@ -3977,9 +3974,17 @@ tl::expected<Replica::Descriptor, ErrorCode> Client::GetPreferredReplica(
         }
     }
 
+    // Then prefer a remote MEMORY replica.
+    for (const auto& rep : replica_list) {
+        if (rep.status == ReplicaStatus::COMPLETE &&
+            rep.is_memory_replica()) {
+            return rep;
+        }
+    }
+
     // Then prefer local NOF_SSD replicas
     for (const auto& rep : replica_list) {
-        if (rep.is_nof_replica()) {
+        if (rep.status == ReplicaStatus::COMPLETE && rep.is_nof_replica()) {
             const auto& nof_desc = rep.get_nof_descriptor();
             const std::string& endpoint =
                 nof_desc.buffer_descriptor.transport_endpoint_;
@@ -3989,7 +3994,15 @@ tl::expected<Replica::Descriptor, ErrorCode> Client::GetPreferredReplica(
         }
     }
 
-    return replica_list[0];
+    // Finally preserve Master order among other completed replicas.
+    for (const auto& rep : replica_list) {
+        if (rep.status == ReplicaStatus::COMPLETE &&
+            (!rep.is_gds_ssd_replica() ||
+             !rep.get_gds_ssd_descriptor().segment_uri.empty())) {
+            return rep;
+        }
+    }
+    return tl::make_unexpected(ErrorCode::INVALID_REPLICA);
 }
 size_t Client::GetLocalHotCacheSizeFromEnv() {
     if (const char* ev_size = std::getenv("MC_STORE_LOCAL_HOT_CACHE_SIZE")) {

@@ -1,4 +1,5 @@
 #include "master_service.h"
+#include "master_metric_manager.h"
 #include "rpc_service.h"
 
 #include <glog/logging.h>
@@ -152,6 +153,31 @@ class MasterServiceTest : public ::testing::Test {
         return segment;
     }
 #endif
+
+    GdsSsdSegment MakeGdsSsdSegment(
+        std::string name, size_t size,
+        const std::vector<std::pair<std::string, std::string>>& host_uris)
+        const {
+        GdsSsdSegment segment;
+        segment.id = generate_uuid();
+        segment.name = std::move(name);
+        segment.size = size;
+        segment.block_size = 4096;
+        segment.allocation_alignment = 4096;
+        segment.namespace_id = "namespace-" + segment.name;
+        for (const auto& [host, uri] : host_uris) {
+            GdsSsdAccessor accessor;
+            accessor.client_host = host;
+            accessor.segment_uri = uri;
+            accessor.namespace_id = segment.namespace_id;
+            accessor.size = segment.size;
+            accessor.block_size = segment.block_size;
+            accessor.allocation_alignment = segment.allocation_alignment;
+            accessor.alive = true;
+            segment.accessors.push_back(std::move(accessor));
+        }
+        return segment;
+    }
 
     MountedSegmentContext PrepareSimpleSegment(
         MasterService& service, std::string name = "test_segment",
@@ -710,6 +736,295 @@ TEST_F(MasterServiceTest, PutStartOnePlusOneAllowsSingleAllocatedReplica) {
     EXPECT_TRUE(put_start_result->front().is_memory_replica());
 }
 #endif
+
+TEST_F(MasterServiceTest, GdsSsdPutAllocatesDistinctPreferredSegments) {
+    MasterService service;
+    const UUID client_id = generate_uuid();
+    const std::string host = "gds-writer";
+    auto segment_a = MakeGdsSsdSegment(
+        "gds_pool_a", 64 * 1024,
+        {{host, "block:///dev/mooncake/gds_pool_a"}});
+    auto segment_b = MakeGdsSsdSegment(
+        "gds_pool_b", 64 * 1024,
+        {{host, "block:///dev/mooncake/gds_pool_b"}});
+    ASSERT_TRUE(service.MountGdsSsdSegment(segment_a).has_value());
+    ASSERT_TRUE(service.MountGdsSsdSegment(segment_b).has_value());
+
+    ReplicateConfig config;
+    config.replica_num = 0;
+    config.gds_replica_num = 2;
+    config.host_id = host;
+    config.preferred_gds_segments = {segment_b.name, segment_a.name};
+
+    auto put_start =
+        service.PutStart(client_id, "gds_two_replicas", "default", 4096,
+                         config);
+    ASSERT_TRUE(put_start.has_value());
+    ASSERT_EQ(put_start->size(), 2u);
+    ASSERT_TRUE((*put_start)[0].is_gds_ssd_replica());
+    ASSERT_TRUE((*put_start)[1].is_gds_ssd_replica());
+    EXPECT_EQ((*put_start)[0].get_gds_ssd_descriptor().segment_name,
+              segment_b.name);
+    EXPECT_EQ((*put_start)[1].get_gds_ssd_descriptor().segment_name,
+              segment_a.name);
+
+    ASSERT_TRUE(service.PutEnd(client_id, "gds_two_replicas", "default",
+                               ReplicaType::GDS_SSD)
+                    .has_value());
+    auto replicas =
+        service.GetReplicaList(client_id, "gds_two_replicas", "default");
+    ASSERT_TRUE(replicas.has_value());
+    ASSERT_EQ(replicas->replicas.size(), 2u);
+    EXPECT_TRUE(replicas->replicas[0].is_gds_ssd_replica());
+    EXPECT_TRUE(replicas->replicas[1].is_gds_ssd_replica());
+}
+
+TEST_F(MasterServiceTest, GdsSsdPutFailureRevokeAndRemoveReleaseAllocations) {
+    MasterService service;
+    const UUID client_id = generate_uuid();
+    const std::string host = "gds-rollback-writer";
+    auto segment = MakeGdsSsdSegment(
+        "gds_rollback_pool", 4096,
+        {{host, "block:///dev/mooncake/gds_rollback_pool"}});
+    ASSERT_TRUE(service.MountGdsSsdSegment(segment).has_value());
+
+    ReplicateConfig two_replicas;
+    two_replicas.replica_num = 0;
+    two_replicas.gds_replica_num = 2;
+    two_replicas.host_id = host;
+
+    ReplicateConfig no_accessor = two_replicas;
+    no_accessor.gds_replica_num = 1;
+    no_accessor.host_id = "host-without-accessor";
+    auto inaccessible = service.PutStart(
+        client_id, "gds_no_accessor", "default", 4096, no_accessor);
+    ASSERT_FALSE(inaccessible.has_value());
+    EXPECT_EQ(inaccessible.error(), ErrorCode::NO_AVAILABLE_HANDLE);
+
+    auto failed = service.PutStart(client_id, "gds_partial_failure", "default",
+                                   4096, two_replicas);
+    ASSERT_FALSE(failed.has_value());
+    EXPECT_EQ(failed.error(), ErrorCode::NO_AVAILABLE_HANDLE);
+    auto& metrics = MasterMetricManager::instance();
+    EXPECT_EQ(metrics.get_segment_gds_pending_size(segment.name), 0);
+    EXPECT_EQ(metrics.get_segment_gds_used_size(segment.name), 0);
+
+    ReplicateConfig one_replica = two_replicas;
+    one_replica.gds_replica_num = 1;
+    auto after_rollback = service.PutStart(
+        client_id, "gds_after_rollback", "default", 4096, one_replica);
+    ASSERT_TRUE(after_rollback.has_value());
+    EXPECT_EQ(metrics.get_segment_gds_pending_size(segment.name), 4096);
+    EXPECT_EQ(metrics.get_segment_gds_used_size(segment.name), 0);
+    ASSERT_TRUE(service.PutRevoke(client_id, "gds_after_rollback", "default",
+                                  ReplicaType::GDS_SSD)
+                    .has_value());
+    EXPECT_EQ(metrics.get_segment_gds_pending_size(segment.name), 0);
+    EXPECT_EQ(metrics.get_segment_gds_used_size(segment.name), 0);
+
+    auto after_revoke = service.PutStart(
+        client_id, "gds_after_revoke", "default", 4096, one_replica);
+    ASSERT_TRUE(after_revoke.has_value());
+    EXPECT_EQ(metrics.get_segment_gds_pending_size(segment.name), 4096);
+    ASSERT_TRUE(service.PutEnd(client_id, "gds_after_revoke", "default",
+                               ReplicaType::GDS_SSD)
+                    .has_value());
+    EXPECT_EQ(metrics.get_segment_gds_pending_size(segment.name), 0);
+    EXPECT_EQ(metrics.get_segment_gds_used_size(segment.name), 4096);
+    ASSERT_TRUE(service.PutEnd(client_id, "gds_after_revoke", "default",
+                               ReplicaType::GDS_SSD)
+                    .has_value());
+    EXPECT_EQ(metrics.get_segment_gds_used_size(segment.name), 4096);
+    ASSERT_TRUE(
+        service.Remove("gds_after_revoke", "default", true).has_value());
+    EXPECT_EQ(metrics.get_segment_gds_used_size(segment.name), 0);
+
+    auto after_remove = service.PutStart(
+        client_id, "gds_after_remove", "default", 4096, one_replica);
+    ASSERT_TRUE(after_remove.has_value());
+    EXPECT_EQ(metrics.get_segment_gds_pending_size(segment.name), 4096);
+    EXPECT_TRUE(service.PutRevoke(client_id, "gds_after_remove", "default",
+                                  ReplicaType::GDS_SSD)
+                    .has_value());
+    EXPECT_EQ(metrics.get_segment_gds_pending_size(segment.name), 0);
+}
+
+TEST_F(MasterServiceTest, GdsSsdPendingAllocationIsReleasedAfterTimeout) {
+    auto service_config = MasterServiceConfig::builder()
+                              .set_put_start_discard_timeout_sec(0)
+                              .set_put_start_release_timeout_sec(1)
+                              .build();
+    MasterService service(service_config);
+    const UUID client_id = generate_uuid();
+    const std::string host = "gds-timeout-writer";
+    auto segment = MakeGdsSsdSegment(
+        "gds_timeout_pool", 4096,
+        {{host, "block:///dev/mooncake/gds_timeout_pool"}});
+    ASSERT_TRUE(service.MountGdsSsdSegment(segment).has_value());
+
+    ReplicateConfig config;
+    config.replica_num = 0;
+    config.gds_replica_num = 1;
+    config.host_id = host;
+    ASSERT_TRUE(service.PutStart(client_id, "gds_abandoned_put", "default",
+                                 4096, config)
+                    .has_value());
+
+    bool reclaimed = false;
+    WaitUntil(
+        [&] {
+            auto retry = service.PutStart(client_id, "gds_after_timeout",
+                                          "default", 4096, config);
+            if (!retry.has_value()) {
+                return false;
+            }
+            reclaimed = true;
+            return true;
+        },
+        std::chrono::milliseconds(4000), std::chrono::milliseconds(100));
+    ASSERT_TRUE(reclaimed);
+    auto abandoned =
+        service.GetReplicaList(client_id, "gds_abandoned_put", "default");
+    ASSERT_FALSE(abandoned.has_value());
+    EXPECT_EQ(abandoned.error(), ErrorCode::OBJECT_NOT_FOUND);
+    EXPECT_TRUE(service.PutRevoke(client_id, "gds_after_timeout", "default",
+                                  ReplicaType::GDS_SSD)
+                    .has_value());
+}
+
+TEST_F(MasterServiceTest, GdsSsdGetResolvesAccessorForReaderHost) {
+    MasterService service;
+    const UUID writer_id = generate_uuid();
+    const UUID reader_id = generate_uuid();
+    const UUID inaccessible_reader_id = generate_uuid();
+    const std::string writer_host = "gds-writer-host";
+    const std::string reader_host = "gds-reader-host";
+    const std::string inaccessible_reader_host = "gds-reader-without-accessor";
+    const std::string writer_uri = "block:///dev/mooncake/writer-path";
+    const std::string reader_uri = "block:///dev/mooncake/reader-path";
+
+    auto reader_memory_segment =
+        MakeSegment("reader_host_identity", kDefaultSegmentBase,
+                    kDefaultSegmentSize, reader_host);
+    ASSERT_TRUE(
+        service.MountSegment(reader_memory_segment, reader_id).has_value());
+    auto inaccessible_reader_segment =
+        MakeSegment("inaccessible_reader_host_identity",
+                    kDefaultSegmentBase + kDefaultSegmentSize,
+                    kDefaultSegmentSize, inaccessible_reader_host);
+    ASSERT_TRUE(service
+                    .MountSegment(inaccessible_reader_segment,
+                                  inaccessible_reader_id)
+                    .has_value());
+
+    auto gds_segment = MakeGdsSsdSegment(
+        "gds_shared_pool", 64 * 1024,
+        {{writer_host, writer_uri}, {reader_host, reader_uri}});
+    ASSERT_TRUE(service.MountGdsSsdSegment(gds_segment).has_value());
+
+    ReplicateConfig config;
+    config.replica_num = 0;
+    config.gds_replica_num = 1;
+    config.host_id = writer_host;
+    auto put_start = service.PutStart(writer_id, "gds_shared_object",
+                                      "default", 4096, config);
+    ASSERT_TRUE(put_start.has_value());
+    ASSERT_EQ(put_start->size(), 1u);
+    EXPECT_EQ(put_start->front().get_gds_ssd_descriptor().segment_uri,
+              writer_uri);
+    ASSERT_TRUE(service.PutEnd(writer_id, "gds_shared_object", "default",
+                               ReplicaType::GDS_SSD)
+                    .has_value());
+
+    auto reader_replicas =
+        service.GetReplicaList(reader_id, "gds_shared_object", "default");
+    ASSERT_TRUE(reader_replicas.has_value());
+    ASSERT_EQ(reader_replicas->replicas.size(), 1u);
+    EXPECT_EQ(reader_replicas->replicas[0]
+                  .get_gds_ssd_descriptor()
+                  .segment_uri,
+              reader_uri);
+    EXPECT_EQ(reader_replicas->replicas[0]
+                  .get_gds_ssd_descriptor()
+                  .offset,
+              put_start->front().get_gds_ssd_descriptor().offset);
+
+    auto inaccessible = service.GetReplicaList(
+        inaccessible_reader_id, "gds_shared_object", "default");
+    ASSERT_FALSE(inaccessible.has_value());
+    EXPECT_EQ(inaccessible.error(), ErrorCode::NO_AVAILABLE_HANDLE);
+
+    ASSERT_TRUE(service
+                    .UnregisterGdsSsdAccessor(gds_segment.id, reader_host)
+                    .has_value());
+    auto unavailable =
+        service.GetReplicaList(reader_id, "gds_shared_object", "default");
+    ASSERT_FALSE(unavailable.has_value());
+    EXPECT_EQ(unavailable.error(), ErrorCode::NO_AVAILABLE_HANDLE);
+}
+
+TEST_F(MasterServiceTest, GdsSsdLeaseProtectsOffsetUntilReaderExpires) {
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(500)
+                              .build();
+    MasterService service(service_config);
+    const UUID writer_id = generate_uuid();
+    const UUID reader_id = generate_uuid();
+    const std::string writer_host = "gds-lease-writer";
+    const std::string reader_host = "gds-lease-reader";
+
+    auto reader_memory_segment =
+        MakeSegment("gds_lease_reader_identity", kDefaultSegmentBase,
+                    kDefaultSegmentSize, reader_host);
+    ASSERT_TRUE(
+        service.MountSegment(reader_memory_segment, reader_id).has_value());
+
+    auto segment = MakeGdsSsdSegment(
+        "gds_lease_pool", 4096,
+        {{writer_host, "block:///dev/mooncake/gds_lease_writer"},
+         {reader_host, "block:///dev/mooncake/gds_lease_reader"}});
+    ASSERT_TRUE(service.MountGdsSsdSegment(segment).has_value());
+
+    ReplicateConfig config;
+    config.replica_num = 0;
+    config.gds_replica_num = 1;
+    config.host_id = writer_host;
+    auto put = service.PutStart(writer_id, "gds_leased_object", "default",
+                                4096, config);
+    ASSERT_TRUE(put.has_value());
+    const uint64_t original_offset =
+        put->front().get_gds_ssd_descriptor().offset;
+    ASSERT_TRUE(service.PutEnd(writer_id, "gds_leased_object", "default",
+                               ReplicaType::GDS_SSD)
+                    .has_value());
+    ASSERT_TRUE(service
+                    .GetReplicaList(reader_id, "gds_leased_object", "default")
+                    .has_value());
+
+    auto protected_remove =
+        service.Remove("gds_leased_object", "default", false);
+    ASSERT_FALSE(protected_remove.has_value());
+    EXPECT_EQ(protected_remove.error(), ErrorCode::OBJECT_HAS_LEASE);
+    EXPECT_EQ(MasterMetricManager::instance().get_segment_gds_used_size(
+                  segment.name),
+              4096);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(700));
+    ASSERT_TRUE(service.Remove("gds_leased_object", "default", false)
+                    .has_value());
+    EXPECT_EQ(MasterMetricManager::instance().get_segment_gds_used_size(
+                  segment.name),
+              0);
+
+    auto reused = service.PutStart(writer_id, "gds_reused_object", "default",
+                                   4096, config);
+    ASSERT_TRUE(reused.has_value());
+    EXPECT_EQ(reused->front().get_gds_ssd_descriptor().offset,
+              original_offset);
+    EXPECT_TRUE(service.PutRevoke(writer_id, "gds_reused_object", "default",
+                                  ReplicaType::GDS_SSD)
+                    .has_value());
+}
 
 TEST_F(MasterServiceTest, PutStartGroupIdsValidation) {
     std::unique_ptr<MasterService> service_(new MasterService());

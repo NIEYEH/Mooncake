@@ -856,6 +856,28 @@ auto MasterService::RegisterGdsSsdAccessor(
     }
     return {};
 }
+
+auto MasterService::UnregisterGdsSsdAccessor(
+    const UUID& segment_id, const std::string& client_host)
+    -> tl::expected<void, ErrorCode> {
+    auto gds_access = gds_ssd_segment_manager_.getGdsSsdSegmentAccess();
+    LOG(INFO) << "GDS SSD accessor unregister: segment_id=" << segment_id
+              << ", client_host=" << client_host;
+
+    auto err = gds_access.UnregisterAccessor(segment_id, client_host);
+    if (err != ErrorCode::OK) {
+        return tl::make_unexpected(err);
+    }
+    return {};
+}
+
+auto MasterService::GetGdsSsdAccessor(
+    const UUID& segment_id, const std::string& client_host)
+    -> tl::expected<GdsSsdAccessor, ErrorCode> {
+    auto gds_access = gds_ssd_segment_manager_.getGdsSsdSegmentAccess();
+    return gds_access.GetAccessor(segment_id, client_host);
+}
+
 auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
                                    const UUID& client_id)
     -> tl::expected<void, ErrorCode> {
@@ -2964,6 +2986,9 @@ auto MasterService::AllocateAndInsertMetadata(
             VLOG(1) << "Failed to allocate GDS SSD replicas for key=" << key
                     << ", error=no_mounted_gds_ssd_segments";
             MasterMetricManager::instance().inc_put_start_alloc_failures();
+            MasterMetricManager::instance().inc_gds_allocation_failure(
+                MasterMetricManager::GdsSsdAllocationFailureReason::
+                    NO_SEGMENT);
             abort_reserved_quota();
             return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
         }
@@ -2975,6 +3000,9 @@ auto MasterService::AllocateAndInsertMetadata(
             VLOG(1) << "Failed to allocate GDS SSD replicas for key=" << key
                     << ", error=missing_client_host";
             MasterMetricManager::instance().inc_put_start_alloc_failures();
+            MasterMetricManager::instance().inc_gds_allocation_failure(
+                MasterMetricManager::GdsSsdAllocationFailureReason::
+                    INVALID_REQUEST);
             abort_reserved_quota();
             return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
         }
@@ -3293,6 +3321,28 @@ auto MasterService::PutEnd(const UUID& client_id, const std::string& key,
         LOG(ERROR) << "Illegal client " << client_id << " to PutEnd key " << key
                    << ", was PutStart-ed by " << metadata.client_id;
         return tl::make_unexpected(ErrorCode::ILLEGAL_CLIENT);
+    }
+
+    std::vector<GdsSsdReplicaMeta> gds_replicas_to_commit;
+    metadata.VisitReplicas(
+        [replica_type](const Replica& replica) {
+            return replica.is_gds_ssd_replica() &&
+                   (replica_type == ReplicaType::ALL ||
+                    replica_type == ReplicaType::GDS_SSD);
+        },
+        [&gds_replicas_to_commit](const Replica& replica) {
+            gds_replicas_to_commit.push_back(replica.get_gds_ssd_meta());
+        });
+    if (!gds_replicas_to_commit.empty()) {
+        auto gds_access =
+            gds_ssd_segment_manager_.getGdsSsdSegmentAccess();
+        const auto commit_error =
+            gds_access.CommitReplicas(gds_replicas_to_commit);
+        if (commit_error != ErrorCode::OK) {
+            LOG(ERROR) << "Failed to commit GDS SSD allocations for key="
+                       << key << ", error=" << commit_error;
+            return tl::make_unexpected(commit_error);
+        }
     }
 
     metadata.VisitReplicas(

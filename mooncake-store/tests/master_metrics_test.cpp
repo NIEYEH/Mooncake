@@ -59,8 +59,15 @@ TEST_F(MasterMetricsTest, InitialStatusTest) {
 
     // GDS SSD Storage Metrics
     ASSERT_EQ(metrics.get_allocated_gds_size(), 0);
+    ASSERT_EQ(metrics.get_gds_used_size(), 0);
+    ASSERT_EQ(metrics.get_gds_pending_size(), 0);
     ASSERT_EQ(metrics.get_total_gds_capacity(), 0);
     ASSERT_DOUBLE_EQ(metrics.get_global_gds_used_ratio(), 0.0);
+    ASSERT_EQ(metrics.get_gds_allocation_success(), 0);
+    ASSERT_EQ(metrics.get_gds_allocation_failure(
+                  MasterMetricManager::GdsSsdAllocationFailureReason::
+                      INVALID_REQUEST),
+              0);
 
     // Key/Value Metrics
     ASSERT_EQ(metrics.get_key_count(), 0);
@@ -141,23 +148,47 @@ TEST_F(MasterMetricsTest, InitialStatusTest) {
 
 TEST_F(MasterMetricsTest, GdsSsdStorageMetricsTest) {
     auto& metrics = MasterMetricManager::instance();
+    using FailureReason =
+        MasterMetricManager::GdsSsdAllocationFailureReason;
     const std::string segment_name = "gds_metrics_segment";
     constexpr int64_t kCapacity = 64 * 1024;
     constexpr int64_t kAllocated = 16 * 1024;
+    constexpr int64_t kUsed = 12 * 1024;
+    constexpr int64_t kPending = kAllocated - kUsed;
 
     const int64_t base_allocated = metrics.get_allocated_gds_size();
+    const int64_t base_used = metrics.get_gds_used_size();
+    const int64_t base_pending = metrics.get_gds_pending_size();
     const int64_t base_capacity = metrics.get_total_gds_capacity();
+    const int64_t base_allocation_success =
+        metrics.get_gds_allocation_success();
+    const int64_t base_capacity_failure =
+        metrics.get_gds_allocation_failure(FailureReason::CAPACITY);
     ASSERT_EQ(metrics.get_segment_allocated_gds_size(segment_name), 0);
+    ASSERT_EQ(metrics.get_segment_gds_used_size(segment_name), 0);
+    ASSERT_EQ(metrics.get_segment_gds_pending_size(segment_name), 0);
     ASSERT_EQ(metrics.get_segment_total_gds_capacity(segment_name), 0);
     ASSERT_DOUBLE_EQ(metrics.get_segment_gds_used_ratio(segment_name), 0.0);
 
     metrics.inc_total_gds_capacity(segment_name, kCapacity);
     metrics.inc_allocated_gds_size(segment_name, kAllocated);
+    metrics.inc_gds_used_size(segment_name, kUsed);
+    metrics.inc_gds_pending_size(segment_name, kPending);
+    metrics.inc_gds_allocation_success();
+    metrics.inc_gds_allocation_failure(FailureReason::CAPACITY);
 
     ASSERT_EQ(metrics.get_allocated_gds_size(), base_allocated + kAllocated);
+    ASSERT_EQ(metrics.get_gds_used_size(), base_used + kUsed);
+    ASSERT_EQ(metrics.get_gds_pending_size(), base_pending + kPending);
     ASSERT_EQ(metrics.get_total_gds_capacity(), base_capacity + kCapacity);
+    ASSERT_EQ(metrics.get_gds_allocation_success(),
+              base_allocation_success + 1);
+    ASSERT_EQ(metrics.get_gds_allocation_failure(FailureReason::CAPACITY),
+              base_capacity_failure + 1);
     ASSERT_EQ(metrics.get_segment_allocated_gds_size(segment_name),
               kAllocated);
+    ASSERT_EQ(metrics.get_segment_gds_used_size(segment_name), kUsed);
+    ASSERT_EQ(metrics.get_segment_gds_pending_size(segment_name), kPending);
     ASSERT_EQ(metrics.get_segment_total_gds_capacity(segment_name), kCapacity);
     ASSERT_DOUBLE_EQ(metrics.get_segment_gds_used_ratio(segment_name),
                      static_cast<double>(kAllocated) /
@@ -172,19 +203,38 @@ TEST_F(MasterMetricsTest, GdsSsdStorageMetricsTest) {
     const auto serialized = metrics.serialize_metrics();
     ASSERT_NE(serialized.find("master_gds_ssd_allocated_bytes"),
               std::string::npos);
+    ASSERT_NE(serialized.find("master_gds_ssd_used_bytes"),
+              std::string::npos);
+    ASSERT_NE(serialized.find("master_gds_ssd_pending_bytes"),
+              std::string::npos);
     ASSERT_NE(serialized.find("master_gds_ssd_total_capacity_bytes"),
               std::string::npos);
     ASSERT_NE(serialized.find("gds_ssd_segment_allocated_bytes"),
               std::string::npos);
+    ASSERT_NE(serialized.find("gds_ssd_segment_used_bytes"),
+              std::string::npos);
+    ASSERT_NE(serialized.find("gds_ssd_segment_pending_bytes"),
+              std::string::npos);
     ASSERT_NE(serialized.find("gds_ssd_segment_total_capacity_bytes"),
               std::string::npos);
+    ASSERT_NE(serialized.find("master_gds_ssd_allocation_success_total"),
+              std::string::npos);
+    ASSERT_NE(serialized.find("master_gds_ssd_allocation_failure_total"),
+              std::string::npos);
+    ASSERT_NE(serialized.find("reason=\"capacity\""), std::string::npos);
 
+    metrics.dec_gds_pending_size(segment_name, kPending);
+    metrics.dec_gds_used_size(segment_name, kUsed);
     metrics.dec_allocated_gds_size(segment_name, kAllocated);
     metrics.dec_total_gds_capacity(segment_name, kCapacity);
 
     ASSERT_EQ(metrics.get_allocated_gds_size(), base_allocated);
+    ASSERT_EQ(metrics.get_gds_used_size(), base_used);
+    ASSERT_EQ(metrics.get_gds_pending_size(), base_pending);
     ASSERT_EQ(metrics.get_total_gds_capacity(), base_capacity);
     ASSERT_EQ(metrics.get_segment_allocated_gds_size(segment_name), 0);
+    ASSERT_EQ(metrics.get_segment_gds_used_size(segment_name), 0);
+    ASSERT_EQ(metrics.get_segment_gds_pending_size(segment_name), 0);
     ASSERT_EQ(metrics.get_segment_total_gds_capacity(segment_name), 0);
 }
 

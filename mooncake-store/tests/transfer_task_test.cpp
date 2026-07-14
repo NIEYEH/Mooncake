@@ -6,6 +6,7 @@
 
 #include <chrono>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <thread>
 #include <vector>
@@ -173,6 +174,90 @@ TEST_F(TransferTaskTest, IsSameProcessEndpoint) {
     // Hostname endpoints (non-P2P metadata mode) compare as full strings.
     EXPECT_TRUE(TransferSubmitter::isSameProcessEndpoint("host-a", "host-a"));
     EXPECT_FALSE(TransferSubmitter::isSameProcessEndpoint("host-a", "host-b"));
+}
+
+TEST_F(TransferTaskTest, BuildGdsSsdTransferRequests) {
+    GdsSsdDescriptor descriptor;
+    descriptor.segment_name = "gds_pool";
+    descriptor.segment_uri = "block:///dev/mooncake/gds_pool";
+    descriptor.offset = 8192;
+    descriptor.object_size = 8192;
+    descriptor.block_size = 4096;
+    descriptor.allocation_alignment = 4096;
+
+    std::vector<Slice> slices = {
+        {reinterpret_cast<void*>(static_cast<uintptr_t>(0x10000)), 4096},
+        {reinterpret_cast<void*>(static_cast<uintptr_t>(0x12000)), 4096},
+    };
+    std::vector<TransferRequest> requests;
+    ASSERT_TRUE(TransferSubmitter::buildGdsSsdTransferRequests(
+        descriptor, slices, TransferRequest::WRITE, requests));
+    ASSERT_EQ(requests.size(), 2u);
+    EXPECT_EQ(requests[0].opcode, TransferRequest::WRITE);
+    EXPECT_EQ(requests[0].source, slices[0].ptr);
+    EXPECT_EQ(requests[0].target_id, 0u);
+    EXPECT_EQ(requests[0].target_offset, descriptor.offset);
+    EXPECT_EQ(requests[0].length, 4096u);
+    EXPECT_EQ(requests[0].transport_hint, 5);
+    EXPECT_EQ(requests[1].target_offset, descriptor.offset + 4096);
+
+    ASSERT_TRUE(TransferSubmitter::buildGdsSsdTransferRequests(
+        descriptor, slices, TransferRequest::READ, requests));
+    EXPECT_EQ(requests[0].opcode, TransferRequest::READ);
+}
+
+TEST_F(TransferTaskTest, RejectsInvalidGdsSsdTransferRequests) {
+    GdsSsdDescriptor descriptor;
+    descriptor.segment_name = "gds_pool";
+    descriptor.segment_uri = "block:///dev/mooncake/gds_pool";
+    descriptor.offset = 0;
+    descriptor.object_size = 8192;
+    descriptor.block_size = 4096;
+    descriptor.allocation_alignment = 4096;
+
+    const Slice first{
+        reinterpret_cast<void*>(static_cast<uintptr_t>(0x10000)), 4096};
+    const Slice second{
+        reinterpret_cast<void*>(static_cast<uintptr_t>(0x12000)), 4096};
+    std::vector<TransferRequest> requests;
+
+    EXPECT_FALSE(TransferSubmitter::buildGdsSsdTransferRequests(
+        descriptor, {}, TransferRequest::WRITE, requests));
+    EXPECT_TRUE(requests.empty());
+
+    EXPECT_FALSE(TransferSubmitter::buildGdsSsdTransferRequests(
+        descriptor, {{first.ptr, 0}, second}, TransferRequest::WRITE,
+        requests));
+    EXPECT_FALSE(TransferSubmitter::buildGdsSsdTransferRequests(
+        descriptor, {first}, TransferRequest::WRITE, requests));
+    EXPECT_FALSE(TransferSubmitter::buildGdsSsdTransferRequests(
+        descriptor,
+        {{reinterpret_cast<void*>(static_cast<uintptr_t>(0x10001)), 4096},
+         second},
+        TransferRequest::WRITE, requests));
+
+    GdsSsdDescriptor overlap_descriptor = descriptor;
+    overlap_descriptor.object_size = 12288;
+    EXPECT_FALSE(TransferSubmitter::buildGdsSsdTransferRequests(
+        overlap_descriptor,
+        {{first.ptr, 8192},
+         {reinterpret_cast<void*>(static_cast<uintptr_t>(0x11000)), 4096}},
+        TransferRequest::WRITE, requests));
+
+    GdsSsdDescriptor overflow_descriptor = descriptor;
+    overflow_descriptor.offset = std::numeric_limits<uint64_t>::max() - 4095;
+    EXPECT_FALSE(TransferSubmitter::buildGdsSsdTransferRequests(
+        overflow_descriptor, {first, second}, TransferRequest::WRITE,
+        requests));
+
+    GdsSsdDescriptor invalid_uri_descriptor = descriptor;
+    invalid_uri_descriptor.segment_uri = "file:///tmp/gds_pool";
+    EXPECT_FALSE(TransferSubmitter::buildGdsSsdTransferRequests(
+        invalid_uri_descriptor, {first, second}, TransferRequest::WRITE,
+        requests));
+    EXPECT_FALSE(TransferSubmitter::buildGdsSsdTransferRequests(
+        descriptor, {first, second},
+        static_cast<TransferRequest::OpCode>(7), requests));
 }
 
 // Test TransferStrategy enum and stream operator

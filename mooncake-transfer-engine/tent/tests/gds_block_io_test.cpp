@@ -43,7 +43,9 @@ namespace tent {
 namespace {
 
 constexpr char kTestPathEnv[] = "MOONCAKE_GDS_TEST_PATH";
+constexpr char kReaderPathEnv[] = "MOONCAKE_GDS_TEST_READER_PATH";
 constexpr char kWriteEnableEnv[] = "MOONCAKE_GDS_TEST_ALLOW_WRITE";
+constexpr char kReadOnlyEnv[] = "MOONCAKE_GDS_TEST_READ_ONLY";
 constexpr char kDeviceConfirmEnv[] = "MOONCAKE_GDS_TEST_DEVICE_CONFIRM";
 constexpr char kOffsetEnv[] = "MOONCAKE_GDS_TEST_OFFSET";
 constexpr char kLengthEnv[] = "MOONCAKE_GDS_TEST_LENGTH";
@@ -209,10 +211,17 @@ TEST(GdsBlockIoTest, DestructiveWriteReadAtTwoOffsets) {
     const char* offset_env = std::getenv(kOffsetEnv);
     const char* length_env = std::getenv(kLengthEnv);
     const char* gpu_env = std::getenv(kGpuIdEnv);
-    if (!path_env || std::strcmp(write_env ? write_env : "", "YES") != 0 ||
+    const bool read_only =
+        std::strcmp(std::getenv(kReadOnlyEnv)
+                        ? std::getenv(kReadOnlyEnv)
+                        : "",
+                    "YES") == 0;
+    if (!path_env || (!read_only &&
+                      std::strcmp(write_env ? write_env : "", "YES") != 0) ||
         !offset_env || !length_env || !gpu_env) {
         GTEST_SKIP() << "Destructive GDS test is disabled. Set "
-                     << kTestPathEnv << ", " << kWriteEnableEnv << "=YES, "
+                     << kTestPathEnv << ", " << kWriteEnableEnv
+                     << "=YES (unless " << kReadOnlyEnv << "=YES), "
                      << kDeviceConfirmEnv << ", " << kOffsetEnv << ", "
                      << kLengthEnv << ", and " << kGpuIdEnv;
     }
@@ -237,6 +246,22 @@ TEST(GdsBlockIoTest, DestructiveWriteReadAtTwoOffsets) {
         << std::strerror(errno);
     ASSERT_TRUE(S_ISBLK(device_stat.st_mode))
         << canonical_device << " is not a block device";
+
+    std::string reader_device_path = device_path;
+    if (const char* reader_path_env = std::getenv(kReaderPathEnv)) {
+        reader_device_path = reader_path_env;
+        if (reader_device_path.rfind(kLocalBlockSegmentPrefix, 0) == 0) {
+            reader_device_path.erase(0, kLocalBlockSegmentPrefix.size());
+        }
+    }
+    struct stat reader_device_stat {};
+    ASSERT_EQ(stat(reader_device_path.c_str(), &reader_device_stat), 0)
+        << std::strerror(errno);
+    ASSERT_TRUE(S_ISBLK(reader_device_stat.st_mode))
+        << reader_device_path << " is not a block device";
+    ASSERT_EQ(reader_device_stat.st_rdev, device_stat.st_rdev)
+        << kReaderPathEnv
+        << " must resolve to the same NVMe namespace as " << kTestPathEnv;
 
     ScopedFd fd(open(canonical_device.c_str(), O_RDWR | O_DIRECT));
     ASSERT_GE(fd.get(), 0) << "open failed for " << canonical_device << ": "
@@ -284,6 +309,14 @@ TEST(GdsBlockIoTest, DestructiveWriteReadAtTwoOffsets) {
     auto status = engine.openSegment(segment, segment_uri);
     ASSERT_TRUE(status.ok()) << status.ToString();
 
+    SegmentID reader_segment = segment;
+    const std::string reader_segment_uri =
+        kLocalBlockSegmentPrefix + reader_device_path;
+    if (reader_segment_uri != segment_uri) {
+        status = engine.openSegment(reader_segment, reader_segment_uri);
+        ASSERT_TRUE(status.ok()) << status.ToString();
+    }
+
     SegmentInfo info;
     status = engine.getSegmentInfo(segment, info);
     ASSERT_TRUE(status.ok()) << status.ToString();
@@ -304,31 +337,37 @@ TEST(GdsBlockIoTest, DestructiveWriteReadAtTwoOffsets) {
 
     const auto first_pattern = makePattern(io_length, 0x31);
     const auto second_pattern = makePattern(io_length, 0xa7);
-    ASSERT_EQ(cudaMemcpy(source.get(), first_pattern.data(), io_length,
-                         cudaMemcpyHostToDevice),
-              cudaSuccess);
-    ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
-
     TransferStatus transfer_status{};
-    auto request = makeRequest(Request::WRITE, source.get(), segment, *offset,
-                               io_length);
-    ASSERT_TRUE(runTransfer(engine, request, transfer_status, error)) << error;
-    ASSERT_EQ(transfer_status.s, COMPLETED);
-    ASSERT_EQ(transfer_status.transferred_bytes, io_length);
+    if (!read_only) {
+        ASSERT_EQ(cudaMemcpy(source.get(), first_pattern.data(), io_length,
+                             cudaMemcpyHostToDevice),
+                  cudaSuccess);
+        ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
 
-    ASSERT_EQ(cudaMemcpy(source.get(), second_pattern.data(), io_length,
-                         cudaMemcpyHostToDevice),
-              cudaSuccess);
-    ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
-    request.target_offset = *offset + *length;
-    ASSERT_TRUE(runTransfer(engine, request, transfer_status, error)) << error;
-    ASSERT_EQ(transfer_status.s, COMPLETED);
+        auto write_request = makeRequest(Request::WRITE, source.get(), segment,
+                                         *offset, io_length);
+        ASSERT_TRUE(
+            runTransfer(engine, write_request, transfer_status, error))
+            << error;
+        ASSERT_EQ(transfer_status.s, COMPLETED);
+        ASSERT_EQ(transfer_status.transferred_bytes, io_length);
+
+        ASSERT_EQ(cudaMemcpy(source.get(), second_pattern.data(), io_length,
+                             cudaMemcpyHostToDevice),
+                  cudaSuccess);
+        ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+        write_request.target_offset = *offset + *length;
+        ASSERT_TRUE(
+            runTransfer(engine, write_request, transfer_status, error))
+            << error;
+        ASSERT_EQ(transfer_status.s, COMPLETED);
+    }
 
     std::vector<uint8_t> actual(io_length);
     ASSERT_EQ(cudaMemset(destination.get(), 0, io_length), cudaSuccess);
     ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
-    request = makeRequest(Request::READ, destination.get(), segment, *offset,
-                          io_length);
+    auto request = makeRequest(Request::READ, destination.get(), reader_segment,
+                               *offset, io_length);
     ASSERT_TRUE(runTransfer(engine, request, transfer_status, error)) << error;
     ASSERT_EQ(transfer_status.s, COMPLETED);
     ASSERT_EQ(cudaMemcpy(actual.data(), destination.get(), io_length,
@@ -355,6 +394,10 @@ TEST(GdsBlockIoTest, DestructiveWriteReadAtTwoOffsets) {
     ASSERT_TRUE(runTransfer(engine, request, transfer_status, error)) << error;
     EXPECT_EQ(transfer_status.s, FAILED);
 
+    if (reader_segment != segment) {
+        status = engine.closeSegment(reader_segment);
+        EXPECT_TRUE(status.ok()) << status.ToString();
+    }
     status = engine.closeSegment(segment);
     EXPECT_TRUE(status.ok()) << status.ToString();
 }

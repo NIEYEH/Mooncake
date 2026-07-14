@@ -163,6 +163,16 @@ struct RpcNameTraits<&WrappedMasterService::RegisterGdsSsdAccessor> {
 };
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::UnregisterGdsSsdAccessor> {
+    static constexpr const char* value = "UnregisterGdsSsdAccessor";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::GetGdsSsdAccessor> {
+    static constexpr const char* value = "GetGdsSsdAccessor";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::ReMountSegment> {
     static constexpr const char* value = "ReMountSegment";
 };
@@ -843,6 +853,35 @@ tl::expected<void, ErrorCode> MasterClient::RegisterGdsSsdAccessor(
     timer.LogResponseExpected(result);
     return result;
 }
+
+tl::expected<void, ErrorCode> MasterClient::UnregisterGdsSsdAccessor(
+    const UUID& segment_id, const std::string& client_host) {
+    ScopedVLogTimer timer(1, "MasterClient::UnregisterGdsSsdAccessor");
+    timer.LogRequest("segment_id=", segment_id,
+                     ", client_host=", client_host,
+                     ", client_id=", client_id_);
+
+    auto result =
+        invoke_rpc<&WrappedMasterService::UnregisterGdsSsdAccessor, void>(
+            segment_id, client_host);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<GdsSsdAccessor, ErrorCode>
+MasterClient::GetGdsSsdAccessor(const UUID& segment_id,
+                                const std::string& client_host) {
+    ScopedVLogTimer timer(1, "MasterClient::GetGdsSsdAccessor");
+    timer.LogRequest("segment_id=", segment_id,
+                     ", client_host=", client_host,
+                     ", client_id=", client_id_);
+
+    auto result = invoke_rpc<&WrappedMasterService::GetGdsSsdAccessor,
+                             GdsSsdAccessor>(segment_id, client_host);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
 tl::expected<void, ErrorCode> MasterClient::ReMountSegment(
     const std::vector<Segment>& segments) {
     ScopedVLogTimer timer(1, "MasterClient::ReMountSegment");

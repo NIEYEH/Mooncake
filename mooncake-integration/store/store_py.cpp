@@ -2024,13 +2024,13 @@ class MooncakeGdsSsdRegisterPyWrapper {
                 if (!accessor.alive) {
                     return OPERATION_OK;
                 }
-                GdsSsdAccessor updated_accessor = accessor;
-                updated_accessor.alive = false;
-                auto register_result = master_client.RegisterGdsSsdAccessor(
-                    segment.id, updated_accessor);
-                if (!register_result) {
-                    LOG(ERROR) << "Failed to mark GDS SSD accessor offline: "
-                               << static_cast<int>(register_result.error());
+                auto unregister_result =
+                    master_client.UnregisterGdsSsdAccessor(segment.id,
+                                                           client_host);
+                if (!unregister_result) {
+                    LOG(ERROR) << "Failed to unregister GDS SSD accessor: "
+                               << static_cast<int>(
+                                      unregister_result.error());
                     return OPERATION_FAILED;
                 }
                 return OPERATION_OK;

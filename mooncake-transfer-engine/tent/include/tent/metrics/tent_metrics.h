@@ -80,6 +80,9 @@ class TentMetrics {
     void recordReadFailed(size_t bytes);
     void recordWriteFailed(size_t bytes);
     void recordTransportFailover();
+    void recordGdsHandleRegistrationFailed();
+    void recordGdsBufferRegistrationFailed();
+    void recordGdsBatchSubmitFailed();
 
     // Record the deadline feasibility ratio (MLU) for a completed transfer
     // that carried a deadline. mlu = actual_transfer_seconds / window_seconds,
@@ -137,6 +140,15 @@ class TentMetrics {
     ylt::metric::counter_t failover_total_{
         "tent_transport_failover_total",
         "Total cross-transport failover events"};
+    ylt::metric::counter_t gds_handle_registration_failures_total_{
+        "tent_gds_handle_registration_failures_total",
+        "Total cuFile handle registration failures"};
+    ylt::metric::counter_t gds_buffer_registration_failures_total_{
+        "tent_gds_buffer_registration_failures_total",
+        "Total cuFile buffer registration failures"};
+    ylt::metric::counter_t gds_batch_submit_failures_total_{
+        "tent_gds_batch_submit_failures_total",
+        "Total cuFile batch submission failures"};
 
     // Histograms - stored as pointers for unified management
     std::vector<ylt::metric::histogram_t*> histograms_;
@@ -274,6 +286,30 @@ class ScopedLatencyRecorder {
         }                                                 \
     } while (0)
 
+#define TENT_RECORD_GDS_HANDLE_REGISTRATION_FAILED()                 \
+    do {                                                             \
+        if (::mooncake::tent::TentMetrics::isEnabled()) {            \
+            ::mooncake::tent::TentMetrics::instance()                \
+                .recordGdsHandleRegistrationFailed();                \
+        }                                                            \
+    } while (0)
+
+#define TENT_RECORD_GDS_BUFFER_REGISTRATION_FAILED()                 \
+    do {                                                             \
+        if (::mooncake::tent::TentMetrics::isEnabled()) {            \
+            ::mooncake::tent::TentMetrics::instance()                \
+                .recordGdsBufferRegistrationFailed();                \
+        }                                                            \
+    } while (0)
+
+#define TENT_RECORD_GDS_BATCH_SUBMIT_FAILED()                        \
+    do {                                                             \
+        if (::mooncake::tent::TentMetrics::isEnabled()) {            \
+            ::mooncake::tent::TentMetrics::instance()                \
+                .recordGdsBatchSubmitFailed();                       \
+        }                                                            \
+    } while (0)
+
 // RAII macro for automatic latency measurement
 #define TENT_SCOPED_READ_LATENCY(bytes)                              \
     ::mooncake::tent::ScopedLatencyRecorder _tent_latency_recorder_( \
@@ -299,6 +335,9 @@ class ScopedLatencyRecorder {
 #define TENT_RECORD_READ_FAILED(bytes) ((void)0)
 #define TENT_RECORD_WRITE_FAILED(bytes) ((void)0)
 #define TENT_RECORD_TRANSPORT_FAILOVER() ((void)0)
+#define TENT_RECORD_GDS_HANDLE_REGISTRATION_FAILED() ((void)0)
+#define TENT_RECORD_GDS_BUFFER_REGISTRATION_FAILED() ((void)0)
+#define TENT_RECORD_GDS_BATCH_SUBMIT_FAILED() ((void)0)
 #define TENT_SCOPED_READ_LATENCY(bytes) ((void)0)
 #define TENT_SCOPED_WRITE_LATENCY(bytes) ((void)0)
 

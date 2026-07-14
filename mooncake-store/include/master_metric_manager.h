@@ -14,6 +14,17 @@ namespace mooncake {
 
 class MasterMetricManager {
    public:
+    enum class GdsSsdAllocationFailureReason {
+        INVALID_REQUEST,
+        NO_SEGMENT,
+        NO_ACCESSOR,
+        SEGMENT_UNAVAILABLE,
+        ALIGNMENT,
+        CAPACITY,
+        INVALID_OFFSET,
+        COLLISION,
+    };
+
     // --- Singleton Access ---
     static MasterMetricManager& instance();
 
@@ -61,6 +72,10 @@ class MasterMetricManager {
     void inc_allocated_gds_size(const std::string& segment, int64_t val = 1);
     void dec_allocated_gds_size(const std::string& segment, int64_t val = 1);
     void reset_allocated_gds_size();
+    void inc_gds_used_size(const std::string& segment, int64_t val = 1);
+    void dec_gds_used_size(const std::string& segment, int64_t val = 1);
+    void inc_gds_pending_size(const std::string& segment, int64_t val = 1);
+    void dec_gds_pending_size(const std::string& segment, int64_t val = 1);
     void inc_total_gds_capacity(const std::string& segment, int64_t val = 1);
     void dec_total_gds_capacity(const std::string& segment, int64_t val = 1);
     void reset_total_gds_capacity();
@@ -119,10 +134,20 @@ class MasterMetricManager {
     void inc_total_gds_capacity(int64_t val = 1);
     void dec_total_gds_capacity(int64_t val = 1);
     int64_t get_allocated_gds_size();
+    int64_t get_gds_used_size();
+    int64_t get_gds_pending_size();
     int64_t get_total_gds_capacity();
     double get_segment_gds_used_ratio(const std::string& segment);
     int64_t get_segment_allocated_gds_size(const std::string& segment);
+    int64_t get_segment_gds_used_size(const std::string& segment);
+    int64_t get_segment_gds_pending_size(const std::string& segment);
     int64_t get_segment_total_gds_capacity(const std::string& segment);
+    void inc_gds_allocation_success(int64_t val = 1);
+    void inc_gds_allocation_failure(GdsSsdAllocationFailureReason reason,
+                                    int64_t val = 1);
+    int64_t get_gds_allocation_success();
+    int64_t get_gds_allocation_failure(
+        GdsSsdAllocationFailureReason reason);
 
     // File Storage Metrics
     void inc_allocated_file_size(int64_t val = 1);
@@ -565,9 +590,17 @@ class MasterMetricManager {
     ylt::metric::dynamic_gauge_1t
         gds_allocated_size_per_segment_;  // GDS SSD segment usage update for
                                           // gauge
+    ylt::metric::gauge_t
+        gds_used_size_;  // Committed GDS SSD bytes across all segments
+    ylt::metric::gauge_t
+        gds_pending_size_;  // Pending GDS SSD bytes across all segments
+    ylt::metric::dynamic_gauge_1t gds_used_size_per_segment_;
+    ylt::metric::dynamic_gauge_1t gds_pending_size_per_segment_;
     ylt::metric::dynamic_gauge_1t
         gds_total_capacity_per_segment_;  // GDS SSD segment capacity update for
                                           // gauge
+    ylt::metric::counter_t gds_allocation_success_total_;
+    ylt::metric::dynamic_counter_1t gds_allocation_failure_total_;
 
     // File Storage Metrics
     ylt::metric::gauge_t file_allocated_size_;

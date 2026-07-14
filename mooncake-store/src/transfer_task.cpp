@@ -11,6 +11,7 @@
 #include <limits>
 #include <sstream>
 #include <string>
+#include <utility>
 #include <vector>
 #include "device/accelerator_registry.h"
 #include "transfer_engine.h"
@@ -829,6 +830,10 @@ void TransferEngineOperationState::set_result_internal(ErrorCode error_code) {
     VLOG(1) << "Setting transfer result for batch " << batch_id_ << " to "
             << static_cast<int>(error_code);
     result_.emplace(error_code);
+    if (completion_callback_) {
+        completion_callback_(error_code);
+        completion_callback_ = {};
+    }
 }
 
 void TransferEngineOperationState::wait_for_completion() {
@@ -955,7 +960,8 @@ TransferSubmitter::TransferSubmitter(TransferEngine& engine,
                                      std::shared_ptr<StorageBackend>& backend,
                                      const std::string& local_hostname,
                                      TransferMetric* transfer_metric,
-                                     int numa_socket_id)
+                                     int numa_socket_id,
+                                     GdsTransferMetric* gds_transfer_metric)
     : engine_(engine),
       local_endpoint_(engine.getLocalIpAndPort()),
       memcpy_pool_(std::make_unique<MemcpyWorkerPool>()),
@@ -964,7 +970,8 @@ TransferSubmitter::TransferSubmitter(TransferEngine& engine,
 #endif
       fileread_pool_(std::make_unique<FilereadWorkerPool>(backend)),
       local_hostname_(local_hostname),
-      transfer_metric_(transfer_metric) {
+      transfer_metric_(transfer_metric),
+      gds_transfer_metric_(gds_transfer_metric) {
     // Read MC_STORE_MEMCPY environment variable.
     // When not set, auto-detect based on transport type:
     //   - TCP-only environment: enable memcpy (avoids TCP loopback overhead)
@@ -1183,7 +1190,8 @@ std::optional<TransferFuture> TransferSubmitter::submitMemcpyOperation(
 }
 
 std::optional<TransferFuture> TransferSubmitter::submitTransfer(
-    std::vector<TransferRequest>& requests) {
+    std::vector<TransferRequest>& requests,
+    TransferEngineOperationState::CompletionCallback completion_callback) {
     // Allocate batch ID
     const size_t batch_size = requests.size();
     BatchID batch_id = engine_.allocateBatchID(batch_size);
@@ -1212,7 +1220,7 @@ std::optional<TransferFuture> TransferSubmitter::submitTransfer(
     // Create state with transfer engine context - no polling thread
     // needed
     auto state = std::make_shared<TransferEngineOperationState>(
-        engine_, batch_id, batch_size);
+        engine_, batch_id, batch_size, std::move(completion_callback));
 
     return TransferFuture(state);
 }
@@ -1353,14 +1361,62 @@ std::optional<TransferFuture> TransferSubmitter::submitSpdkNofOperation(
 std::optional<TransferFuture> TransferSubmitter::submitGdsSsdOperation(
     const Replica::Descriptor& replica, const std::vector<Slice>& slices,
     TransferRequest::OpCode op_code) {
+    const auto start_time = std::chrono::steady_clock::now();
+    const auto metric_operation = op_code == TransferRequest::READ
+                                      ? GdsTransferOperation::kRead
+                                      : GdsTransferOperation::kWrite;
+    const uint64_t requested_bytes =
+        replica.get_gds_ssd_descriptor().object_size;
+    auto* const metric = gds_transfer_metric_;
+    auto observe = [metric, metric_operation, requested_bytes,
+                    start_time](bool success) {
+        if (metric) {
+            metric->Observe(metric_operation, success, requested_bytes,
+                            elapsed_us_since(start_time));
+        }
+    };
+
     if (!engine_.isUsingTent()) {
         LOG(ERROR) << "GDS SSD transfer requires the TENT transfer engine";
+        observe(false);
         return std::nullopt;
     }
 
     const auto& descriptor = replica.get_gds_ssd_descriptor();
+    std::vector<TransferRequest> requests;
+    if (!buildGdsSsdTransferRequests(descriptor, slices, op_code, requests)) {
+        observe(false);
+        return std::nullopt;
+    }
+
+    SegmentHandle seg = engine_.openSegment(descriptor.segment_uri);
+    if (seg == static_cast<uint64_t>(ERR_INVALID_ARGUMENT)) {
+        LOG(ERROR) << "Failed to open GDS SSD segment uri='"
+                   << descriptor.segment_uri << "'";
+        observe(false);
+        return std::nullopt;
+    }
+    for (auto& request : requests) {
+        request.target_id = seg;
+    }
+    auto future = submitTransfer(
+        requests, [observe](ErrorCode error_code) {
+            observe(error_code == ErrorCode::OK);
+        });
+    if (!future.has_value()) {
+        observe(false);
+    }
+    return future;
+}
+
+bool TransferSubmitter::buildGdsSsdTransferRequests(
+    const GdsSsdDescriptor& descriptor, const std::vector<Slice>& slices,
+    TransferRequest::OpCode op_code, std::vector<TransferRequest>& requests) {
+    requests.clear();
     const uint64_t alignment = descriptor.allocation_alignment;
-    if (descriptor.segment_uri.empty() || descriptor.object_size == 0 ||
+    if (descriptor.segment_name.empty() ||
+        descriptor.segment_uri.rfind("block://", 0) != 0 ||
+        descriptor.segment_uri == "block://" || descriptor.object_size == 0 ||
         descriptor.block_size == 0 || alignment == 0 ||
         alignment % descriptor.block_size != 0) {
         LOG(ERROR) << "Invalid GDS SSD descriptor: segment_uri='"
@@ -1368,7 +1424,13 @@ std::optional<TransferFuture> TransferSubmitter::submitGdsSsdOperation(
                    << "', object_size=" << descriptor.object_size
                    << ", block_size=" << descriptor.block_size
                    << ", allocation_alignment=" << alignment;
-        return std::nullopt;
+        return false;
+    }
+    if (op_code != TransferRequest::READ &&
+        op_code != TransferRequest::WRITE) {
+        LOG(ERROR) << "Invalid GDS SSD opcode: "
+                   << static_cast<int>(op_code);
+        return false;
     }
     if (!IsAligned(descriptor.offset, alignment) ||
         !IsAligned(descriptor.object_size, alignment)) {
@@ -1377,7 +1439,7 @@ std::optional<TransferFuture> TransferSubmitter::submitGdsSsdOperation(
                    << ", offset=" << descriptor.offset
                    << ", object_size=" << descriptor.object_size
                    << ", alignment=" << alignment;
-        return std::nullopt;
+        return false;
     }
 
     uint64_t replica_end = 0;
@@ -1386,27 +1448,23 @@ std::optional<TransferFuture> TransferSubmitter::submitGdsSsdOperation(
                    << descriptor.segment_name
                    << ", offset=" << descriptor.offset
                    << ", object_size=" << descriptor.object_size;
-        return std::nullopt;
+        return false;
     }
 
-    SegmentHandle seg = engine_.openSegment(descriptor.segment_uri);
-    if (seg == static_cast<uint64_t>(ERR_INVALID_ARGUMENT)) {
-        LOG(ERROR) << "Failed to open GDS SSD segment uri='"
-                   << descriptor.segment_uri << "'";
-        return std::nullopt;
-    }
-
-    std::vector<TransferRequest> requests;
     requests.reserve(slices.size());
+    std::vector<std::pair<uint64_t, uint64_t>> source_ranges;
+    source_ranges.reserve(slices.size());
     uint64_t logical_offset = 0;
     for (const auto& slice : slices) {
         if (slice.size == 0) {
             LOG(ERROR) << "GDS SSD transfer got a zero-length slice";
-            return std::nullopt;
+            requests.clear();
+            return false;
         }
         if (slice.ptr == nullptr) {
             LOG(ERROR) << "GDS SSD transfer got a null slice pointer";
-            return std::nullopt;
+            requests.clear();
+            return false;
         }
         const auto source_address = static_cast<uint64_t>(
             reinterpret_cast<std::uintptr_t>(slice.ptr));
@@ -1417,8 +1475,28 @@ std::optional<TransferFuture> TransferSubmitter::submitGdsSsdOperation(
                        << ", ptr=" << slice.ptr
                        << ", slice_size=" << slice.size
                        << ", alignment=" << alignment;
-            return std::nullopt;
+            requests.clear();
+            return false;
         }
+
+        uint64_t source_end = 0;
+        if (!CheckedAdd(source_address, static_cast<uint64_t>(slice.size),
+                        source_end)) {
+            LOG(ERROR) << "GDS SSD source range overflows: ptr=" << slice.ptr
+                       << ", slice_size=" << slice.size;
+            requests.clear();
+            return false;
+        }
+        for (const auto& [existing_begin, existing_end] : source_ranges) {
+            if (source_address < existing_end &&
+                existing_begin < source_end) {
+                LOG(ERROR) << "GDS SSD slices overlap: ptr=" << slice.ptr
+                           << ", slice_size=" << slice.size;
+                requests.clear();
+                return false;
+            }
+        }
+        source_ranges.emplace_back(source_address, source_end);
 
         uint64_t next_offset = 0;
         if (!CheckedAdd(logical_offset, static_cast<uint64_t>(slice.size),
@@ -1429,25 +1507,30 @@ std::optional<TransferFuture> TransferSubmitter::submitGdsSsdOperation(
                        << ", logical_offset=" << logical_offset
                        << ", slice_size=" << slice.size
                        << ", object_size=" << descriptor.object_size;
-            return std::nullopt;
+            requests.clear();
+            return false;
         }
 
         uint64_t target_offset = 0;
+        uint64_t target_end = 0;
         if (!CheckedAdd(descriptor.offset, logical_offset, target_offset) ||
+            !CheckedAdd(target_offset, static_cast<uint64_t>(slice.size),
+                        target_end) ||
             !IsAligned(target_offset, alignment) ||
-            target_offset >= replica_end) {
+            target_offset >= replica_end || target_end > replica_end) {
             LOG(ERROR) << "Invalid GDS SSD target offset: segment_name="
                        << descriptor.segment_name
                        << ", target_offset=" << target_offset
                        << ", replica_end=" << replica_end
                        << ", alignment=" << alignment;
-            return std::nullopt;
+            requests.clear();
+            return false;
         }
 
         TransferRequest request;
         request.opcode = op_code;
         request.source = static_cast<char*>(slice.ptr);
-        request.target_id = seg;
+        request.target_id = 0;
         request.target_offset = target_offset;
         request.length = slice.size;
         request.transport_hint = kTentGdsTransportHint;
@@ -1460,14 +1543,14 @@ std::optional<TransferFuture> TransferSubmitter::submitGdsSsdOperation(
                    << descriptor.segment_name
                    << ", slices_size=" << logical_offset
                    << ", object_size=" << descriptor.object_size;
-        return std::nullopt;
+        requests.clear();
+        return false;
     }
     if (requests.empty()) {
         LOG(ERROR) << "GDS SSD transfer has no requests";
-        return std::nullopt;
+        return false;
     }
-
-    return submitTransfer(requests);
+    return true;
 }
 
 std::optional<TransferFuture> TransferSubmitter::submitFileReadOperation(

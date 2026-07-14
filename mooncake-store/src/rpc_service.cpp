@@ -736,6 +736,37 @@ tl::expected<void, ErrorCode> WrappedMasterService::RegisterGdsSsdAccessor(
         },
         [] {}, [] {});
 }
+
+tl::expected<void, ErrorCode> WrappedMasterService::UnregisterGdsSsdAccessor(
+    const UUID& segment_id, const std::string& client_host) {
+    return execute_rpc(
+        "UnregisterGdsSsdAccessor",
+        [&] {
+            return master_service_.UnregisterGdsSsdAccessor(segment_id,
+                                                             client_host);
+        },
+        [&](auto& timer) {
+            timer.LogRequest("GDS SSD accessor unregister: segment_id=",
+                             segment_id, ", client_host=", client_host);
+        },
+        [] {}, [] {});
+}
+
+tl::expected<GdsSsdAccessor, ErrorCode>
+WrappedMasterService::GetGdsSsdAccessor(
+    const UUID& segment_id, const std::string& client_host) {
+    return execute_rpc(
+        "GetGdsSsdAccessor",
+        [&] {
+            return master_service_.GetGdsSsdAccessor(segment_id, client_host);
+        },
+        [&](auto& timer) {
+            timer.LogRequest("GDS SSD accessor query: segment_id=", segment_id,
+                             ", client_host=", client_host);
+        },
+        [] {}, [] {});
+}
+
 tl::expected<void, ErrorCode> WrappedMasterService::ReMountSegment(
     const std::vector<Segment>& segments, const UUID& client_id) {
     return execute_rpc(
@@ -1340,6 +1371,12 @@ void RegisterRpcService(
         &wrapped_master_service);
     server.register_handler<
         &mooncake::WrappedMasterService::RegisterGdsSsdAccessor>(
+        &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedMasterService::UnregisterGdsSsdAccessor>(
+        &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedMasterService::GetGdsSsdAccessor>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::ReMountSegment>(
         &wrapped_master_service);

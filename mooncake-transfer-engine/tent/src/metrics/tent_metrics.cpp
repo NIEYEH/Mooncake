@@ -172,7 +172,7 @@ void TentMetrics::shutdown() {
 
 void TentMetrics::registerMetrics() {
     // Pre-allocate vectors to avoid reallocation
-    counters_.reserve(7);
+    counters_.reserve(10);
     histograms_.reserve(5);
     histogram_boundaries_.reserve(5);
 
@@ -180,7 +180,9 @@ void TentMetrics::registerMetrics() {
     counters_ = {
         &read_bytes_total_,     &write_bytes_total_,   &read_requests_total_,
         &write_requests_total_, &read_failures_total_, &write_failures_total_,
-        &failover_total_,
+        &failover_total_, &gds_handle_registration_failures_total_,
+        &gds_buffer_registration_failures_total_,
+        &gds_batch_submit_failures_total_,
     };
 
     // Register all histograms - add new histograms here
@@ -257,6 +259,24 @@ void TentMetrics::recordTransportFailover() {
         return;
 
     failover_total_.inc();
+}
+
+void TentMetrics::recordGdsHandleRegistrationFailed() {
+    if (!initialized_ || !runtime_enabled_.load(std::memory_order_relaxed))
+        return;
+    gds_handle_registration_failures_total_.inc();
+}
+
+void TentMetrics::recordGdsBufferRegistrationFailed() {
+    if (!initialized_ || !runtime_enabled_.load(std::memory_order_relaxed))
+        return;
+    gds_buffer_registration_failures_total_.inc();
+}
+
+void TentMetrics::recordGdsBatchSubmitFailed() {
+    if (!initialized_ || !runtime_enabled_.load(std::memory_order_relaxed))
+        return;
+    gds_batch_submit_failures_total_.inc();
 }
 
 std::string TentMetrics::getPrometheusMetrics() {
@@ -389,6 +409,9 @@ void TentMetrics::recordWriteCompleted(size_t, double) {}
 void TentMetrics::recordReadFailed(size_t) {}
 void TentMetrics::recordWriteFailed(size_t) {}
 void TentMetrics::recordTransportFailover() {}
+void TentMetrics::recordGdsHandleRegistrationFailed() {}
+void TentMetrics::recordGdsBufferRegistrationFailed() {}
+void TentMetrics::recordGdsBatchSubmitFailed() {}
 void TentMetrics::recordDeadlineMLU(double) {}
 
 std::string TentMetrics::getPrometheusMetrics() {

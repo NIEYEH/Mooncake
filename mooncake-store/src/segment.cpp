@@ -8,6 +8,7 @@
 #include <functional>
 #include <limits>
 #include <set>
+#include <unordered_set>
 
 namespace mooncake {
 namespace {
@@ -1508,7 +1509,8 @@ ErrorCode ValidateGdsSsdAccessor(const GdsSsdSegment& segment,
         LOG(ERROR) << "GDS SSD accessor invalid: empty client_host or uri";
         return ErrorCode::INVALID_PARAMS;
     }
-    if (!StartsWithBlockUri(accessor.segment_uri)) {
+    if (!StartsWithBlockUri(accessor.segment_uri) ||
+        accessor.segment_uri == "block://") {
         LOG(ERROR) << "GDS SSD accessor invalid: segment_uri="
                    << accessor.segment_uri << ", expected block:// URI";
         return ErrorCode::INVALID_PARAMS;
@@ -1548,6 +1550,14 @@ ErrorCode ValidateGdsSsdSegment(const GdsSsdSegment& segment) {
         LOG(ERROR) << "GDS SSD segment invalid: base=" << segment.base
                    << " is not aligned to "
                    << segment.allocation_alignment;
+        return ErrorCode::INVALID_PARAMS;
+    }
+    if (segment.allocation_alignment < segment.block_size ||
+        segment.allocation_alignment % segment.block_size != 0) {
+        LOG(ERROR) << "GDS SSD segment invalid: allocation_alignment="
+                   << segment.allocation_alignment
+                   << " must be a multiple of block_size="
+                   << segment.block_size;
         return ErrorCode::INVALID_PARAMS;
     }
     uint64_t alloc_end = 0;
@@ -1632,12 +1642,17 @@ ScopedGdsSsdSegmentAccess::AllocateReplica(
     size_t object_size, const std::vector<std::string>& preferred_segments,
     const std::set<std::string>& excluded_segments,
     const std::string& client_host) {
+    using FailureReason =
+        MasterMetricManager::GdsSsdAllocationFailureReason;
+    auto& metrics = MasterMetricManager::instance();
     if (object_size == 0) {
+        metrics.inc_gds_allocation_failure(FailureReason::INVALID_REQUEST);
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
     std::vector<UUID> candidates;
     std::set<std::string> candidate_names;
+    bool saw_segment_without_accessor = false;
     auto add_candidate = [&](const UUID& segment_id) {
         auto segment_it = gds_segment_manager_->mounted_segments_.find(
             segment_id);
@@ -1646,11 +1661,13 @@ ScopedGdsSsdSegmentAccess::AllocateReplica(
         }
         const auto& segment = segment_it->second.segment;
         if (excluded_segments.contains(segment.name) ||
-            candidate_names.contains(segment.name) ||
-            !HasAliveGdsSsdAccessor(segment, client_host)) {
+            !candidate_names.insert(segment.name).second) {
             return;
         }
-        candidate_names.insert(segment.name);
+        if (!HasAliveGdsSsdAccessor(segment, client_host)) {
+            saw_segment_without_accessor = true;
+            return;
+        }
         candidates.push_back(segment_id);
     };
 
@@ -1673,10 +1690,14 @@ ScopedGdsSsdSegmentAccess::AllocateReplica(
     }
 
     if (candidates.empty()) {
+        metrics.inc_gds_allocation_failure(
+            saw_segment_without_accessor ? FailureReason::NO_ACCESSOR
+                                         : FailureReason::NO_SEGMENT);
         return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
     }
 
     bool saw_alignment_mismatch = false;
+    bool saw_capacity_failure = false;
     for (const auto& segment_id : candidates) {
         auto segment_it = gds_segment_manager_->mounted_segments_.find(
             segment_id);
@@ -1701,6 +1722,7 @@ ScopedGdsSsdSegmentAccess::AllocateReplica(
 
         auto buffer = mounted_segment.buf_allocator->allocate(object_size);
         if (!buffer) {
+            saw_capacity_failure = true;
             continue;
         }
 
@@ -1711,6 +1733,8 @@ ScopedGdsSsdSegmentAccess::AllocateReplica(
                        << "segment=" << segment.name
                        << ", offset=" << offset
                        << ", alignment=" << segment.allocation_alignment;
+            metrics.inc_gds_allocation_failure(
+                FailureReason::INVALID_OFFSET);
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
 
@@ -1726,17 +1750,27 @@ ScopedGdsSsdSegmentAccess::AllocateReplica(
         if (gds_segment_manager_->allocation_records_.contains(key)) {
             LOG(ERROR) << "GDS SSD allocation collided: segment="
                        << segment.name << ", offset=" << meta.offset;
+            metrics.inc_gds_allocation_failure(FailureReason::COLLISION);
             return tl::make_unexpected(ErrorCode::INVALID_REPLICA);
         }
 
         gds_segment_manager_->allocation_records_.emplace(
-            key, GdsSsdAllocationRecord{meta, std::move(buffer)});
+            key, GdsSsdAllocationRecord{meta, std::move(buffer), false});
+        MasterMetricManager::instance().inc_gds_pending_size(
+            segment.name, static_cast<int64_t>(meta.object_size));
+        metrics.inc_gds_allocation_success();
         return meta;
     }
 
     if (saw_alignment_mismatch) {
+        metrics.inc_gds_allocation_failure(FailureReason::ALIGNMENT);
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
+    if (saw_capacity_failure) {
+        metrics.inc_gds_allocation_failure(FailureReason::CAPACITY);
+        return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+    }
+    metrics.inc_gds_allocation_failure(FailureReason::SEGMENT_UNAVAILABLE);
     return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
 }
 
@@ -1752,14 +1786,72 @@ ErrorCode ScopedGdsSsdSegmentAccess::ReleaseReplica(
 
     const auto& stored_meta = allocation_it->second.meta;
     if (stored_meta.object_size != meta.object_size ||
-        (!meta.segment_name.empty() &&
-         stored_meta.segment_name != meta.segment_name)) {
+        stored_meta.block_size != meta.block_size ||
+        stored_meta.allocation_alignment != meta.allocation_alignment ||
+        stored_meta.segment_name != meta.segment_name) {
         LOG(WARNING) << "GDS SSD release: meta mismatch, segment_id="
                      << meta.segment_id << ", offset=" << meta.offset;
         return ErrorCode::INVALID_REPLICA;
     }
 
+    if (allocation_it->second.committed) {
+        MasterMetricManager::instance().dec_gds_used_size(
+            stored_meta.segment_name,
+            static_cast<int64_t>(stored_meta.object_size));
+    } else {
+        MasterMetricManager::instance().dec_gds_pending_size(
+            stored_meta.segment_name,
+            static_cast<int64_t>(stored_meta.object_size));
+    }
     gds_segment_manager_->allocation_records_.erase(allocation_it);
+    return ErrorCode::OK;
+}
+
+ErrorCode ScopedGdsSsdSegmentAccess::CommitReplicas(
+    const std::vector<GdsSsdReplicaMeta>& replicas) {
+    std::vector<GdsSsdAllocationRecord*> records;
+    records.reserve(replicas.size());
+    std::unordered_set<GdsSsdAllocationKey, GdsSsdAllocationKeyHash>
+        unique_keys;
+
+    for (const auto& meta : replicas) {
+        GdsSsdAllocationKey key{meta.segment_id, meta.offset};
+        if (!unique_keys.insert(key).second) {
+            continue;
+        }
+        auto allocation_it =
+            gds_segment_manager_->allocation_records_.find(key);
+        if (allocation_it ==
+            gds_segment_manager_->allocation_records_.end()) {
+            LOG(WARNING) << "GDS SSD commit: allocation not found, segment_id="
+                         << meta.segment_id << ", offset=" << meta.offset;
+            return ErrorCode::INVALID_REPLICA;
+        }
+
+        const auto& stored_meta = allocation_it->second.meta;
+        if (stored_meta.object_size != meta.object_size ||
+            stored_meta.block_size != meta.block_size ||
+            stored_meta.allocation_alignment != meta.allocation_alignment ||
+            stored_meta.segment_name != meta.segment_name) {
+            LOG(WARNING) << "GDS SSD commit: meta mismatch, segment_id="
+                         << meta.segment_id << ", offset=" << meta.offset;
+            return ErrorCode::INVALID_REPLICA;
+        }
+        records.push_back(&allocation_it->second);
+    }
+
+    for (auto* record : records) {
+        if (record->committed) {
+            continue;
+        }
+        MasterMetricManager::instance().dec_gds_pending_size(
+            record->meta.segment_name,
+            static_cast<int64_t>(record->meta.object_size));
+        MasterMetricManager::instance().inc_gds_used_size(
+            record->meta.segment_name,
+            static_cast<int64_t>(record->meta.object_size));
+        record->committed = true;
+    }
     return ErrorCode::OK;
 }
 
@@ -1786,6 +1878,48 @@ ErrorCode ScopedGdsSsdSegmentAccess::RegisterAccessor(
     }
     segment.accessors.push_back(accessor);
     return ErrorCode::OK;
+}
+
+ErrorCode ScopedGdsSsdSegmentAccess::UnregisterAccessor(
+    const UUID& segment_id, const std::string& client_host) {
+    if (client_host.empty()) {
+        return ErrorCode::INVALID_PARAMS;
+    }
+
+    auto segment_it = gds_segment_manager_->mounted_segments_.find(segment_id);
+    if (segment_it == gds_segment_manager_->mounted_segments_.end()) {
+        return ErrorCode::SEGMENT_NOT_FOUND;
+    }
+
+    for (auto& accessor : segment_it->second.segment.accessors) {
+        if (accessor.client_host == client_host) {
+            accessor.alive = false;
+            return ErrorCode::OK;
+        }
+    }
+
+    // Unregister is idempotent so cleanup can be retried safely.
+    return ErrorCode::OK;
+}
+
+tl::expected<GdsSsdAccessor, ErrorCode>
+ScopedGdsSsdSegmentAccess::GetAccessor(
+    const UUID& segment_id, const std::string& client_host) const {
+    if (client_host.empty()) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    auto segment_it = gds_segment_manager_->mounted_segments_.find(segment_id);
+    if (segment_it == gds_segment_manager_->mounted_segments_.end()) {
+        return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
+    }
+
+    for (const auto& accessor : segment_it->second.segment.accessors) {
+        if (accessor.client_host == client_host && accessor.alive) {
+            return accessor;
+        }
+    }
+    return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
 }
 
 ErrorCode ScopedGdsSsdSegmentAccess::ResolveDescriptor(
@@ -1895,6 +2029,29 @@ void GdsSsdSegmentManager::GetMountedSegmentsSnapshot(
             segment_id, mounted_segment.segment, mounted_segment.status});
     }
 }
+
+GdsSsdSegmentManager::~GdsSsdSegmentManager() {
+    std::unique_lock<std::shared_mutex> lock(segment_mutex_);
+    for (const auto& entry : allocation_records_) {
+        const auto& record = entry.second;
+        if (record.committed) {
+            MasterMetricManager::instance().dec_gds_used_size(
+                record.meta.segment_name,
+                static_cast<int64_t>(record.meta.object_size));
+        } else {
+            MasterMetricManager::instance().dec_gds_pending_size(
+                record.meta.segment_name,
+                static_cast<int64_t>(record.meta.object_size));
+        }
+    }
+    for (const auto& entry : mounted_segments_) {
+        const auto& mounted_segment = entry.second;
+        MasterMetricManager::instance().dec_total_gds_capacity(
+            mounted_segment.segment.name,
+            static_cast<int64_t>(mounted_segment.segment.size));
+    }
+}
+
 void SegmentManager::initializeCxlAllocator(const std::string& cxl_path,
                                             const size_t cxl_size) {
     LOG(INFO) << "Init CXL global allocator.";

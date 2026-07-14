@@ -343,6 +343,12 @@ class MasterClient {
     [[nodiscard]] tl::expected<void, ErrorCode> RegisterGdsSsdAccessor(
         const UUID& segment_id, const GdsSsdAccessor& accessor);
 
+    [[nodiscard]] tl::expected<void, ErrorCode> UnregisterGdsSsdAccessor(
+        const UUID& segment_id, const std::string& client_host);
+
+    [[nodiscard]] tl::expected<GdsSsdAccessor, ErrorCode> GetGdsSsdAccessor(
+        const UUID& segment_id, const std::string& client_host);
+
     /**
      * @brief Re-mount segments, invoked when the client is the first time to
      * connect to the master or the client Ping TTL is expired and need

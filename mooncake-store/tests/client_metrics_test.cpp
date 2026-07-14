@@ -132,6 +132,36 @@ TEST_F(ClientMetricsTest, ClientMetricsSummaryTest) {
     std::cout << "Full Client Metrics Summary:\n" << summary << std::endl;
 }
 
+TEST_F(ClientMetricsTest, GdsTransferMetricsUseBoundedLabels) {
+    ClientMetric metrics;
+    metrics.gds_transfer_metric.Observe(GdsTransferOperation::kWrite, true,
+                                        4096, 250);
+    metrics.gds_transfer_metric.Observe(GdsTransferOperation::kRead, false,
+                                        8192, 500);
+
+    const std::array<std::string, 2> write_success = {"WRITE", "success"};
+    const std::array<std::string, 2> read_failure = {"READ", "failure"};
+    EXPECT_EQ(metrics.gds_transfer_metric.operation_count.value(write_success),
+              1);
+    EXPECT_EQ(metrics.gds_transfer_metric.operation_bytes.value(write_success),
+              4096);
+    EXPECT_EQ(metrics.gds_transfer_metric.operation_count.value(read_failure),
+              1);
+    EXPECT_EQ(metrics.gds_transfer_metric.operation_bytes.value(read_failure),
+              8192);
+
+    std::string serialized;
+    metrics.serialize(serialized);
+    EXPECT_NE(serialized.find("mooncake_gds_ssd_transfer_operations_total"),
+              std::string::npos);
+    EXPECT_NE(serialized.find("operation=\"WRITE\""), std::string::npos);
+    EXPECT_NE(serialized.find("result=\"failure\""), std::string::npos);
+    EXPECT_NE(serialized.find("replica_type=\"GDS_SSD\""),
+              std::string::npos);
+    EXPECT_NE(serialized.find("transport=\"GDS\""), std::string::npos);
+    EXPECT_EQ(serialized.find("segment_uri"), std::string::npos);
+}
+
 TEST_F(ClientMetricsTest, ByteFormattingTest) {
     TransferMetric metrics;
 

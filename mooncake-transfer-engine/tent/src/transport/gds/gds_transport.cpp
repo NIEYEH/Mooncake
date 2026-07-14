@@ -31,6 +31,7 @@
 #include <unistd.h>
 
 #include "tent/runtime/slab.h"
+#include "tent/metrics/tent_metrics.h"
 
 namespace mooncake {
 namespace tent {
@@ -48,6 +49,7 @@ class GdsFileContext {
         desc_.handle.fd = fd;
         auto result = cuFileHandleRegister(&handle_, &desc_);
         if (result.err != CU_FILE_SUCCESS) {
+            TENT_RECORD_GDS_HANDLE_REGISTRATION_FAILED();
             LOG(ERROR) << "Failed to register GDS storage handle: Code "
                        << result.err;
             close(desc_.handle.fd);
@@ -497,6 +499,7 @@ Status GdsTransport::submitTransferTasks(
         gds_batch->batch_handle->handle, static_cast<unsigned>(num_params),
         &gds_batch->io_params[first_param_index], 0);
     if (result.err != CU_FILE_SUCCESS) {
+        TENT_RECORD_GDS_BATCH_SUBMIT_FAILED();
         gds_batch->io_params.resize(first_param_index);
         gds_batch->io_statuses.resize(first_param_index);
         gds_batch->io_transferred_bytes.resize(first_param_index);
@@ -596,6 +599,7 @@ Status GdsTransport::addMemoryBuffer(BufferDesc& desc,
     if (location.type() != "cuda") return Status::OK();
     auto result = cuFileBufRegister((void*)desc.addr, desc.length, 0);
     if (result.err != CU_FILE_SUCCESS) {
+        TENT_RECORD_GDS_BUFFER_REGISTRATION_FAILED();
         LOG(ERROR) << "Failed to register GDS buffer: addr="
                    << reinterpret_cast<void*>(desc.addr)
                    << ", length=" << desc.length

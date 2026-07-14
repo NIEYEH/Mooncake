@@ -10,6 +10,33 @@
 #include "utils.h"
 
 namespace mooncake {
+namespace {
+
+const char* GdsAllocationFailureReasonLabel(
+    MasterMetricManager::GdsSsdAllocationFailureReason reason) {
+    using Reason = MasterMetricManager::GdsSsdAllocationFailureReason;
+    switch (reason) {
+        case Reason::INVALID_REQUEST:
+            return "invalid_request";
+        case Reason::NO_SEGMENT:
+            return "no_segment";
+        case Reason::NO_ACCESSOR:
+            return "no_accessor";
+        case Reason::SEGMENT_UNAVAILABLE:
+            return "segment_unavailable";
+        case Reason::ALIGNMENT:
+            return "alignment";
+        case Reason::CAPACITY:
+            return "capacity";
+        case Reason::INVALID_OFFSET:
+            return "invalid_offset";
+        case Reason::COLLISION:
+            return "collision";
+    }
+    return "invalid_request";
+}
+
+}  // namespace
 
 // --- Singleton Instance ---
 MasterMetricManager& MasterMetricManager::instance() {
@@ -54,9 +81,28 @@ MasterMetricManager::MasterMetricManager()
           "gds_ssd_segment_allocated_bytes",
           "Total GDS SSD bytes currently allocated of the segment",
           {"segment"}),
+      gds_used_size_(
+          "master_gds_ssd_used_bytes",
+          "Total committed GDS SSD bytes across all segments"),
+      gds_pending_size_(
+          "master_gds_ssd_pending_bytes",
+          "Total pending GDS SSD bytes across all segments"),
+      gds_used_size_per_segment_(
+          "gds_ssd_segment_used_bytes",
+          "Total committed GDS SSD bytes of the segment", {"segment"}),
+      gds_pending_size_per_segment_(
+          "gds_ssd_segment_pending_bytes",
+          "Total pending GDS SSD bytes of the segment", {"segment"}),
       gds_total_capacity_per_segment_(
           "gds_ssd_segment_total_capacity_bytes",
           "Total GDS SSD capacity of the mounted segment", {"segment"}),
+      gds_allocation_success_total_(
+          "master_gds_ssd_allocation_success_total",
+          "Total number of successful GDS SSD replica allocations"),
+      gds_allocation_failure_total_(
+          "master_gds_ssd_allocation_failure_total",
+          "Total number of failed GDS SSD replica allocations by reason",
+          {"reason"}),
       file_allocated_size_(
           "master_allocated_file_size_bytes",
           "Total bytes currently allocated for file storage in 3fs/nfs"),
@@ -478,6 +524,8 @@ void MasterMetricManager::update_metrics_for_zero_output() {
     nof_allocated_size_.update(0);
     nof_total_capacity_.update(0);
     gds_allocated_size_.update(0);
+    gds_used_size_.update(0);
+    gds_pending_size_.update(0);
     gds_total_capacity_.update(0);
     file_allocated_size_.update(0);
     file_total_capacity_.update(0);
@@ -786,6 +834,30 @@ void MasterMetricManager::reset_allocated_gds_size() {
     gds_allocated_size_.reset();
 }
 
+void MasterMetricManager::inc_gds_used_size(const std::string& segment,
+                                            int64_t val) {
+    gds_used_size_.inc(val);
+    if (!segment.empty()) gds_used_size_per_segment_.inc({segment}, val);
+}
+
+void MasterMetricManager::dec_gds_used_size(const std::string& segment,
+                                            int64_t val) {
+    gds_used_size_.dec(val);
+    if (!segment.empty()) gds_used_size_per_segment_.dec({segment}, val);
+}
+
+void MasterMetricManager::inc_gds_pending_size(const std::string& segment,
+                                               int64_t val) {
+    gds_pending_size_.inc(val);
+    if (!segment.empty()) gds_pending_size_per_segment_.inc({segment}, val);
+}
+
+void MasterMetricManager::dec_gds_pending_size(const std::string& segment,
+                                               int64_t val) {
+    gds_pending_size_.dec(val);
+    if (!segment.empty()) gds_pending_size_per_segment_.dec({segment}, val);
+}
+
 void MasterMetricManager::inc_total_gds_capacity(const std::string& segment,
                                                  int64_t val) {
     gds_total_capacity_.inc(val);
@@ -822,6 +894,14 @@ int64_t MasterMetricManager::get_allocated_gds_size() {
     return gds_allocated_size_.value();
 }
 
+int64_t MasterMetricManager::get_gds_used_size() {
+    return gds_used_size_.value();
+}
+
+int64_t MasterMetricManager::get_gds_pending_size() {
+    return gds_pending_size_.value();
+}
+
 int64_t MasterMetricManager::get_total_gds_capacity() {
     return gds_total_capacity_.value();
 }
@@ -840,6 +920,16 @@ int64_t MasterMetricManager::get_segment_allocated_gds_size(
     return gds_allocated_size_per_segment_.value({segment});
 }
 
+int64_t MasterMetricManager::get_segment_gds_used_size(
+    const std::string& segment) {
+    return gds_used_size_per_segment_.value({segment});
+}
+
+int64_t MasterMetricManager::get_segment_gds_pending_size(
+    const std::string& segment) {
+    return gds_pending_size_per_segment_.value({segment});
+}
+
 int64_t MasterMetricManager::get_segment_total_gds_capacity(
     const std::string& segment) {
     return gds_total_capacity_per_segment_.value({segment});
@@ -853,6 +943,26 @@ double MasterMetricManager::get_segment_gds_used_ratio(
         return 0.0;
     }
     return allocated / capacity;
+}
+
+void MasterMetricManager::inc_gds_allocation_success(int64_t val) {
+    gds_allocation_success_total_.inc(val);
+}
+
+void MasterMetricManager::inc_gds_allocation_failure(
+    GdsSsdAllocationFailureReason reason, int64_t val) {
+    gds_allocation_failure_total_.inc(
+        {GdsAllocationFailureReasonLabel(reason)}, val);
+}
+
+int64_t MasterMetricManager::get_gds_allocation_success() {
+    return gds_allocation_success_total_.value();
+}
+
+int64_t MasterMetricManager::get_gds_allocation_failure(
+    GdsSsdAllocationFailureReason reason) {
+    return gds_allocation_failure_total_.value(
+        {GdsAllocationFailureReasonLabel(reason)});
 }
 
 // File Storage Metrics
@@ -1821,9 +1931,15 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(nof_allocated_size_per_segment_);
     serialize_metric(nof_total_capacity_per_segment_);
     serialize_metric(gds_allocated_size_);
+    serialize_metric(gds_used_size_);
+    serialize_metric(gds_pending_size_);
     serialize_metric(gds_total_capacity_);
     serialize_metric(gds_allocated_size_per_segment_);
+    serialize_metric(gds_used_size_per_segment_);
+    serialize_metric(gds_pending_size_per_segment_);
     serialize_metric(gds_total_capacity_per_segment_);
+    serialize_metric(gds_allocation_success_total_);
+    serialize_metric(gds_allocation_failure_total_);
     serialize_metric(file_allocated_size_);
     serialize_metric(file_total_capacity_);
     serialize_metric(key_count_);
@@ -2048,6 +2164,8 @@ std::string MasterMetricManager::get_summary_string(
     int64_t nof_allocated = nof_allocated_size_.value();
     int64_t nof_capacity = nof_total_capacity_.value();
     int64_t gds_allocated = gds_allocated_size_.value();
+    int64_t gds_used = gds_used_size_.value();
+    int64_t gds_pending = gds_pending_size_.value();
     int64_t gds_capacity = gds_total_capacity_.value();
     int64_t file_allocated = file_allocated_size_.value();
     int64_t file_capacity = file_total_capacity_.value();
@@ -2346,7 +2464,8 @@ std::string MasterMetricManager::get_summary_string(
         ss << " (" << std::fixed << std::setprecision(1)
            << ((double)nof_allocated / (double)nof_capacity * 100.0) << "%)";
     }
-    ss << " | GDS SSD: " << byte_size_to_string(gds_allocated) << " / "
+    ss << " | GDS SSD: used " << byte_size_to_string(gds_used)
+       << " + pending " << byte_size_to_string(gds_pending) << " / "
        << byte_size_to_string(gds_capacity);
     if (gds_capacity > 0) {
         ss << " (" << std::fixed << std::setprecision(1)

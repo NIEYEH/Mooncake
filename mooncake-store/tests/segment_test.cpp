@@ -1,4 +1,5 @@
 #include "segment.h"
+#include "master_metric_manager.h"
 
 #include <glog/logging.h>
 #include <gtest/gtest.h>
@@ -6,12 +7,17 @@
 #include <boost/functional/hash.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <limits>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <thread>
+#include <unordered_set>
 #include <vector>
 
 #ifdef __linux__
@@ -995,14 +1001,54 @@ TEST_F(SegmentTest, GdsSsdSegmentManagerAllocatesResolvesAndReleases) {
     auto access = gds_segment_manager.getGdsSsdSegmentAccess();
     ASSERT_EQ(access.MountSegment(segment), ErrorCode::OK);
 
+    using FailureReason =
+        MasterMetricManager::GdsSsdAllocationFailureReason;
+    auto& metrics = MasterMetricManager::instance();
+    const int64_t success_before = metrics.get_gds_allocation_success();
+    const int64_t no_accessor_before =
+        metrics.get_gds_allocation_failure(FailureReason::NO_ACCESSOR);
+    const int64_t no_segment_before =
+        metrics.get_gds_allocation_failure(FailureReason::NO_SEGMENT);
+    const int64_t alignment_before =
+        metrics.get_gds_allocation_failure(FailureReason::ALIGNMENT);
+    const int64_t capacity_before =
+        metrics.get_gds_allocation_failure(FailureReason::CAPACITY);
+
     auto allocation =
         access.AllocateReplica(8192, {"gds_pool_0"}, {}, "host-a");
     ASSERT_TRUE(allocation.has_value());
+    EXPECT_EQ(metrics.get_gds_allocation_success(), success_before + 1);
+    EXPECT_EQ(metrics.get_segment_gds_pending_size(segment.name), 8192);
+    EXPECT_EQ(metrics.get_segment_gds_used_size(segment.name), 0);
 
     auto inaccessible_allocation =
         access.AllocateReplica(4096, {}, {}, "host-b");
     EXPECT_FALSE(inaccessible_allocation.has_value());
     EXPECT_EQ(inaccessible_allocation.error(), ErrorCode::NO_AVAILABLE_HANDLE);
+    EXPECT_EQ(metrics.get_gds_allocation_failure(FailureReason::NO_ACCESSOR),
+              no_accessor_before + 1);
+
+    auto missing_segment_allocation = access.AllocateReplica(
+        4096, {"missing-gds-segment"}, {}, "host-a");
+    EXPECT_FALSE(missing_segment_allocation.has_value());
+    EXPECT_EQ(missing_segment_allocation.error(),
+              ErrorCode::NO_AVAILABLE_HANDLE);
+    EXPECT_EQ(metrics.get_gds_allocation_failure(FailureReason::NO_SEGMENT),
+              no_segment_before + 1);
+
+    auto unaligned_allocation =
+        access.AllocateReplica(4097, {}, {}, "host-a");
+    EXPECT_FALSE(unaligned_allocation.has_value());
+    EXPECT_EQ(unaligned_allocation.error(), ErrorCode::INVALID_PARAMS);
+    EXPECT_EQ(metrics.get_gds_allocation_failure(FailureReason::ALIGNMENT),
+              alignment_before + 1);
+
+    auto oversized_allocation =
+        access.AllocateReplica(2 * 1024 * 1024, {}, {}, "host-a");
+    EXPECT_FALSE(oversized_allocation.has_value());
+    EXPECT_EQ(oversized_allocation.error(), ErrorCode::NO_AVAILABLE_HANDLE);
+    EXPECT_EQ(metrics.get_gds_allocation_failure(FailureReason::CAPACITY),
+              capacity_before + 1);
     const GdsSsdReplicaMeta meta = allocation.value();
     EXPECT_EQ(meta.segment_id, segment.id);
     EXPECT_EQ(meta.segment_name, segment.name);
@@ -1028,11 +1074,260 @@ TEST_F(SegmentTest, GdsSsdSegmentManagerAllocatesResolvesAndReleases) {
     EXPECT_EQ(used, 8192);
     EXPECT_EQ(capacity, segment.size);
 
+    EXPECT_EQ(access.CommitReplicas({meta}), ErrorCode::OK);
+    EXPECT_EQ(metrics.get_segment_gds_pending_size(segment.name), 0);
+    EXPECT_EQ(metrics.get_segment_gds_used_size(segment.name), 8192);
+    EXPECT_EQ(access.CommitReplicas({meta}), ErrorCode::OK);
+    EXPECT_EQ(metrics.get_segment_gds_used_size(segment.name), 8192);
+
     EXPECT_EQ(access.ReleaseReplica(meta), ErrorCode::OK);
+    EXPECT_EQ(metrics.get_segment_gds_pending_size(segment.name), 0);
+    EXPECT_EQ(metrics.get_segment_gds_used_size(segment.name), 0);
     ASSERT_EQ(access.QuerySegments(segment.name, used, capacity),
               ErrorCode::OK);
     EXPECT_EQ(used, 0);
     EXPECT_EQ(capacity, segment.size);
+}
+
+TEST_F(SegmentTest, GdsSsdMetricsAreReleasedWithManager) {
+    const std::string segment_name = "gds_metrics_lifetime";
+    auto& metrics = MasterMetricManager::instance();
+    ASSERT_EQ(metrics.get_segment_total_gds_capacity(segment_name), 0);
+    ASSERT_EQ(metrics.get_segment_allocated_gds_size(segment_name), 0);
+    ASSERT_EQ(metrics.get_segment_gds_pending_size(segment_name), 0);
+    ASSERT_EQ(metrics.get_segment_gds_used_size(segment_name), 0);
+
+    {
+        GdsSsdSegmentManager manager;
+        GdsSsdSegment segment;
+        segment.id = generate_uuid();
+        segment.name = segment_name;
+        segment.size = 16 * 1024;
+        segment.block_size = 4096;
+        segment.allocation_alignment = 4096;
+        segment.namespace_id = "nvme-ns-metrics-lifetime";
+
+        GdsSsdAccessor accessor;
+        accessor.client_host = "host-a";
+        accessor.segment_uri = "block:///dev/mooncake/gds_metrics_lifetime";
+        accessor.namespace_id = segment.namespace_id;
+        accessor.size = segment.size;
+        accessor.block_size = segment.block_size;
+        accessor.allocation_alignment = segment.allocation_alignment;
+        accessor.alive = true;
+        segment.accessors.push_back(accessor);
+
+        {
+            auto access = manager.getGdsSsdSegmentAccess();
+            ASSERT_EQ(access.MountSegment(segment), ErrorCode::OK);
+            auto committed = access.AllocateReplica(4096, {}, {}, "host-a");
+            auto pending = access.AllocateReplica(4096, {}, {}, "host-a");
+            ASSERT_TRUE(committed.has_value());
+            ASSERT_TRUE(pending.has_value());
+            ASSERT_EQ(access.CommitReplicas({committed.value()}),
+                      ErrorCode::OK);
+        }
+
+        EXPECT_EQ(metrics.get_segment_total_gds_capacity(segment_name),
+                  segment.size);
+        EXPECT_EQ(metrics.get_segment_allocated_gds_size(segment_name), 8192);
+        EXPECT_EQ(metrics.get_segment_gds_pending_size(segment_name), 4096);
+        EXPECT_EQ(metrics.get_segment_gds_used_size(segment_name), 4096);
+    }
+
+    EXPECT_EQ(metrics.get_segment_total_gds_capacity(segment_name), 0);
+    EXPECT_EQ(metrics.get_segment_allocated_gds_size(segment_name), 0);
+    EXPECT_EQ(metrics.get_segment_gds_pending_size(segment_name), 0);
+    EXPECT_EQ(metrics.get_segment_gds_used_size(segment_name), 0);
+}
+
+TEST_F(SegmentTest, GdsSsdConcurrentAllocationsDoNotOverlap) {
+    constexpr size_t kThreadCount = 16;
+    constexpr size_t kAllocationSize = 4096;
+
+    GdsSsdSegmentManager manager;
+    GdsSsdSegment segment;
+    segment.id = generate_uuid();
+    segment.name = "gds_concurrent_allocations";
+    segment.size = kThreadCount * kAllocationSize;
+    segment.block_size = kAllocationSize;
+    segment.allocation_alignment = kAllocationSize;
+    segment.namespace_id = "nvme-ns-concurrent";
+
+    GdsSsdAccessor accessor;
+    accessor.client_host = "host-a";
+    accessor.segment_uri = "block:///dev/mooncake/gds_concurrent";
+    accessor.namespace_id = segment.namespace_id;
+    accessor.size = segment.size;
+    accessor.block_size = segment.block_size;
+    accessor.allocation_alignment = segment.allocation_alignment;
+    accessor.alive = true;
+    segment.accessors.push_back(accessor);
+
+    auto access = manager.getGdsSsdSegmentAccess();
+    ASSERT_EQ(access.MountSegment(segment), ErrorCode::OK);
+
+    std::atomic<bool> start{false};
+    std::mutex results_mutex;
+    std::vector<GdsSsdReplicaMeta> allocations;
+    std::vector<std::thread> threads;
+    threads.reserve(kThreadCount);
+    for (size_t i = 0; i < kThreadCount; ++i) {
+        threads.emplace_back([&] {
+            while (!start.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
+            }
+            auto allocation =
+                access.AllocateReplica(kAllocationSize, {}, {}, "host-a");
+            ASSERT_TRUE(allocation.has_value());
+            std::lock_guard<std::mutex> lock(results_mutex);
+            allocations.push_back(allocation.value());
+        });
+    }
+    start.store(true, std::memory_order_release);
+    for (auto& thread : threads) {
+        thread.join();
+    }
+
+    ASSERT_EQ(allocations.size(), kThreadCount);
+    std::unordered_set<uint64_t> offsets;
+    for (const auto& allocation : allocations) {
+        EXPECT_TRUE(offsets.insert(allocation.offset).second);
+        EXPECT_EQ(allocation.offset % kAllocationSize, 0u);
+        EXPECT_LE(allocation.offset + allocation.object_size, segment.size);
+    }
+
+    ASSERT_EQ(access.CommitReplicas(allocations), ErrorCode::OK);
+    for (const auto& allocation : allocations) {
+        ASSERT_EQ(access.ReleaseReplica(allocation), ErrorCode::OK);
+    }
+    auto reused = access.AllocateReplica(kAllocationSize, {}, {}, "host-a");
+    ASSERT_TRUE(reused.has_value());
+    EXPECT_EQ(reused->offset, 0u);
+    EXPECT_EQ(access.ReleaseReplica(reused.value()), ErrorCode::OK);
+}
+
+TEST_F(SegmentTest, GdsSsdAccessorLifecycleAndValidation) {
+    GdsSsdSegmentManager manager;
+    GdsSsdSegment segment;
+    segment.id = generate_uuid();
+    segment.name = "gds_accessors";
+    segment.base = 4096;
+    segment.size = 1024 * 1024;
+    segment.block_size = 512;
+    segment.allocation_alignment = 4096;
+    segment.namespace_id = "nvme-ns-accessors";
+
+    auto access = manager.getGdsSsdSegmentAccess();
+    ASSERT_EQ(access.MountSegment(segment), ErrorCode::OK);
+
+    GdsSsdAccessor accessor;
+    accessor.client_host = "host-a";
+    accessor.segment_uri = "block:///dev/disk/by-id/gds-a";
+    accessor.namespace_id = segment.namespace_id;
+    accessor.size = segment.base + segment.size;
+    accessor.block_size = segment.block_size;
+    accessor.allocation_alignment = segment.allocation_alignment;
+    accessor.gpu_device_ids = {0};
+    accessor.alive = true;
+
+    ASSERT_EQ(access.RegisterAccessor(segment.id, accessor), ErrorCode::OK);
+    auto found = access.GetAccessor(segment.id, "host-a");
+    ASSERT_TRUE(found.has_value());
+    EXPECT_EQ(found->segment_uri, accessor.segment_uri);
+
+    GdsSsdAccessor updated = accessor;
+    updated.segment_uri = "block:///dev/mooncake/gds-a";
+    updated.gpu_device_ids = {1, 2};
+    ASSERT_EQ(access.RegisterAccessor(segment.id, updated), ErrorCode::OK);
+    found = access.GetAccessor(segment.id, "host-a");
+    ASSERT_TRUE(found.has_value());
+    EXPECT_EQ(found->segment_uri, updated.segment_uri);
+    EXPECT_EQ(found->gpu_device_ids, updated.gpu_device_ids);
+
+    GdsSsdAccessor invalid = accessor;
+    invalid.namespace_id = "another-namespace";
+    EXPECT_EQ(access.RegisterAccessor(segment.id, invalid),
+              ErrorCode::INVALID_PARAMS);
+    invalid = accessor;
+    invalid.size = segment.base + segment.size - 1;
+    EXPECT_EQ(access.RegisterAccessor(segment.id, invalid),
+              ErrorCode::INVALID_PARAMS);
+    invalid = accessor;
+    invalid.block_size = 4096;
+    EXPECT_EQ(access.RegisterAccessor(segment.id, invalid),
+              ErrorCode::INVALID_PARAMS);
+    invalid = accessor;
+    invalid.segment_uri = "block://";
+    EXPECT_EQ(access.RegisterAccessor(segment.id, invalid),
+              ErrorCode::INVALID_PARAMS);
+
+    EXPECT_EQ(access.UnregisterAccessor(segment.id, "host-a"), ErrorCode::OK);
+    EXPECT_EQ(access.UnregisterAccessor(segment.id, "host-a"), ErrorCode::OK);
+    found = access.GetAccessor(segment.id, "host-a");
+    ASSERT_FALSE(found.has_value());
+    EXPECT_EQ(found.error(), ErrorCode::NO_AVAILABLE_HANDLE);
+
+    auto allocation = access.AllocateReplica(4096, {}, {}, "host-a");
+    ASSERT_FALSE(allocation.has_value());
+    EXPECT_EQ(allocation.error(), ErrorCode::NO_AVAILABLE_HANDLE);
+
+    updated.alive = true;
+    EXPECT_EQ(access.RegisterAccessor(segment.id, updated), ErrorCode::OK);
+    EXPECT_TRUE(access.GetAccessor(segment.id, "host-a").has_value());
+}
+
+TEST_F(SegmentTest, GdsSsdRejectsInvalidSegmentsAndReplicaRelease) {
+    GdsSsdSegmentManager manager;
+    GdsSsdSegment segment;
+    segment.id = generate_uuid();
+    segment.name = "gds_validation";
+    segment.base = 0;
+    segment.size = 1024 * 1024;
+    segment.block_size = 4096;
+    segment.allocation_alignment = 4096;
+    segment.namespace_id = "nvme-ns-validation";
+
+    auto access = manager.getGdsSsdSegmentAccess();
+    GdsSsdSegment invalid = segment;
+    invalid.base = 1;
+    EXPECT_EQ(access.MountSegment(invalid), ErrorCode::INVALID_PARAMS);
+
+    invalid = segment;
+    invalid.allocation_alignment = 512;
+    EXPECT_EQ(access.MountSegment(invalid), ErrorCode::INVALID_PARAMS);
+
+    invalid = segment;
+    invalid.base = std::numeric_limits<uint64_t>::max() - 4095;
+    invalid.size = 8192;
+    EXPECT_EQ(access.MountSegment(invalid), ErrorCode::INVALID_PARAMS);
+
+    GdsSsdAccessor accessor;
+    accessor.client_host = "host-a";
+    accessor.segment_uri = "block:///dev/disk/by-id/gds-validation";
+    accessor.namespace_id = segment.namespace_id;
+    accessor.size = segment.size;
+    accessor.block_size = segment.block_size;
+    accessor.allocation_alignment = segment.allocation_alignment;
+    accessor.alive = true;
+    segment.accessors.push_back(accessor);
+    ASSERT_EQ(access.MountSegment(segment), ErrorCode::OK);
+
+    auto allocation = access.AllocateReplica(4096, {}, {}, "host-a");
+    ASSERT_TRUE(allocation.has_value());
+    GdsSsdReplicaMeta forged = allocation.value();
+    forged.block_size = 512;
+    EXPECT_EQ(access.ReleaseReplica(forged), ErrorCode::INVALID_REPLICA);
+
+    size_t used = 0;
+    size_t capacity = 0;
+    ASSERT_EQ(access.QuerySegments(segment.name, used, capacity),
+              ErrorCode::OK);
+    EXPECT_EQ(used, 4096);
+
+    EXPECT_EQ(access.ReleaseReplica(allocation.value()), ErrorCode::OK);
+    EXPECT_EQ(access.ReleaseReplica(allocation.value()),
+              ErrorCode::INVALID_REPLICA);
 }
 
 TEST_F(SegmentTest, GdsSsdLocalNvmeOfPathCanBeOpenedByTent) {

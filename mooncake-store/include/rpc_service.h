@@ -155,6 +155,12 @@ class WrappedMasterService {
     tl::expected<void, ErrorCode> RegisterGdsSsdAccessor(
         const UUID& segment_id, const GdsSsdAccessor& accessor);
 
+    tl::expected<void, ErrorCode> UnregisterGdsSsdAccessor(
+        const UUID& segment_id, const std::string& client_host);
+
+    tl::expected<GdsSsdAccessor, ErrorCode> GetGdsSsdAccessor(
+        const UUID& segment_id, const std::string& client_host);
+
     tl::expected<void, ErrorCode> ReMountSegment(
         const std::vector<Segment>& segments, const UUID& client_id);
 

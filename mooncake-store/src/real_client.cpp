@@ -277,13 +277,13 @@ inline tl::expected<void, ErrorCode> scatter_host_to_maybe_device(
     return {};
 }
 
-// Select the best replica from a list: prefer local MEMORY, then any
-// MEMORY, then LOCAL_DISK, then DISK.  Master may return replicas in any
-// order, so we always scan.
+// Select the best replica from a list: local MEMORY, resolved GDS SSD, remote
+// MEMORY, NoF, LOCAL_DISK, then DISK. Master may return any order.
 inline const Replica::Descriptor *SelectBestReplica(
     const std::vector<Replica::Descriptor> &replicas,
     const std::unordered_set<std::string> &local_endpoints) {
     const Replica::Descriptor *first_memory = nullptr;
+    const Replica::Descriptor *first_gds = nullptr;
     const Replica::Descriptor *first_nof = nullptr;
     for (const auto &r : replicas) {
         if (r.status != ReplicaStatus::COMPLETE) continue;
@@ -294,6 +294,11 @@ inline const Replica::Descriptor *SelectBestReplica(
                 return &r;  // local MEMORY — best case
             }
             if (!first_memory) first_memory = &r;
+        } else if (r.is_gds_ssd_replica()) {
+            if (!r.get_gds_ssd_descriptor().segment_uri.empty() &&
+                !first_gds) {
+                first_gds = &r;
+            }
         } else if (r.is_nof_replica()) {
             if (local_endpoints.count(
                     r.get_nof_descriptor()
@@ -303,6 +308,7 @@ inline const Replica::Descriptor *SelectBestReplica(
             if (!first_nof) first_nof = &r;
         }
     }
+    if (first_gds) return first_gds;
     if (first_memory) return first_memory;
     if (first_nof) return first_nof;
 
@@ -4972,10 +4978,20 @@ RealClient::batch_get_into_multi_buffers_internal(
         const auto &buffers = all_buffers[i];
         std::vector<Slice> key_slices;
         key_slices.reserve(buffers.size());
-        if (replica.is_memory_replica()) {
-            // MEMORY: RDMA from remote memory directly to GPU (GPUDirect).
+        if (replica.is_memory_replica() ||
+            replica.is_gds_ssd_replica()) {
+            // MEMORY and GDS_SSD both transfer directly to the supplied GPU
+            // slices. GDS requires the submitted total to equal object_size.
+            uint64_t remaining = total_size;
             for (size_t j = 0; j < buffers.size(); ++j) {
-                key_slices.emplace_back(Slice{buffers[j], sizes[j]});
+                const size_t slice_size = static_cast<size_t>(
+                    std::min<uint64_t>(remaining, sizes[j]));
+                if (slice_size != 0) {
+                    key_slices.emplace_back(
+                        Slice{buffers[j], slice_size});
+                    remaining -= slice_size;
+                }
+                if (remaining == 0) break;
             }
         } else if (replica.is_local_disk_replica() ||
                    replica.is_disk_replica()) {
