@@ -39,3 +39,12 @@ if(USE_NOF)
   target_link_libraries(nof_worker_pool_bench PRIVATE mooncake_store glog::glog
                                                        gflags::gflags)
 endif()
+
+# End-to-end Store benchmark for GPU buffers backed by GDS SSD replicas.
+if(USE_TENT AND USE_CUDA)
+  find_package(CUDAToolkit REQUIRED)
+  add_executable(gds_store_bench gds_store_bench.cpp)
+  target_link_libraries(
+    gds_store_bench PRIVATE mooncake_store gflags::gflags glog::glog
+                            CUDA::cudart pthread)
+endif()
