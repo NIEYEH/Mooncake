@@ -949,6 +949,21 @@ TEST_F(MasterServiceTest, GdsSsdGetResolvesAccessorForReaderHost) {
                   .offset,
               put_start->front().get_gds_ssd_descriptor().offset);
 
+    const std::vector<std::string> batch_keys = {"gds_shared_object",
+                                                  "gds_missing_object"};
+    auto batch_replicas =
+        service.BatchGetReplicaList(reader_id, batch_keys, "default");
+    ASSERT_EQ(batch_replicas.size(), batch_keys.size());
+    ASSERT_TRUE(batch_replicas[0].has_value());
+    ASSERT_EQ(batch_replicas[0]->replicas.size(), 1u);
+    EXPECT_EQ(batch_replicas[0]
+                  ->replicas.front()
+                  .get_gds_ssd_descriptor()
+                  .segment_uri,
+              reader_uri);
+    ASSERT_FALSE(batch_replicas[1].has_value());
+    EXPECT_EQ(batch_replicas[1].error(), ErrorCode::OBJECT_NOT_FOUND);
+
     auto inaccessible = service.GetReplicaList(
         inaccessible_reader_id, "gds_shared_object", "default");
     ASSERT_FALSE(inaccessible.has_value());
@@ -1202,9 +1217,12 @@ TEST_F(MasterServiceTest, BatchGetReplicaListKeepsTenantIsolation) {
     ASSERT_TRUE(service_->PutEnd(client_id, key, tenant_b, ReplicaType::MEMORY)
                     .has_value());
 
-    auto tenant_a_results = service_->BatchGetReplicaList(client_id, {key}, tenant_a);
-    auto tenant_b_results = service_->BatchGetReplicaList(client_id, {key}, tenant_b);
-    auto default_results = service_->BatchGetReplicaList(client_id, {key}, "default");
+    auto tenant_a_results =
+        service_->BatchGetReplicaList(client_id, {key}, tenant_a);
+    auto tenant_b_results =
+        service_->BatchGetReplicaList(client_id, {key}, tenant_b);
+    auto default_results =
+        service_->BatchGetReplicaList(client_id, {key}, "default");
 
     ASSERT_EQ(tenant_a_results.size(), 1u);
     ASSERT_EQ(tenant_b_results.size(), 1u);
@@ -1878,8 +1896,13 @@ TEST_F(MasterServiceTest, WrappedBatchPutStartMixedGroupIdsPreservesOrder) {
         ASSERT_TRUE(result.has_value());
     }
 
-    for (const auto& key : keys) {
-        EXPECT_TRUE(service_.GetReplicaList(client_id, key, "default").has_value());
+    auto get_results =
+        service_.BatchGetReplicaList(client_id, keys, "default");
+    ASSERT_EQ(get_results.size(), keys.size());
+    for (const auto& result : get_results) {
+        ASSERT_TRUE(result.has_value()) << toString(result.error());
+        ASSERT_EQ(result->replicas.size(), 1u);
+        EXPECT_TRUE(result->replicas.front().is_memory_replica());
     }
 
     ReplicateConfig invalid_config = config;
@@ -5127,6 +5150,24 @@ TEST_F(MasterServiceTest, WrappedBatchExistKeyUsesTenantAwareBatchPath) {
     ASSERT_TRUE(
         service_.PutEnd(client_id, default_only_key, ReplicaType::MEMORY)
             .has_value());
+
+    auto tenant_get =
+        service_.GetReplicaList(client_id, tenant_key_a, tenant_id);
+    ASSERT_TRUE(tenant_get.has_value());
+    ASSERT_EQ(tenant_get->replicas.size(), 1u);
+    EXPECT_TRUE(tenant_get->replicas.front().is_memory_replica());
+
+    const std::vector<std::string> get_keys = {tenant_key_a,
+                                                default_only_key, missing_key};
+    auto tenant_get_batch =
+        service_.BatchGetReplicaList(client_id, get_keys, tenant_id);
+    ASSERT_EQ(tenant_get_batch.size(), get_keys.size());
+    ASSERT_TRUE(tenant_get_batch[0].has_value());
+    ASSERT_EQ(tenant_get_batch[0]->replicas.size(), 1u);
+    ASSERT_FALSE(tenant_get_batch[1].has_value());
+    EXPECT_EQ(tenant_get_batch[1].error(), ErrorCode::OBJECT_NOT_FOUND);
+    ASSERT_FALSE(tenant_get_batch[2].has_value());
+    EXPECT_EQ(tenant_get_batch[2].error(), ErrorCode::OBJECT_NOT_FOUND);
 
     auto& metrics = MasterMetricManager::instance();
     const auto base_requests = metrics.get_batch_exist_key_requests();
