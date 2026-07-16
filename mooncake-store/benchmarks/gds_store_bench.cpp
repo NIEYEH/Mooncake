@@ -54,6 +54,7 @@ DEFINE_uint64(num_objects, 1024,
               "Number of persistent objects used by prepare/read/verify/cleanup");
 DEFINE_uint64(key_start, 0, "First persistent object ID");
 DEFINE_string(key_prefix, "gds-store-bench", "Object key prefix");
+DEFINE_string(case_name, "", "Optional result label written to CSV");
 DEFINE_int32(threads, 1, "Number of synchronous worker threads");
 DEFINE_int32(batch_size, 1, "Objects per Store batch call");
 DEFINE_int32(duration_sec, 30, "Measured duration for write/read/mixed");
@@ -532,15 +533,18 @@ void appendCsv(const PhaseResult& result) {
         throw std::runtime_error("cannot open --csv_path=" + FLAGS_csv_path);
     }
     if (write_header) {
-        output << "phase,operation,value_size,threads,batch_size,elapsed_sec,"
+        output << "case_name,key_prefix,phase,operation,value_size,threads,"
+                  "batch_size,elapsed_sec,"
                   "requests,success_kvs,failed_kvs,bytes,gib_per_sec,kv_iops,"
                   "request_qps,cpu_user_sec,cpu_system_sec,cpu_percent_one_core,"
                   "p50_us,p95_us,p99_us,p999_us,max_us,errors\n";
     }
     const double seconds = std::max(result.elapsed_sec, 1e-9);
-    output << csvEscape(result.name) << ',' << FLAGS_operation << ','
-           << FLAGS_value_size << ',' << FLAGS_threads << ',' << FLAGS_batch_size
-           << ',' << result.elapsed_sec << ',' << result.requests << ','
+    output << csvEscape(FLAGS_case_name) << ',' << csvEscape(FLAGS_key_prefix)
+           << ',' << csvEscape(result.name) << ',' << FLAGS_operation << ','
+           << FLAGS_value_size << ',' << FLAGS_threads << ','
+           << FLAGS_batch_size << ',' << result.elapsed_sec << ','
+           << result.requests << ','
            << result.successful_kvs << ',' << result.failed_kvs << ','
            << result.bytes << ','
            << static_cast<double>(result.bytes) / seconds /
@@ -693,6 +697,8 @@ int main(int argc, char** argv) {
         }
 
         std::cout << "operation=" << FLAGS_operation
+                  << " case_name="
+                  << (FLAGS_case_name.empty() ? "<none>" : FLAGS_case_name)
                   << " local_hostname=" << FLAGS_local_hostname
                   << " gpu=" << FLAGS_gpu_id
                   << " value_size=" << FLAGS_value_size
