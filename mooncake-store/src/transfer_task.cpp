@@ -1523,10 +1523,11 @@ bool TransferSubmitter::buildGdsSsdTransferRequests(
         return false;
     }
 
-    requests.reserve(slices.size());
+    std::vector<Slice> coalesced_slices;
+    coalesced_slices.reserve(slices.size());
     std::vector<std::pair<uint64_t, uint64_t>> source_ranges;
     source_ranges.reserve(slices.size());
-    uint64_t logical_offset = 0;
+    uint64_t slices_size = 0;
     for (const auto& slice : slices) {
         if (slice.size == 0) {
             LOG(ERROR) << "GDS SSD transfer got a zero-length slice";
@@ -1540,17 +1541,6 @@ bool TransferSubmitter::buildGdsSsdTransferRequests(
         }
         const auto source_address = static_cast<uint64_t>(
             reinterpret_cast<std::uintptr_t>(slice.ptr));
-        if (!IsAligned(source_address, alignment) ||
-            !IsAligned(static_cast<uint64_t>(slice.size), alignment)) {
-            LOG(ERROR) << "Unaligned GDS SSD slice: segment_name="
-                       << descriptor.segment_name
-                       << ", ptr=" << slice.ptr
-                       << ", slice_size=" << slice.size
-                       << ", alignment=" << alignment;
-            requests.clear();
-            return false;
-        }
-
         uint64_t source_end = 0;
         if (!CheckedAdd(source_address, static_cast<uint64_t>(slice.size),
                         source_end)) {
@@ -1570,15 +1560,69 @@ bool TransferSubmitter::buildGdsSsdTransferRequests(
         }
         source_ranges.emplace_back(source_address, source_end);
 
-        uint64_t next_offset = 0;
-        if (!CheckedAdd(logical_offset, static_cast<uint64_t>(slice.size),
-                        next_offset) ||
-            next_offset > descriptor.object_size) {
+        uint64_t next_size = 0;
+        if (!CheckedAdd(slices_size, static_cast<uint64_t>(slice.size),
+                        next_size) ||
+            next_size > descriptor.object_size) {
             LOG(ERROR) << "GDS SSD transfer range exceeds object: segment_name="
                        << descriptor.segment_name
-                       << ", logical_offset=" << logical_offset
+                       << ", logical_offset=" << slices_size
                        << ", slice_size=" << slice.size
                        << ", object_size=" << descriptor.object_size;
+            requests.clear();
+            return false;
+        }
+        slices_size = next_size;
+
+        if (!coalesced_slices.empty()) {
+            auto& previous = coalesced_slices.back();
+            const auto previous_address = static_cast<uint64_t>(
+                reinterpret_cast<std::uintptr_t>(previous.ptr));
+            uint64_t previous_end = 0;
+            if (!CheckedAdd(previous_address,
+                            static_cast<uint64_t>(previous.size),
+                            previous_end)) {
+                requests.clear();
+                return false;
+            }
+            const bool previous_needs_coalescing =
+                !IsAligned(previous_address, alignment) ||
+                !IsAligned(static_cast<uint64_t>(previous.size), alignment);
+            if (previous_end == source_address &&
+                previous_needs_coalescing) {
+                if (slice.size >
+                    std::numeric_limits<size_t>::max() - previous.size) {
+                    LOG(ERROR) << "GDS SSD coalesced slice size overflows";
+                    requests.clear();
+                    return false;
+                }
+                previous.size += slice.size;
+                continue;
+            }
+        }
+        coalesced_slices.emplace_back(slice);
+    }
+
+    if (slices_size != descriptor.object_size) {
+        LOG(ERROR) << "GDS SSD transfer size mismatch: segment_name="
+                   << descriptor.segment_name
+                   << ", slices_size=" << slices_size
+                   << ", object_size=" << descriptor.object_size;
+        requests.clear();
+        return false;
+    }
+
+    requests.reserve(coalesced_slices.size());
+    uint64_t logical_offset = 0;
+    for (const auto& slice : coalesced_slices) {
+        const auto source_address = static_cast<uint64_t>(
+            reinterpret_cast<std::uintptr_t>(slice.ptr));
+        if (!IsAligned(source_address, alignment) ||
+            !IsAligned(static_cast<uint64_t>(slice.size), alignment)) {
+            LOG(ERROR) << "Unaligned GDS SSD coalesced slice: segment_name="
+                       << descriptor.segment_name << ", ptr=" << slice.ptr
+                       << ", slice_size=" << slice.size
+                       << ", alignment=" << alignment;
             requests.clear();
             return false;
         }
@@ -1607,17 +1651,9 @@ bool TransferSubmitter::buildGdsSsdTransferRequests(
         request.length = slice.size;
         request.transport_hint = kTentGdsTransportHint;
         requests.emplace_back(request);
-        logical_offset = next_offset;
+        logical_offset += slice.size;
     }
 
-    if (logical_offset != descriptor.object_size) {
-        LOG(ERROR) << "GDS SSD transfer size mismatch: segment_name="
-                   << descriptor.segment_name
-                   << ", slices_size=" << logical_offset
-                   << ", object_size=" << descriptor.object_size;
-        requests.clear();
-        return false;
-    }
     if (requests.empty()) {
         LOG(ERROR) << "GDS SSD transfer has no requests";
         return false;

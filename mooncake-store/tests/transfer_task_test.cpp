@@ -204,6 +204,30 @@ TEST_F(TransferTaskTest, BuildGdsSsdTransferRequests) {
     ASSERT_TRUE(TransferSubmitter::buildGdsSsdTransferRequests(
         descriptor, slices, TransferRequest::READ, requests));
     EXPECT_EQ(requests[0].opcode, TransferRequest::READ);
+
+    // RealClient splits at kMaxSliceSize (16 MiB - 16). Adjacent pieces must
+    // be coalesced before applying GDS alignment requirements.
+    GdsSsdDescriptor split_descriptor = descriptor;
+    split_descriptor.object_size = 16 * 1024 * 1024;
+    constexpr uintptr_t kSplitBufferAddress = 0x20000;
+    slices = {
+        {reinterpret_cast<void*>(kSplitBufferAddress), kMaxSliceSize},
+        {reinterpret_cast<void*>(kSplitBufferAddress + kMaxSliceSize), 16},
+    };
+    ASSERT_TRUE(TransferSubmitter::buildGdsSsdTransferRequests(
+        split_descriptor, slices, TransferRequest::WRITE, requests));
+    ASSERT_EQ(requests.size(), 1u);
+    EXPECT_EQ(requests[0].source, slices[0].ptr);
+    EXPECT_EQ(requests[0].length, split_descriptor.object_size);
+    EXPECT_EQ(requests[0].target_offset, split_descriptor.offset);
+
+    slices = {
+        {reinterpret_cast<void*>(static_cast<uintptr_t>(0x30000)), 4096},
+        {reinterpret_cast<void*>(static_cast<uintptr_t>(0x31000)), 4096},
+    };
+    ASSERT_TRUE(TransferSubmitter::buildGdsSsdTransferRequests(
+        descriptor, slices, TransferRequest::WRITE, requests));
+    EXPECT_EQ(requests.size(), 2u);
 }
 
 TEST_F(TransferTaskTest, RejectsInvalidGdsSsdTransferRequests) {
@@ -234,6 +258,11 @@ TEST_F(TransferTaskTest, RejectsInvalidGdsSsdTransferRequests) {
         descriptor,
         {{reinterpret_cast<void*>(static_cast<uintptr_t>(0x10001)), 4096},
          second},
+        TransferRequest::WRITE, requests));
+    EXPECT_FALSE(TransferSubmitter::buildGdsSsdTransferRequests(
+        descriptor,
+        {{first.ptr, 4080},
+         {reinterpret_cast<void*>(static_cast<uintptr_t>(0x12000)), 4112}},
         TransferRequest::WRITE, requests));
 
     GdsSsdDescriptor overlap_descriptor = descriptor;
