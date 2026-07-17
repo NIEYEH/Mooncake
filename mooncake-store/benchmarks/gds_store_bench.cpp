@@ -77,7 +77,8 @@ DEFINE_bool(verify_reads, false,
             "Copy successful reads to host and verify the per-key byte pattern");
 DEFINE_bool(cleanup_after_run, false,
             "Remove objects created or consumed by this run");
-DEFINE_bool(cleanup_force, false, "Use force=true for object removal");
+DEFINE_bool(cleanup_force, true,
+            "Use force=true for object removal; benchmark keys are isolated");
 DEFINE_int32(cleanup_batch_size, 128, "Keys per BatchRemove call");
 DEFINE_string(allow_destructive_gds, "",
               "Must be YES for any workload that writes GDS replicas");
@@ -86,6 +87,7 @@ DEFINE_string(csv_path, "", "Append the measured phase result to this CSV file")
 namespace {
 
 using Clock = std::chrono::steady_clock;
+using mooncake::ErrorCode;
 using mooncake::RealClient;
 using mooncake::ReplicateConfig;
 
@@ -576,7 +578,12 @@ bool cleanupRange(const std::shared_ptr<RealClient>& client,
         }
         const auto results = client->batchRemove(keys, FLAGS_cleanup_force);
         for (int code : results) {
-            code == 0 ? ++removed : ++failed;
+            if (code == 0 ||
+                code == static_cast<int>(ErrorCode::OBJECT_NOT_FOUND)) {
+                ++removed;
+            } else {
+                ++failed;
+            }
         }
         if (results.size() != count) failed += count - results.size();
         cursor += count;

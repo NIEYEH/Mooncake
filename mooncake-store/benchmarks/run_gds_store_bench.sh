@@ -13,6 +13,8 @@ GDS_SEGMENT=${GDS_SEGMENT:-gds_pool_0}
 GDS_DEVICE=${GDS_DEVICE:-}
 GPU_ID=${GPU_ID:-0}
 TENANT_ID=${TENANT_ID:-default}
+GLOBAL_SEGMENT_SIZE=${GLOBAL_SEGMENT_SIZE:-67108864}
+LOCAL_BUFFER_SIZE=${LOCAL_BUFFER_SIZE:-0}
 
 # The current mounted path is expected to top out below this value. It is a
 # reporting reference and a capacity guard, not a performance pass threshold.
@@ -152,10 +154,13 @@ COMMON_ARGS=(
   "--master_server=${MASTER_SERVER}"
   "--tenant_id=${TENANT_ID}"
   "--gpu_id=${GPU_ID}"
+  "--global_segment_size=${GLOBAL_SEGMENT_SIZE}"
+  "--local_buffer_size=${LOCAL_BUFFER_SIZE}"
   "--memory_replica_num=0"
   "--nof_replica_num=0"
   "--gds_replica_num=1"
   "--preferred_gds_segments=${GDS_SEGMENT}"
+  "--cleanup_force=true"
 )
 
 CURRENT_CASE=preflight

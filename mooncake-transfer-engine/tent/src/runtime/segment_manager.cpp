@@ -86,17 +86,21 @@ Status SegmentManager::getRemoteCached(SegmentDesc *&desc, SegmentID handle) {
 
         std::string peer_rpc_addr = desc_ref->rpc_server_addr;
         std::string local_rpc_addr = local_desc_->rpc_server_addr;
-        if (!peer_rpc_addr.empty() && !local_rpc_addr.empty()) {
-            // Send a subscription request to enable proactive cache
-            // invalidation. This is a best-effort mechanism to reduce stale
-            // cache hits. Errors are logged and ignored; correctness should not
-            // depend on this.
-            ControlClient::subscribeSegmentUpdateAsync(peer_rpc_addr,
-                                                       local_rpc_addr);
-        } else {
-            LOG(ERROR) << "Unexpected empty RPC address, peer: '"
-                       << peer_rpc_addr << "', local: '" << local_rpc_addr
-                       << "'.";
+        // File and block descriptors are resolved locally and do not have a
+        // peer control service to subscribe to.
+        if (desc_ref->type == SegmentType::Memory) {
+            if (!peer_rpc_addr.empty() && !local_rpc_addr.empty()) {
+                // Send a subscription request to enable proactive cache
+                // invalidation. This is a best-effort mechanism to reduce
+                // stale cache hits. Errors are logged and ignored;
+                // correctness should not depend on this.
+                ControlClient::subscribeSegmentUpdateAsync(peer_rpc_addr,
+                                                           local_rpc_addr);
+            } else {
+                LOG(ERROR) << "Unexpected empty RPC address, peer: '"
+                           << peer_rpc_addr << "', local: '" << local_rpc_addr
+                           << "'.";
+            }
         }
     }
     desc = cache.id_to_desc_map[handle].get();

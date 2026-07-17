@@ -573,6 +573,17 @@ class TransferSubmitter {
         std::vector<std::vector<Slice>>& all_slices,
         TransferRequest::OpCode op_code);
 
+    /**
+     * @brief Submit multiple GDS SSD replicas in one TENT/cuFile batch.
+     *
+     * Store batch APIs use this path so a logical BatchPut/BatchGet does not
+     * create one cuFile batch handle per object.
+     */
+    std::optional<TransferFuture> submitGdsSsdBatch(
+        const std::vector<Replica::Descriptor>& replicas,
+        const std::vector<std::vector<Slice>>& all_slices,
+        TransferRequest::OpCode op_code);
+
     std::optional<TransferFuture> submit_batch_get_offload_object(
         const std::string& transfer_engine_addr,
         const std::vector<std::string>& keys,

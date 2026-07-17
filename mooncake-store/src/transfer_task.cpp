@@ -11,6 +11,7 @@
 #include <limits>
 #include <sstream>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 #include "device/accelerator_registry.h"
@@ -1406,6 +1407,77 @@ std::optional<TransferFuture> TransferSubmitter::submitGdsSsdOperation(
     if (!future.has_value()) {
         observe(false);
     }
+    return future;
+}
+
+std::optional<TransferFuture> TransferSubmitter::submitGdsSsdBatch(
+    const std::vector<Replica::Descriptor>& replicas,
+    const std::vector<std::vector<Slice>>& all_slices,
+    TransferRequest::OpCode op_code) {
+    if (replicas.empty() || replicas.size() != all_slices.size()) {
+        LOG(ERROR) << "Invalid GDS SSD batch: replicas=" << replicas.size()
+                   << ", slice_groups=" << all_slices.size();
+        return std::nullopt;
+    }
+    if (!engine_.isUsingTent()) {
+        LOG(ERROR) << "GDS SSD batch transfer requires the TENT transfer engine";
+        return std::nullopt;
+    }
+
+    const auto start_time = std::chrono::steady_clock::now();
+    const auto metric_operation = op_code == TransferRequest::READ
+                                      ? GdsTransferOperation::kRead
+                                      : GdsTransferOperation::kWrite;
+    std::vector<uint64_t> metric_bytes;
+    metric_bytes.reserve(replicas.size());
+
+    std::unordered_map<std::string, SegmentHandle> opened_segments;
+    std::vector<TransferRequest> requests;
+    for (size_t i = 0; i < replicas.size(); ++i) {
+        if (!replicas[i].is_gds_ssd_replica()) {
+            LOG(ERROR) << "Non-GDS replica in GDS SSD batch at index " << i;
+            return std::nullopt;
+        }
+
+        const auto& descriptor = replicas[i].get_gds_ssd_descriptor();
+        std::vector<TransferRequest> replica_requests;
+        if (!buildGdsSsdTransferRequests(descriptor, all_slices[i], op_code,
+                                         replica_requests)) {
+            return std::nullopt;
+        }
+
+        auto [segment_it, inserted] = opened_segments.try_emplace(
+            descriptor.segment_uri, static_cast<SegmentHandle>(0));
+        if (inserted) {
+            segment_it->second = engine_.openSegment(descriptor.segment_uri);
+            if (segment_it->second ==
+                static_cast<uint64_t>(ERR_INVALID_ARGUMENT)) {
+                LOG(ERROR) << "Failed to open GDS SSD segment uri='"
+                           << descriptor.segment_uri << "'";
+                return std::nullopt;
+            }
+        }
+        for (auto& request : replica_requests) {
+            request.target_id = segment_it->second;
+            requests.emplace_back(std::move(request));
+        }
+        metric_bytes.push_back(descriptor.object_size);
+    }
+
+    auto* const metric = gds_transfer_metric_;
+    auto observe_all = [metric, metric_operation,
+                        metric_bytes = std::move(metric_bytes),
+                        start_time](ErrorCode error_code) {
+        if (!metric) return;
+        const bool success = error_code == ErrorCode::OK;
+        const uint64_t elapsed_us = elapsed_us_since(start_time);
+        for (uint64_t bytes : metric_bytes) {
+            metric->Observe(metric_operation, success, bytes, elapsed_us);
+        }
+    };
+
+    auto future = submitTransfer(requests, observe_all);
+    if (!future.has_value()) observe_all(ErrorCode::TRANSFER_FAIL);
     return future;
 }
 

@@ -564,6 +564,16 @@ Status GdsTransport::getTransferStatus(SubBatchRef batch, int task_id,
                 } else {
                     gds_batch->io_transferred_bytes[param_index] = transferred;
                 }
+            } else if (event_status != PENDING) {
+                LOG(ERROR) << "GDS IO completion failed: io_index="
+                           << param_index << ", cuFile_status="
+                           << static_cast<int>(event.status)
+                           << ", return_value=" << event.ret
+                           << ", file_offset="
+                           << gds_batch->io_params[param_index]
+                                  .u.batch.file_offset
+                           << ", size="
+                           << gds_batch->io_params[param_index].u.batch.size;
             }
             gds_batch->io_statuses[param_index] = event_status;
         }

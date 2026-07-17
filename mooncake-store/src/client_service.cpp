@@ -1388,6 +1388,10 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
     std::vector<std::tuple<size_t, std::string, TransferFuture,
                            Replica::Descriptor, bool>>
         pending_transfers;
+    std::vector<Replica::Descriptor> gds_replicas;
+    std::vector<std::vector<Slice>> gds_slices;
+    std::vector<size_t> gds_result_indices;
+    std::vector<std::string> gds_keys;
     std::vector<tl::expected<void, ErrorCode>> results(object_keys.size());
     // Record batch get transfer latency (Submit + Wait)
     auto t0_batch_get = std::chrono::steady_clock::now();
@@ -1427,6 +1431,14 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
             }
         }
 
+        if (replica.is_gds_ssd_replica()) {
+            gds_replicas.emplace_back(replica);
+            gds_slices.emplace_back(slices_it->second);
+            gds_result_indices.emplace_back(i);
+            gds_keys.emplace_back(key);
+            continue;
+        }
+
         // Submit transfer operation asynchronously
         std::optional<TransferFuture> future;
         if (replica.is_nof_replica()) {
@@ -1459,6 +1471,31 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
 
         pending_transfers.emplace_back(i, key, std::move(*future), replica,
                                        cache_used);
+    }
+
+    if (!gds_replicas.empty()) {
+        auto future = transfer_submitter_->submitGdsSsdBatch(
+            gds_replicas, gds_slices, TransferRequest::READ);
+        ErrorCode batch_result = ErrorCode::TRANSFER_FAIL;
+        if (future.has_value()) batch_result = future->get();
+
+        for (size_t i = 0; i < gds_result_indices.size(); ++i) {
+            const size_t index = gds_result_indices[i];
+            const auto& key = gds_keys[i];
+            if (batch_result != ErrorCode::OK) {
+                LOG(ERROR) << "Batched GDS transfer failed for key: " << key
+                           << " with error: "
+                           << static_cast<int>(batch_result);
+                results[index] = tl::unexpected(batch_result);
+                continue;
+            }
+
+            results[index] = {};
+            VLOG(1) << "Batched GDS transfer completed for key: " << key;
+            if (hot_cache_ && ShouldAdmitToHotCache(key, false)) {
+                ProcessSlicesAsync(key, gds_slices[i], gds_replicas[i]);
+            }
+        }
     }
 
     // Wait for all transfers to complete
@@ -2036,7 +2073,12 @@ void Client::SubmitTransfers(std::vector<PutOperation>& ops) {
         return;
     }
 
-    for (auto& op : ops) {
+    std::vector<Replica::Descriptor> gds_replicas;
+    std::vector<std::vector<Slice>> gds_slices;
+    std::vector<size_t> gds_op_indices;
+
+    for (size_t op_index = 0; op_index < ops.size(); ++op_index) {
+        auto& op = ops[op_index];
         // Skip operations that already failed in previous stages
         if (op.IsResolved()) {
             continue;
@@ -2067,13 +2109,16 @@ void Client::SubmitTransfers(std::vector<PutOperation>& ops) {
         for (size_t replica_idx = 0; replica_idx < op.replicas.size();
              ++replica_idx) {
             const auto& replica = op.replicas[replica_idx];
-            if (replica.is_memory_replica() || replica.is_nof_replica() ||
-                replica.is_gds_ssd_replica()) {
+            if (replica.is_gds_ssd_replica()) {
+                gds_replicas.emplace_back(replica);
+                gds_slices.emplace_back(op.slices);
+                gds_op_indices.emplace_back(op_index);
+                continue;
+            }
+            if (replica.is_memory_replica() || replica.is_nof_replica()) {
                 const auto replica_type = replica.is_memory_replica()
                                               ? ReplicaType::MEMORY
-                                              : (replica.is_nof_replica()
-                                                     ? ReplicaType::NOF_SSD
-                                                     : ReplicaType::GDS_SSD);
+                                              : ReplicaType::NOF_SSD;
                 std::optional<TransferFuture> submit_result;
                 if (replica.is_nof_replica()) {
                     auto contiguous_range = GetContiguousSliceRange(op.slices);
@@ -2112,6 +2157,27 @@ void Client::SubmitTransfers(std::vector<PutOperation>& ops) {
 
         VLOG(1) << "Submitted " << op.pending_transfers.size()
                 << " transfers for key " << op.key;
+    }
+
+    if (gds_replicas.empty()) return;
+
+    auto gds_future = transfer_submitter_->submitGdsSsdBatch(
+        gds_replicas, gds_slices, TransferRequest::WRITE);
+    ErrorCode gds_result = ErrorCode::TRANSFER_FAIL;
+    if (gds_future.has_value()) {
+        gds_result = gds_future->get();
+    }
+
+    for (size_t i = 0; i < gds_op_indices.size(); ++i) {
+        auto& op = ops[gds_op_indices[i]];
+        if (gds_result == ErrorCode::OK) {
+            op.transfer_summary.RecordSuccess(ReplicaType::GDS_SSD);
+        } else {
+            op.transfer_summary.RecordFailure(ReplicaType::GDS_SSD,
+                                              gds_result);
+            op.AppendFailureContext("Batched GDS transfer failed for replica " +
+                                    std::to_string(i));
+        }
     }
 }
 
