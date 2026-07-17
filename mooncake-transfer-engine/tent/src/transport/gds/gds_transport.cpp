@@ -97,7 +97,8 @@ TransferStatusEnum parseTransferStatus(CUfileStatus_t status) {
     }
 }
 
-GdsTransport::GdsTransport() : installed_(false) {
+GdsTransport::GdsTransport()
+    : installed_(false), io_batch_depth_(0), max_io_size_(1ull << 20) {
     static std::once_flag g_once_flag;
     auto fork_init = []() { cuFileDriverOpen(); };
     std::call_once(g_once_flag, fork_init);
@@ -124,6 +125,20 @@ Status GdsTransport::install(std::string& local_segment_name,
         return Status::InvalidArgument(
             "GDS io_batch_depth must be greater than zero" LOC_MARK);
     io_batch_depth_ = static_cast<size_t>(configured_batch_depth);
+
+    CUfileDrvProps_t properties{};
+    auto properties_result = cuFileDriverGetProperties(&properties);
+    if (properties_result.err == CU_FILE_SUCCESS &&
+        properties.nvfs.max_direct_io_size != 0 &&
+        properties.nvfs.max_direct_io_size <=
+            std::numeric_limits<size_t>::max() / 1024) {
+        max_io_size_ = properties.nvfs.max_direct_io_size * 1024;
+    } else {
+        LOG(WARNING) << "Unable to query cuFile max_direct_io_size; using "
+                     << max_io_size_ << " bytes";
+    }
+    LOG(INFO) << "GDS transport limits: batch_depth=" << io_batch_depth_
+              << ", max_io_size=" << max_io_size_;
     installed_ = true;
     caps.dram_to_file = true;
     caps.gpu_to_file = true;
@@ -408,7 +423,6 @@ Status GdsTransport::validateRequest(const Request& request) {
 
 Status GdsTransport::submitTransferTasks(
     SubBatchRef batch, const std::vector<Request>& request_list) {
-    const static size_t kMaxSliceSize = 16ull << 20;
     auto gds_batch = dynamic_cast<GdsSubBatch*>(batch);
     if (!gds_batch)
         return Status::InvalidArgument("Invalid GDS sub-batch" LOC_MARK);
@@ -425,11 +439,7 @@ Status GdsTransport::submitTransferTasks(
     size_t num_params = 0;
     size_t first_param_index = gds_batch->io_params.size();
     std::vector<GdsFileContext*> contexts;
-    std::vector<void*> registered_bases;
-    std::vector<size_t> registered_offsets;
     contexts.reserve(request_list.size());
-    registered_bases.reserve(request_list.size());
-    registered_offsets.reserve(request_list.size());
     for (const auto& request : request_list) {
         auto status = validateRequest(request);
         if (!status.ok()) {
@@ -443,7 +453,7 @@ Status GdsTransport::submitTransferTasks(
         }
 
         const size_t request_params =
-            1 + (request.length - 1) / kMaxSliceSize;
+            1 + (request.length - 1) / max_io_size_;
         if (request_params > std::numeric_limits<size_t>::max() - num_params)
             return Status::TooManyRequests(
                 "GDS request count overflows" LOC_MARK);
@@ -453,17 +463,19 @@ Status GdsTransport::submitTransferTasks(
         if (!context || !context->ready())
             return Status::InvalidArgument("Invalid remote segment" LOC_MARK);
         contexts.push_back(context);
-
-        void* registered_base = nullptr;
-        size_t registered_offset = 0;
-        CHECK_STATUS(
-            resolveIoBuffer(request, registered_base, registered_offset));
-        registered_bases.push_back(registered_base);
-        registered_offsets.push_back(registered_offset);
     }
     if (first_param_index > io_batch_depth_ ||
-        num_params > io_batch_depth_ - first_param_index)
+        num_params > io_batch_depth_ - first_param_index) {
+        LOG(ERROR) << "GDS batch requires " << num_params
+                   << " IO entries but only "
+                   << (first_param_index > io_batch_depth_
+                           ? 0
+                           : io_batch_depth_ - first_param_index)
+                   << " are available; logical_requests="
+                   << request_list.size() << ", max_io_size="
+                   << max_io_size_;
         return Status::TooManyRequests("Exceed batch capacity" LOC_MARK);
+    }
 
     const size_t first_range_index = gds_batch->io_param_ranges.size();
     for (size_t request_index = 0; request_index < request_list.size();
@@ -472,8 +484,8 @@ Status GdsTransport::submitTransferTasks(
         GdsFileContext* context = contexts[request_index];
         IOParamRange range{gds_batch->io_params.size(), 0};
         for (size_t offset = 0; offset < request.length;
-             offset += kMaxSliceSize) {
-            size_t length = std::min(kMaxSliceSize, request.length - offset);
+             offset += max_io_size_) {
+            size_t length = std::min(max_io_size_, request.length - offset);
             const size_t param_index = gds_batch->io_params.size();
             CUfileIOParams_t params{};
             params.mode = CUFILE_BATCH;
@@ -481,9 +493,9 @@ Status GdsTransport::submitTransferTasks(
                 (request.opcode == Request::READ) ? CUFILE_READ : CUFILE_WRITE;
             params.cookie = reinterpret_cast<void*>(
                 static_cast<std::uintptr_t>(param_index + 1));
-            params.u.batch.devPtr_base = registered_bases[request_index];
-            params.u.batch.devPtr_offset =
-                registered_offsets[request_index] + offset;
+            params.u.batch.devPtr_base =
+                static_cast<char*>(request.source) + offset;
+            params.u.batch.devPtr_offset = 0;
             params.u.batch.file_offset = request.target_offset + offset;
             params.u.batch.size = length;
             params.fh = context->getHandle();

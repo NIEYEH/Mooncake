@@ -117,6 +117,7 @@ class GdsTransport : public Transport {
         std::unordered_map<SegmentID, std::shared_ptr<GdsFileContext>>;
     FileContextMap file_context_map_;
     size_t io_batch_depth_;
+    size_t max_io_size_;
 
     // Object pool for BatchHandle to avoid frequent cuFileBatchIOSetUp/Destroy
     // CUfileBatchHandle_t is reusable per cuFile API documentation

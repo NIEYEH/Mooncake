@@ -191,55 +191,76 @@ uint8_t patternForId(uint64_t id) {
 class RegisteredGpuBuffer {
    public:
     RegisteredGpuBuffer(std::shared_ptr<RealClient> client, int gpu_id,
-                        size_t bytes)
-        : client_(std::move(client)), gpu_id_(gpu_id), bytes_(bytes) {
+                        size_t slot_size, size_t slot_count)
+        : client_(std::move(client)),
+          gpu_id_(gpu_id),
+          slot_size_(slot_size) {
         checkCuda(cudaSetDevice(gpu_id_), "cudaSetDevice");
-        checkCuda(cudaMalloc(&data_, bytes_), "cudaMalloc");
-        checkCuda(cudaMemset(data_, 0x5a, bytes_), "cudaMemset");
-        checkCuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize");
-        if (reinterpret_cast<uintptr_t>(data_) % kGdsAlignment != 0) {
-            cudaFree(data_);
-            data_ = nullptr;
-            throw std::runtime_error("cudaMalloc returned a non-4096-aligned pointer");
+        slots_.reserve(slot_count);
+        try {
+            for (size_t i = 0; i < slot_count; ++i) {
+                void* slot_ptr = nullptr;
+                checkCuda(cudaMalloc(&slot_ptr, slot_size_), "cudaMalloc");
+                slots_.push_back(slot_ptr);
+                if (reinterpret_cast<uintptr_t>(slot_ptr) % kGdsAlignment !=
+                    0) {
+                    throw std::runtime_error(
+                        "cudaMalloc returned a non-4096-aligned pointer");
+                }
+                checkCuda(cudaMemset(slot_ptr, 0x5a, slot_size_),
+                          "cudaMemset");
+                const int rc = client_->register_buffer(slot_ptr, slot_size_);
+                if (rc != 0) {
+                    throw std::runtime_error(
+                        "Store register_buffer failed: " +
+                        std::to_string(rc));
+                }
+                ++registered_count_;
+            }
+            checkCuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize");
+        } catch (...) {
+            release();
+            throw;
         }
-        const int rc = client_->register_buffer(data_, bytes_);
-        if (rc != 0) {
-            cudaFree(data_);
-            data_ = nullptr;
-            throw std::runtime_error("Store register_buffer failed: " +
-                                     std::to_string(rc));
-        }
-        registered_ = true;
     }
 
     RegisteredGpuBuffer(const RegisteredGpuBuffer&) = delete;
     RegisteredGpuBuffer& operator=(const RegisteredGpuBuffer&) = delete;
 
-    ~RegisteredGpuBuffer() {
-        if (data_ == nullptr) return;
+    ~RegisteredGpuBuffer() { release(); }
+
+    void* slot(size_t index, size_t value_size) const {
+        if (value_size != slot_size_ || index >= slots_.size()) {
+            throw std::out_of_range("invalid registered GPU buffer slot");
+        }
+        return slots_[index];
+    }
+
+   private:
+    void release() noexcept {
+        if (slots_.empty()) return;
         cudaSetDevice(gpu_id_);
-        if (registered_) {
-            const int rc = client_->unregister_buffer(data_);
+        for (size_t i = 0; i < registered_count_; ++i) {
+            const int rc = client_->unregister_buffer(slots_[i]);
             if (rc != 0) {
                 LOG(ERROR) << "unregister_buffer failed: " << rc;
             }
         }
-        const auto rc = cudaFree(data_);
-        if (rc != cudaSuccess) {
-            LOG(ERROR) << "cudaFree failed: " << cudaGetErrorString(rc);
+        registered_count_ = 0;
+        for (void* slot_ptr : slots_) {
+            const auto rc = cudaFree(slot_ptr);
+            if (rc != cudaSuccess) {
+                LOG(ERROR) << "cudaFree failed: " << cudaGetErrorString(rc);
+            }
         }
+        slots_.clear();
     }
 
-    void* slot(size_t index, size_t value_size) const {
-        return static_cast<char*>(data_) + index * value_size;
-    }
-
-   private:
     std::shared_ptr<RealClient> client_;
     int gpu_id_;
-    size_t bytes_;
-    void* data_{nullptr};
-    bool registered_{false};
+    size_t slot_size_;
+    std::vector<void*> slots_;
+    size_t registered_count_{0};
 };
 
 ReplicateConfig makeReplicateConfig() {
@@ -725,13 +746,12 @@ int main(int argc, char** argv) {
                             ? 0
                             : 2;
         } else {
-            const size_t gpu_bytes = static_cast<size_t>(
-                FLAGS_value_size * static_cast<uint64_t>(FLAGS_batch_size));
             std::vector<std::unique_ptr<RegisteredGpuBuffer>> buffers;
             buffers.reserve(FLAGS_threads);
             for (int i = 0; i < FLAGS_threads; ++i) {
                 buffers.push_back(std::make_unique<RegisteredGpuBuffer>(
-                    client, FLAGS_gpu_id, gpu_bytes));
+                    client, FLAGS_gpu_id, static_cast<size_t>(FLAGS_value_size),
+                    static_cast<size_t>(FLAGS_batch_size)));
             }
             const ReplicateConfig replicate_config = makeReplicateConfig();
 
