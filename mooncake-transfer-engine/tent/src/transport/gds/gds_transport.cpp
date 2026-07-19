@@ -407,10 +407,8 @@ Status GdsTransport::validateRequest(const Request& request) {
                         "GDS request is outside the block segment" LOC_MARK);
 
                 const uint64_t alignment = detail.allocation_alignment;
-                const auto source =
-                    reinterpret_cast<std::uintptr_t>(request.source);
                 if (alignment == 0 || request.target_offset % alignment != 0 ||
-                    request.length % alignment != 0 || source % alignment != 0)
+                    request.length % alignment != 0)
                     return Status::InvalidArgument(
                         "GDS block request is not allocation-aligned" LOC_MARK);
                 return Status::OK();
@@ -482,6 +480,10 @@ Status GdsTransport::submitTransferTasks(
          ++request_index) {
         const auto& request = request_list[request_index];
         GdsFileContext* context = contexts[request_index];
+        void* io_base = nullptr;
+        size_t io_offset = 0;
+        auto io_buffer_status = resolveIoBuffer(request, io_base, io_offset);
+        if (!io_buffer_status.ok()) return io_buffer_status;
         IOParamRange range{gds_batch->io_params.size(), 0};
         for (size_t offset = 0; offset < request.length;
              offset += max_io_size_) {
@@ -493,9 +495,9 @@ Status GdsTransport::submitTransferTasks(
                 (request.opcode == Request::READ) ? CUFILE_READ : CUFILE_WRITE;
             params.cookie = reinterpret_cast<void*>(
                 static_cast<std::uintptr_t>(param_index + 1));
-            params.u.batch.devPtr_base =
-                static_cast<char*>(request.source) + offset;
-            params.u.batch.devPtr_offset = 0;
+            params.u.batch.devPtr_base = io_base;
+            params.u.batch.devPtr_offset =
+                static_cast<off_t>(io_offset + offset);
             params.u.batch.file_offset = request.target_offset + offset;
             params.u.batch.size = length;
             params.fh = context->getHandle();

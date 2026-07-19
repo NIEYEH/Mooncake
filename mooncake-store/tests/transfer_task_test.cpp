@@ -205,6 +205,19 @@ TEST_F(TransferTaskTest, BuildGdsSsdTransferRequests) {
         descriptor, slices, TransferRequest::READ, requests));
     EXPECT_EQ(requests[0].opcode, TransferRequest::READ);
 
+    // KV-cache blocks can begin at a non-4 KiB offset inside a larger
+    // cuFile-registered allocation. TENT resolves the registered base and
+    // passes this delta through CUfileIOParams_t::devPtr_offset.
+    slices = {
+        {reinterpret_cast<void*>(static_cast<uintptr_t>(0x10800)), 4096},
+        {reinterpret_cast<void*>(static_cast<uintptr_t>(0x12800)), 4096},
+    };
+    ASSERT_TRUE(TransferSubmitter::buildGdsSsdTransferRequests(
+        descriptor, slices, TransferRequest::WRITE, requests));
+    ASSERT_EQ(requests.size(), 2u);
+    EXPECT_EQ(requests[0].source, slices[0].ptr);
+    EXPECT_EQ(requests[1].source, slices[1].ptr);
+
     // RealClient splits at kMaxSliceSize (16 MiB - 16). Adjacent pieces must
     // be coalesced before applying GDS alignment requirements.
     GdsSsdDescriptor split_descriptor = descriptor;
@@ -254,11 +267,6 @@ TEST_F(TransferTaskTest, RejectsInvalidGdsSsdTransferRequests) {
         requests));
     EXPECT_FALSE(TransferSubmitter::buildGdsSsdTransferRequests(
         descriptor, {first}, TransferRequest::WRITE, requests));
-    EXPECT_FALSE(TransferSubmitter::buildGdsSsdTransferRequests(
-        descriptor,
-        {{reinterpret_cast<void*>(static_cast<uintptr_t>(0x10001)), 4096},
-         second},
-        TransferRequest::WRITE, requests));
     EXPECT_FALSE(TransferSubmitter::buildGdsSsdTransferRequests(
         descriptor,
         {{first.ptr, 4080},

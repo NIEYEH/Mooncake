@@ -1585,9 +1585,8 @@ bool TransferSubmitter::buildGdsSsdTransferRequests(
                 requests.clear();
                 return false;
             }
-            const bool previous_needs_coalescing =
-                !IsAligned(previous_address, alignment) ||
-                !IsAligned(static_cast<uint64_t>(previous.size), alignment);
+            const bool previous_needs_coalescing = !IsAligned(
+                static_cast<uint64_t>(previous.size), alignment);
             if (previous_end == source_address &&
                 previous_needs_coalescing) {
                 if (slice.size >
@@ -1615,14 +1614,12 @@ bool TransferSubmitter::buildGdsSsdTransferRequests(
     requests.reserve(coalesced_slices.size());
     uint64_t logical_offset = 0;
     for (const auto& slice : coalesced_slices) {
-        const auto source_address = static_cast<uint64_t>(
-            reinterpret_cast<std::uintptr_t>(slice.ptr));
-        if (!IsAligned(source_address, alignment) ||
-            !IsAligned(static_cast<uint64_t>(slice.size), alignment)) {
-            LOG(ERROR) << "Unaligned GDS SSD coalesced slice: segment_name="
-                       << descriptor.segment_name << ", ptr=" << slice.ptr
-                       << ", slice_size=" << slice.size
-                       << ", alignment=" << alignment;
+        if (!IsAligned(static_cast<uint64_t>(slice.size), alignment)) {
+            LOG(ERROR)
+                << "Unaligned GDS SSD coalesced slice length: segment_name="
+                << descriptor.segment_name << ", ptr=" << slice.ptr
+                << ", slice_size=" << slice.size
+                << ", alignment=" << alignment;
             requests.clear();
             return false;
         }
