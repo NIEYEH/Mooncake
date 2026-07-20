@@ -247,6 +247,8 @@ class TransferEngineImpl {
 
     Status retireQueueForBatch(Batch* batch);
 
+    void updateRuntimeQueueMetrics();
+
     Status pollTaskStatus(Batch* batch, size_t task_id,
                           TransferStatus& task_status);
 

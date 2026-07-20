@@ -19,6 +19,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -479,10 +480,21 @@ Status GdsTransport::submitNextIoBatch(GdsSubBatch* batch) {
             continue;
         }
 
+        const auto submit_start = std::chrono::steady_clock::now();
         auto result = cuFileBatchIOSubmit(
             it->batch_handle->handle, static_cast<unsigned>(it->param_count),
             it->params.data(), 0);
         if (result.err == CU_FILE_SUCCESS) {
+            const double submit_seconds =
+                std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                              submit_start)
+                    .count();
+            size_t physical_bytes = 0;
+            for (const auto& param : it->params) {
+                physical_bytes += param.u.batch.size;
+            }
+            TentMetrics::instance().recordGdsPhysicalBatch(
+                it->param_count, physical_bytes, submit_seconds);
             it->state = GdsIoBatch::State::SUBMITTED;
             auto restore_status = device_guard.restore();
             if (!restore_status.ok()) LOG(ERROR) << restore_status.ToString();

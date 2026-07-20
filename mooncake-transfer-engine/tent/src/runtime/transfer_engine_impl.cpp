@@ -1401,6 +1401,20 @@ Status TransferEngineImpl::prepareSubmit(
         }
         prepared.tasks.push_back({merged_task_index, task_id});
     }
+
+    size_t gds_input_requests = 0;
+    size_t gds_merged_requests = 0;
+    size_t gds_bytes = 0;
+    for (const auto& owner : prepared.owners) {
+        if (owner.route.transport != GDS) continue;
+        ++gds_merged_requests;
+        gds_input_requests += 1 + owner.derived_task_ids.size();
+        gds_bytes += owner.request.length;
+    }
+    if (gds_input_requests > 0) {
+        TentMetrics::instance().recordGdsCoalescing(
+            gds_input_requests, gds_merged_requests, gds_bytes);
+    }
     return Status::OK();
 }
 
@@ -1575,7 +1589,28 @@ Status TransferEngineImpl::enqueuePreparedSubmit(Batch* batch,
             prepared.owners[i].derived_task_ids.end());
         queued_owners_.emplace(admitted_owner_ids[i], queued);
     }
+    updateRuntimeQueueMetrics();
     return Status::OK();
+}
+
+void TransferEngineImpl::updateRuntimeQueueMetrics() {
+    if (!runtime_queue_config_.enabled || !runtime_queue_) {
+        TentMetrics::instance().updateRuntimeQueue(0, 0, 0, 0);
+        return;
+    }
+    const size_t outstanding_owners = runtime_queue_->outstandingOwners();
+    const size_t outstanding_bytes = runtime_queue_->outstandingBytes();
+    const size_t queued_owners =
+        outstanding_owners >= dispatch_inflight_owners_
+            ? outstanding_owners - dispatch_inflight_owners_
+            : 0;
+    const size_t queued_bytes =
+        outstanding_bytes >= dispatch_inflight_bytes_
+            ? outstanding_bytes - dispatch_inflight_bytes_
+            : 0;
+    TentMetrics::instance().updateRuntimeQueue(
+        queued_owners, queued_bytes, dispatch_inflight_owners_,
+        dispatch_inflight_bytes_);
 }
 
 Status TransferEngineImpl::finishQueuedOwner(
@@ -1602,6 +1637,7 @@ Status TransferEngineImpl::finishQueuedOwner(
         queued.batch->task_list[task_id].status = terminal_status;
     }
     queued_owners_.erase(queued_it);
+    updateRuntimeQueueMetrics();
     return Status::OK();
 }
 
@@ -1623,6 +1659,7 @@ Status TransferEngineImpl::markQueuedOwnerSubmitted(QueueOwnerId owner_id) {
         queued.in_dispatch_window = true;
         ++dispatch_inflight_owners_;
         dispatch_inflight_bytes_ += queued.byte_charge;
+        updateRuntimeQueueMetrics();
     }
     return Status::OK();
 }

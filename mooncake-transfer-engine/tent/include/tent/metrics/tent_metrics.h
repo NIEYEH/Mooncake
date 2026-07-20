@@ -83,6 +83,12 @@ class TentMetrics {
     void recordGdsHandleRegistrationFailed();
     void recordGdsBufferRegistrationFailed();
     void recordGdsBatchSubmitFailed();
+    void recordGdsCoalescing(size_t input_requests, size_t merged_requests,
+                             size_t bytes);
+    void recordGdsPhysicalBatch(size_t io_count, size_t bytes,
+                                double submit_latency_seconds);
+    void updateRuntimeQueue(size_t queued_owners, size_t queued_bytes,
+                            size_t inflight_owners, size_t inflight_bytes);
 
     // Record the deadline feasibility ratio (MLU) for a completed transfer
     // that carried a deadline. mlu = actual_transfer_seconds / window_seconds,
@@ -125,6 +131,7 @@ class TentMetrics {
 
     // Counters - stored as pointers for unified management
     std::vector<ylt::metric::counter_t*> counters_;
+    std::vector<ylt::metric::gauge_t*> gauges_;
     ylt::metric::counter_t read_bytes_total_{"tent_read_bytes_total",
                                              "Total bytes read via TENT"};
     ylt::metric::counter_t write_bytes_total_{"tent_write_bytes_total",
@@ -149,6 +156,29 @@ class TentMetrics {
     ylt::metric::counter_t gds_batch_submit_failures_total_{
         "tent_gds_batch_submit_failures_total",
         "Total cuFile batch submission failures"};
+    ylt::metric::counter_t gds_input_requests_total_{
+        "tent_gds_input_requests_total",
+        "GDS requests before contiguous request coalescing"};
+    ylt::metric::counter_t gds_merged_requests_total_{
+        "tent_gds_merged_requests_total",
+        "GDS requests after contiguous request coalescing"};
+    ylt::metric::counter_t gds_logical_bytes_total_{
+        "tent_gds_logical_bytes_total", "Logical GDS bytes submitted"};
+    ylt::metric::counter_t gds_physical_ios_total_{
+        "tent_gds_physical_ios_total", "Physical cuFile IO operations"};
+    ylt::metric::counter_t gds_physical_bytes_total_{
+        "tent_gds_physical_bytes_total", "Physical cuFile IO bytes"};
+    ylt::metric::counter_t gds_physical_batches_total_{
+        "tent_gds_physical_batches_total", "Submitted cuFile batches"};
+
+    ylt::metric::gauge_t runtime_queue_owners_{
+        "tent_runtime_queue_owners", "Owners waiting in the runtime queue"};
+    ylt::metric::gauge_t runtime_queue_bytes_{
+        "tent_runtime_queue_bytes", "Bytes waiting in the runtime queue"};
+    ylt::metric::gauge_t runtime_inflight_owners_{
+        "tent_runtime_inflight_owners", "Owners in the dispatch window"};
+    ylt::metric::gauge_t runtime_inflight_bytes_{
+        "tent_runtime_inflight_bytes", "Bytes in the dispatch window"};
 
     // Histograms - stored as pointers for unified management
     std::vector<ylt::metric::histogram_t*> histograms_;
@@ -166,6 +196,9 @@ class TentMetrics {
     ylt::metric::histogram_t write_latency_{
         "tent_write_latency_us", "Write latency distribution in microseconds",
         kLatencyBuckets};
+    ylt::metric::histogram_t gds_batch_submit_latency_{
+        "tent_gds_batch_submit_latency_us",
+        "cuFile batch submission latency in microseconds", kLatencyBuckets};
     // Size histograms for request size distribution (in bytes)
     // Default buckets: 1KB, 4KB, 16KB, 64KB, 256KB, 1MB, 4MB, 16MB, 64MB,
     // 256MB, 1GB

@@ -163,6 +163,7 @@ void TentMetrics::shutdown() {
 
     // Clear metric vectors
     counters_.clear();
+    gauges_.clear();
     histograms_.clear();
     histogram_boundaries_.clear();
 
@@ -172,9 +173,10 @@ void TentMetrics::shutdown() {
 
 void TentMetrics::registerMetrics() {
     // Pre-allocate vectors to avoid reallocation
-    counters_.reserve(10);
-    histograms_.reserve(5);
-    histogram_boundaries_.reserve(5);
+    counters_.reserve(16);
+    gauges_.reserve(4);
+    histograms_.reserve(6);
+    histogram_boundaries_.reserve(6);
 
     // Register all counters - add new counters here
     counters_ = {
@@ -183,17 +185,26 @@ void TentMetrics::registerMetrics() {
         &failover_total_, &gds_handle_registration_failures_total_,
         &gds_buffer_registration_failures_total_,
         &gds_batch_submit_failures_total_,
+        &gds_input_requests_total_, &gds_merged_requests_total_,
+        &gds_logical_bytes_total_, &gds_physical_ios_total_,
+        &gds_physical_bytes_total_, &gds_physical_batches_total_,
     };
+
+    gauges_ = {
+        &runtime_queue_owners_, &runtime_queue_bytes_,
+        &runtime_inflight_owners_, &runtime_inflight_bytes_,
+    };
+    for (auto* gauge : gauges_) gauge->update(0);
 
     // Register all histograms - add new histograms here
     // Note: histogram_boundaries_ must match the order of histograms_
     histograms_ = {
         &read_latency_, &write_latency_, &read_size_,
-        &write_size_,   &deadline_mlu_,
+        &write_size_, &deadline_mlu_, &gds_batch_submit_latency_,
     };
     histogram_boundaries_ = {
         kLatencyBuckets, kLatencyBuckets,     kSizeBuckets,
-        kSizeBuckets,    kMluPerMilleBuckets,
+        kSizeBuckets, kMluPerMilleBuckets, kLatencyBuckets,
     };
 }
 
@@ -279,6 +290,40 @@ void TentMetrics::recordGdsBatchSubmitFailed() {
     gds_batch_submit_failures_total_.inc();
 }
 
+void TentMetrics::recordGdsCoalescing(size_t input_requests,
+                                      size_t merged_requests, size_t bytes) {
+    if (!initialized_ || !runtime_enabled_.load(std::memory_order_relaxed))
+        return;
+    gds_input_requests_total_.inc(static_cast<int64_t>(input_requests));
+    gds_merged_requests_total_.inc(static_cast<int64_t>(merged_requests));
+    gds_logical_bytes_total_.inc(static_cast<int64_t>(bytes));
+}
+
+void TentMetrics::recordGdsPhysicalBatch(size_t io_count, size_t bytes,
+                                         double submit_latency_seconds) {
+    if (!initialized_ || !runtime_enabled_.load(std::memory_order_relaxed))
+        return;
+    gds_physical_ios_total_.inc(static_cast<int64_t>(io_count));
+    gds_physical_bytes_total_.inc(static_cast<int64_t>(bytes));
+    gds_physical_batches_total_.inc();
+    if (submit_latency_seconds > 0.0) {
+        gds_batch_submit_latency_.observe(static_cast<int64_t>(
+            submit_latency_seconds * 1000000.0));
+    }
+}
+
+void TentMetrics::updateRuntimeQueue(size_t queued_owners,
+                                     size_t queued_bytes,
+                                     size_t inflight_owners,
+                                     size_t inflight_bytes) {
+    if (!initialized_ || !runtime_enabled_.load(std::memory_order_relaxed))
+        return;
+    runtime_queue_owners_.update(static_cast<int64_t>(queued_owners));
+    runtime_queue_bytes_.update(static_cast<int64_t>(queued_bytes));
+    runtime_inflight_owners_.update(static_cast<int64_t>(inflight_owners));
+    runtime_inflight_bytes_.update(static_cast<int64_t>(inflight_bytes));
+}
+
 std::string TentMetrics::getPrometheusMetrics() {
     if (!initialized_) return "";
 
@@ -290,6 +335,10 @@ std::string TentMetrics::getPrometheusMetrics() {
         // Serialize all counters
         for (auto* counter : counters_) {
             counter->serialize(result);
+        }
+
+        for (auto* gauge : gauges_) {
+            gauge->serialize(result);
         }
 
         // Serialize all histograms
@@ -313,6 +362,10 @@ std::string TentMetrics::getJsonMetrics() {
         // Serialize all counters
         for (auto* counter : counters_) {
             root[counter->str_name()] = counter->value();
+        }
+
+        for (auto* gauge : gauges_) {
+            root[gauge->str_name()] = gauge->value();
         }
 
         // Serialize all histograms
@@ -412,6 +465,9 @@ void TentMetrics::recordTransportFailover() {}
 void TentMetrics::recordGdsHandleRegistrationFailed() {}
 void TentMetrics::recordGdsBufferRegistrationFailed() {}
 void TentMetrics::recordGdsBatchSubmitFailed() {}
+void TentMetrics::recordGdsCoalescing(size_t, size_t, size_t) {}
+void TentMetrics::recordGdsPhysicalBatch(size_t, size_t, double) {}
+void TentMetrics::updateRuntimeQueue(size_t, size_t, size_t, size_t) {}
 void TentMetrics::recordDeadlineMLU(double) {}
 
 std::string TentMetrics::getPrometheusMetrics() {
