@@ -1205,7 +1205,7 @@ std::optional<TransferFuture> TransferSubmitter::submitTransfer(
     Status s = engine_.submitTransfer(batch_id, requests);
     if (!s.ok()) {
         LOG(ERROR) << "Failed to submit all transfers, error code is "
-                   << s.code();
+                   << s.code() << ", detail=" << s.message();
         // Note: batch_id will be freed by TransferEngineOperationState
         // destructor if we create the state object, otherwise we need to free
         // it here
