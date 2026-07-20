@@ -50,9 +50,16 @@ struct BatchHandle {
     int device_id;  // CUDA device whose context created this handle
 };
 
+struct GdsIoBatch {
+    BatchHandle* batch_handle;
+    size_t param_base;
+    size_t param_count;
+    std::vector<CUfileIOParams_t> params;
+};
+
 struct GdsSubBatch : public Transport::SubBatch {
     size_t max_size;
-    BatchHandle* batch_handle;  // Pointer to reusable handle from pool
+    std::vector<GdsIoBatch> io_batches;
     std::vector<IOParamRange> io_param_ranges;
     std::vector<CUfileIOParams_t> io_params;
     std::vector<CUfileIOEvents_t> io_events;
@@ -106,7 +113,9 @@ class GdsTransport : public Transport {
     Status resolveIoBuffer(const Request& request, void*& io_base,
                            size_t& io_offset, int& device_id);
 
-    Status ensureBatchHandle(GdsSubBatch* batch, int device_id);
+    Status acquireBatchHandle(int device_id, BatchHandle*& handle);
+
+    void releaseBatchHandle(BatchHandle* handle);
 
    private:
     bool installed_;

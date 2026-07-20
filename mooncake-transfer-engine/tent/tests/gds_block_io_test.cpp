@@ -141,7 +141,7 @@ std::shared_ptr<Config> makeGdsConfig() {
     config->set("transports/nvlink/enable", false);
     config->set("transports/mnnvl/enable", false);
     config->set("transports/gds/enable", true);
-    config->set("transports/gds/io_batch_depth", 32);
+    config->set("transports/gds/io_batch_depth", 1);
     return config;
 }
 
@@ -153,16 +153,17 @@ std::vector<uint8_t> makePattern(size_t length, uint8_t seed) {
     return pattern;
 }
 
-bool runTransferOnCurrentThread(TransferEngine& engine, const Request& request,
-                                TransferStatus& final_status,
-                                std::string& error) {
-    BatchID batch = engine.allocateBatch(1);
+bool runTransfersOnCurrentThread(TransferEngine& engine,
+                                 const std::vector<Request>& requests,
+                                 TransferStatus& final_status,
+                                 std::string& error) {
+    BatchID batch = engine.allocateBatch(requests.size());
     if (batch == 0) {
         error = "allocateBatch failed";
         return false;
     }
 
-    auto status = engine.submitTransfer(batch, {request});
+    auto status = engine.submitTransfer(batch, requests);
     if (!status.ok()) {
         error = "submitTransfer failed: " + status.ToString();
         (void)engine.freeBatch(batch);
@@ -194,16 +195,22 @@ bool runTransferOnCurrentThread(TransferEngine& engine, const Request& request,
     return false;
 }
 
-bool runTransfer(TransferEngine& engine, const Request& request,
-                 TransferStatus& final_status, std::string& error) {
+bool runTransfers(TransferEngine& engine,
+                  const std::vector<Request>& requests,
+                  TransferStatus& final_status, std::string& error) {
     bool success = false;
     // Exercise the same fresh-worker-thread context used by vLLM batch_put.
     std::thread worker([&] {
-        success = runTransferOnCurrentThread(engine, request, final_status,
-                                             error);
+        success = runTransfersOnCurrentThread(engine, requests, final_status,
+                                              error);
     });
     worker.join();
     return success;
+}
+
+bool runTransfer(TransferEngine& engine, const Request& request,
+                 TransferStatus& final_status, std::string& error) {
+    return runTransfers(engine, {request}, final_status, error);
 }
 
 Request makeRequest(Request::OpCode opcode, void* buffer, SegmentID segment,
@@ -359,11 +366,13 @@ TEST(GdsBlockIoTest, DestructiveWriteReadAtTwoOffsets) {
 
         auto write_request = makeRequest(Request::WRITE, source.get(), segment,
                                          *offset, io_length);
-        ASSERT_TRUE(
-            runTransfer(engine, write_request, transfer_status, error))
+        auto second_write_request = write_request;
+        second_write_request.target_offset = *offset + *length;
+        ASSERT_TRUE(runTransfers(engine, {write_request, second_write_request},
+                                 transfer_status, error))
             << error;
         ASSERT_EQ(transfer_status.s, COMPLETED);
-        ASSERT_EQ(transfer_status.transferred_bytes, io_length);
+        ASSERT_EQ(transfer_status.transferred_bytes, io_length * 2);
 
         ASSERT_EQ(cudaMemcpy(source.get(), second_pattern.data(), io_length,
                              cudaMemcpyHostToDevice),
