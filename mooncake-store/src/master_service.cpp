@@ -4952,8 +4952,10 @@ size_t MasterService::GetKeyCount() const {
     return total;
 }
 
-auto MasterService::Ping(const UUID& client_id)
+auto MasterService::Ping(const UUID& client_id, const std::string& host_id)
     -> tl::expected<PingResponse, ErrorCode> {
+    UpdateClientHostId(client_id, host_id);
+
     ClientStatus client_status;
     {
         std::shared_lock<std::shared_mutex> lock(client_mutex_);

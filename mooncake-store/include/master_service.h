@@ -592,10 +592,13 @@ class MasterService {
      * @brief Heartbeat from client
      * @param client_id The uuid of the client
      * @return PingResponse containing view version and client status
+     * @param host_id Stable host identity used to resolve host-local storage
+     *                descriptors for clients without a mounted memory segment
      * @return ErrorCode::OK on success, ErrorCode::INTERNAL_ERROR if the client
      *         ping queue is full
      */
-    auto Ping(const UUID& client_id) -> tl::expected<PingResponse, ErrorCode>;
+    auto Ping(const UUID& client_id, const std::string& host_id = {})
+        -> tl::expected<PingResponse, ErrorCode>;
 
     /**
      * @brief Get the master service cluster ID to use as subdirectory name

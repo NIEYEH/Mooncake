@@ -974,12 +974,13 @@ MasterClient::GetNoFSegmentsByName(const std::string& segment_name) {
     return result;
 }
 
-tl::expected<PingResponse, ErrorCode> MasterClient::Ping() {
+tl::expected<PingResponse, ErrorCode> MasterClient::Ping(
+    const std::string& host_id) {
     ScopedVLogTimer timer(1, "MasterClient::Ping");
-    timer.LogRequest("client_id=", client_id_);
+    timer.LogRequest("client_id=", client_id_, ", host_id=", host_id);
 
-    auto result =
-        invoke_rpc<&WrappedMasterService::Ping, PingResponse>(client_id_);
+    auto result = invoke_rpc<&WrappedMasterService::Ping, PingResponse>(
+        client_id_, host_id);
     timer.LogResponseExpected(result);
     return result;
 }

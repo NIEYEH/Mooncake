@@ -425,10 +425,12 @@ class MasterClient {
 
     /**
      * @brief Pings master to check its availability
+     * @param host_id Stable host identity for host-local storage access
      * @return tl::expected<PingResponse, ErrorCode>
      * containing view version and client status
      */
-    [[nodiscard]] tl::expected<PingResponse, ErrorCode> Ping();
+    [[nodiscard]] tl::expected<PingResponse, ErrorCode> Ping(
+        const std::string& host_id = {});
 
     /**
      * @brief Mounts a local disk segment into the master.

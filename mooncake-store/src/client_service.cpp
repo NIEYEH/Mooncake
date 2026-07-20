@@ -568,6 +568,10 @@ ErrorCode Client::ConnectToMaster(const std::string& master_server_entry) {
         if (err != ErrorCode::OK) {
             return err;
         }
+        auto ping_result = master_client_.Ping(host_id_);
+        if (!ping_result) {
+            return ping_result.error();
+        }
         direct_master_address_ = master_server_entry;
         {
             std::lock_guard<std::mutex> lock(leader_switch_mutex_);
@@ -598,6 +602,11 @@ ErrorCode Client::SwitchLeader(const ha::MasterView& target_view) {
     if (err != ErrorCode::OK) {
         last_ping_success_.store(false);
         return err;
+    }
+    auto ping_result = master_client_.Ping(host_id_);
+    if (!ping_result) {
+        last_ping_success_.store(false);
+        return ping_result.error();
     }
 
     current_master_view_ = target_view;
@@ -992,6 +1001,8 @@ std::optional<std::shared_ptr<Client>> Client::Create(
     if (err != ErrorCode::OK) {
         LOG(ERROR) << "Failed to initialize local hot cache";
     }
+
+    client->EnsureStorageControlPlaneStarted();
 
     return client;
 }
@@ -3874,7 +3885,7 @@ void Client::StorageHeartbeatThreadMain() {
         }
 
         // Ping master
-        auto ping_result = master_client_.Ping();
+        auto ping_result = master_client_.Ping(host_id_);
         if (ping_result) {
             // Reset ping failure count
             ping_fail_count = 0;

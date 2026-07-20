@@ -978,6 +978,61 @@ TEST_F(MasterServiceTest, GdsSsdGetResolvesAccessorForReaderHost) {
     EXPECT_EQ(unavailable.error(), ErrorCode::NO_AVAILABLE_HANDLE);
 }
 
+TEST_F(MasterServiceTest, GdsSsdGetOnlyReaderRegistersHostThroughPing) {
+    MasterService service;
+    const UUID writer_id = generate_uuid();
+    const UUID reader_id = generate_uuid();
+    const std::string writer_host = "gds-ping-writer";
+    const std::string reader_host = "gds-ping-reader";
+    const std::string reader_uri =
+        "block:///dev/mooncake/gds-ping-reader";
+
+    auto segment = MakeGdsSsdSegment(
+        "gds_ping_pool", 64 * 1024,
+        {{writer_host, "block:///dev/mooncake/gds-ping-writer"},
+         {reader_host, reader_uri}});
+    ASSERT_TRUE(service.MountGdsSsdSegment(segment).has_value());
+
+    ReplicateConfig config;
+    config.replica_num = 0;
+    config.gds_replica_num = 1;
+    config.host_id = writer_host;
+    ASSERT_TRUE(service
+                    .PutStart(writer_id, "gds_ping_object", "default", 4096,
+                              config)
+                    .has_value());
+    ASSERT_TRUE(service
+                    .PutEnd(writer_id, "gds_ping_object", "default",
+                            ReplicaType::GDS_SSD)
+                    .has_value());
+
+    auto before_ping =
+        service.GetReplicaList(reader_id, "gds_ping_object", "default");
+    ASSERT_FALSE(before_ping.has_value());
+    EXPECT_EQ(before_ping.error(), ErrorCode::NO_AVAILABLE_HANDLE);
+
+    ASSERT_TRUE(service.Ping(reader_id, reader_host).has_value());
+    auto after_ping =
+        service.GetReplicaList(reader_id, "gds_ping_object", "default");
+    ASSERT_TRUE(after_ping.has_value());
+    ASSERT_EQ(after_ping->replicas.size(), 1u);
+    EXPECT_EQ(after_ping->replicas.front()
+                  .get_gds_ssd_descriptor()
+                  .segment_uri,
+              reader_uri);
+
+    auto batch_after_ping = service.BatchGetReplicaList(
+        reader_id, {"gds_ping_object"}, "default");
+    ASSERT_EQ(batch_after_ping.size(), 1u);
+    ASSERT_TRUE(batch_after_ping.front().has_value());
+    ASSERT_EQ(batch_after_ping.front()->replicas.size(), 1u);
+    EXPECT_EQ(batch_after_ping.front()
+                  ->replicas.front()
+                  .get_gds_ssd_descriptor()
+                  .segment_uri,
+              reader_uri);
+}
+
 TEST_F(MasterServiceTest, GdsSsdLeaseProtectsOffsetUntilReaderExpires) {
     auto service_config = MasterServiceConfig::builder()
                               .set_default_kv_lease_ttl(500)
