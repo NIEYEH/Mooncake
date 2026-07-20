@@ -47,6 +47,7 @@ struct IOParamRange {
 struct BatchHandle {
     CUfileBatchHandle_t handle;
     int max_nr;  // max number of batch entries
+    int device_id;  // CUDA device whose context created this handle
 };
 
 struct GdsSubBatch : public Transport::SubBatch {
@@ -100,10 +101,12 @@ class GdsTransport : public Transport {
 
     bool findRegisteredBuffer(const void* addr, size_t length,
                               void*& registered_base,
-                              size_t& registered_offset);
+                              size_t& registered_offset, int& device_id);
 
     Status resolveIoBuffer(const Request& request, void*& io_base,
-                           size_t& io_offset);
+                           size_t& io_offset, int& device_id);
+
+    Status ensureBatchHandle(GdsSubBatch* batch, int device_id);
 
    private:
     bool installed_;
@@ -128,7 +131,11 @@ class GdsTransport : public Transport {
     std::vector<GdsSubBatch*> allocated_batches_;
     std::mutex allocated_batches_lock_;
 
-    std::map<std::uintptr_t, size_t> registered_buffers_;
+    struct RegisteredBuffer {
+        size_t length;
+        int device_id;
+    };
+    std::map<std::uintptr_t, RegisteredBuffer> registered_buffers_;
     std::mutex registered_buffers_lock_;
 };
 }  // namespace tent

@@ -153,8 +153,9 @@ std::vector<uint8_t> makePattern(size_t length, uint8_t seed) {
     return pattern;
 }
 
-bool runTransfer(TransferEngine& engine, const Request& request,
-                 TransferStatus& final_status, std::string& error) {
+bool runTransferOnCurrentThread(TransferEngine& engine, const Request& request,
+                                TransferStatus& final_status,
+                                std::string& error) {
     BatchID batch = engine.allocateBatch(1);
     if (batch == 0) {
         error = "allocateBatch failed";
@@ -191,6 +192,18 @@ bool runTransfer(TransferEngine& engine, const Request& request,
     error = "GDS transfer did not finish within 60 seconds";
     (void)engine.freeBatch(batch);
     return false;
+}
+
+bool runTransfer(TransferEngine& engine, const Request& request,
+                 TransferStatus& final_status, std::string& error) {
+    bool success = false;
+    // Exercise the same fresh-worker-thread context used by vLLM batch_put.
+    std::thread worker([&] {
+        success = runTransferOnCurrentThread(engine, request, final_status,
+                                             error);
+    });
+    worker.join();
+    return success;
 }
 
 Request makeRequest(Request::OpCode opcode, void* buffer, SegmentID segment,
