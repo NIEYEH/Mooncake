@@ -39,7 +39,8 @@ namespace mooncake {
 namespace tent {
 namespace {
 
-constexpr size_t kMaxCuFileBatchDepth = 128;
+constexpr size_t kMaxCuFileBatchDepth = 64;
+constexpr size_t kSafeUnregisteredBatchIoSize = 960 * 1024;
 
 class CudaDeviceGuard {
    public:
@@ -187,7 +188,7 @@ Status GdsTransport::install(std::string& local_segment_name,
                                kMaxCuFileBatchDepth);
     if (static_cast<size_t>(configured_batch_depth) > io_batch_depth_) {
         LOG(WARNING) << "GDS io_batch_depth=" << configured_batch_depth
-                     << " exceeds the cuFile per-batch limit; using "
+                     << " exceeds the safe cuFile batch depth; using "
                      << io_batch_depth_;
     }
 
@@ -202,6 +203,7 @@ Status GdsTransport::install(std::string& local_segment_name,
         LOG(WARNING) << "Unable to query cuFile max_direct_io_size; using "
                      << max_io_size_ << " bytes";
     }
+    max_io_size_ = std::min(max_io_size_, kSafeUnregisteredBatchIoSize);
     LOG(INFO) << "GDS transport limits: configured_batch_depth="
               << configured_batch_depth
               << ", effective_batch_depth=" << io_batch_depth_
@@ -219,6 +221,7 @@ Status GdsTransport::uninstall() {
             std::lock_guard<std::mutex> lock(allocated_batches_lock_);
             for (auto* gds_batch : allocated_batches_) {
                 for (const auto& io_batch : gds_batch->io_batches) {
+                    if (!io_batch.batch_handle) continue;
                     // Do not return handles to the pool while shutting down.
                     cuFileBatchIODestroy(io_batch.batch_handle->handle);
                     delete io_batch.batch_handle;
@@ -288,7 +291,8 @@ Status GdsTransport::freeSubBatch(SubBatchRef& batch) {
     // (via getTransferStatus) before calling freeSubBatch, as cuFile may still
     // access io_params otherwise
     for (const auto& io_batch : gds_batch->io_batches) {
-        releaseBatchHandle(io_batch.batch_handle);
+        if (io_batch.batch_handle)
+            releaseBatchHandle(io_batch.batch_handle);
     }
 
     // Deallocate the GdsSubBatch (each allocation gets a fresh one)
@@ -430,6 +434,77 @@ void GdsTransport::releaseBatchHandle(BatchHandle* handle) {
     handle_pool_.push_back(handle);
 }
 
+Status GdsTransport::submitNextIoBatch(GdsSubBatch* batch) {
+    if (!batch)
+        return Status::InvalidArgument("Invalid GDS sub-batch" LOC_MARK);
+    if (std::any_of(batch->io_batches.begin(), batch->io_batches.end(),
+                    [](const GdsIoBatch& io_batch) {
+                        return io_batch.state ==
+                               GdsIoBatch::State::SUBMITTED;
+                    })) {
+        return Status::OK();
+    }
+
+    while (true) {
+        auto it = std::find_if(
+            batch->io_batches.begin(), batch->io_batches.end(),
+            [](const GdsIoBatch& io_batch) {
+                return io_batch.state == GdsIoBatch::State::QUEUED;
+            });
+        if (it == batch->io_batches.end()) return Status::OK();
+
+        auto mark_failed = [&] {
+            for (size_t index = it->param_base;
+                 index < it->param_base + it->param_count; ++index) {
+                batch->io_statuses[index] = FAILED;
+            }
+            it->state = GdsIoBatch::State::COMPLETE;
+        };
+
+        CudaDeviceGuard device_guard;
+        auto status = device_guard.activate(it->device_id);
+        if (!status.ok()) {
+            LOG(ERROR) << "Failed to activate CUDA device for queued GDS "
+                          "batch: "
+                       << status.ToString();
+            mark_failed();
+            continue;
+        }
+
+        status = acquireBatchHandle(it->device_id, it->batch_handle);
+        if (!status.ok()) {
+            LOG(ERROR) << "Failed to acquire handle for queued GDS batch: "
+                       << status.ToString();
+            mark_failed();
+            continue;
+        }
+
+        auto result = cuFileBatchIOSubmit(
+            it->batch_handle->handle, static_cast<unsigned>(it->param_count),
+            it->params.data(), 0);
+        if (result.err == CU_FILE_SUCCESS) {
+            it->state = GdsIoBatch::State::SUBMITTED;
+            auto restore_status = device_guard.restore();
+            if (!restore_status.ok()) LOG(ERROR) << restore_status.ToString();
+            return Status::OK();
+        }
+
+        TENT_RECORD_GDS_BATCH_SUBMIT_FAILED();
+        cuFileBatchIODestroy(it->batch_handle->handle);
+        delete it->batch_handle;
+        it->batch_handle = nullptr;
+        mark_failed();
+
+        const auto& first = it->params.front();
+        LOG(ERROR) << "Failed to submit physical GDS batch: io_count="
+                   << it->param_count << ", cuFile_error=" << result.err
+                   << ", first_dev_ptr=" << first.u.batch.devPtr_base
+                   << ", first_dev_offset=" << first.u.batch.devPtr_offset
+                   << ", first_file_offset=" << first.u.batch.file_offset
+                   << ", first_size=" << first.u.batch.size;
+    }
+}
+
 Status GdsTransport::validateRequest(const Request& request) {
     if (request.length == 0)
         return Status::InvalidArgument(
@@ -525,10 +600,6 @@ Status GdsTransport::submitTransferTasks(
     size_t first_param_index = gds_batch->io_params.size();
     std::vector<GdsFileContext*> contexts;
     contexts.reserve(request_list.size());
-    std::vector<void*> io_bases;
-    std::vector<size_t> io_offsets;
-    io_bases.reserve(request_list.size());
-    io_offsets.reserve(request_list.size());
     int batch_device_id = -1;
     for (const auto& request : request_list) {
         auto status = validateRequest(request);
@@ -563,24 +634,18 @@ Status GdsTransport::submitTransferTasks(
             }
             batch_device_id = request_device_id;
         }
-        io_bases.push_back(io_base);
-        io_offsets.push_back(io_offset);
+        (void)io_base;
+        (void)io_offset;
 
         GdsFileContext* context = findFileContext(request.target_id);
         if (!context || !context->ready())
             return Status::InvalidArgument("Invalid remote segment" LOC_MARK);
         contexts.push_back(context);
     }
-    CudaDeviceGuard device_guard;
-    CHECK_STATUS(device_guard.activate(batch_device_id));
-
-    const size_t first_range_index = gds_batch->io_param_ranges.size();
     for (size_t request_index = 0; request_index < request_list.size();
          ++request_index) {
         const auto& request = request_list[request_index];
         GdsFileContext* context = contexts[request_index];
-        void* io_base = io_bases[request_index];
-        const size_t io_offset = io_offsets[request_index];
         IOParamRange range{gds_batch->io_params.size(), 0};
         for (size_t offset = 0; offset < request.length;
              offset += max_io_size_) {
@@ -592,9 +657,9 @@ Status GdsTransport::submitTransferTasks(
                 (request.opcode == Request::READ) ? CUFILE_READ : CUFILE_WRITE;
             params.cookie = reinterpret_cast<void*>(
                 static_cast<std::uintptr_t>(param_index + 1));
-            params.u.batch.devPtr_base = io_base;
-            params.u.batch.devPtr_offset =
-                static_cast<off_t>(io_offset + offset);
+            params.u.batch.devPtr_base =
+                static_cast<char*>(request.source) + offset;
+            params.u.batch.devPtr_offset = 0;
             params.u.batch.file_offset = request.target_offset + offset;
             params.u.batch.size = length;
             params.fh = context->getHandle();
@@ -609,58 +674,23 @@ Status GdsTransport::submitTransferTasks(
     const size_t last_param_index = gds_batch->io_params.size();
     const size_t physical_batch_count =
         1 + (num_params - 1) / io_batch_depth_;
-    std::vector<BatchHandle*> handles;
-    handles.reserve(physical_batch_count);
     for (size_t index = 0; index < physical_batch_count; ++index) {
-        BatchHandle* handle = nullptr;
-        auto status = acquireBatchHandle(batch_device_id, handle);
-        if (!status.ok()) {
-            for (auto* acquired : handles) releaseBatchHandle(acquired);
-            gds_batch->io_params.resize(first_param_index);
-            gds_batch->io_statuses.resize(first_param_index);
-            gds_batch->io_transferred_bytes.resize(first_param_index);
-            gds_batch->io_param_ranges.resize(first_range_index);
-            return status;
-        }
-        handles.push_back(handle);
-    }
-
-    for (size_t index = 0; index < handles.size(); ++index) {
         const size_t param_base = first_param_index + index * io_batch_depth_;
         const size_t param_count =
             std::min(io_batch_depth_, last_param_index - param_base);
-        GdsIoBatch io_batch{handles[index], param_base, param_count, {}};
+        GdsIoBatch io_batch{nullptr,
+                            batch_device_id,
+                            param_base,
+                            param_count,
+                            {},
+                            GdsIoBatch::State::QUEUED};
         io_batch.params.assign(gds_batch->io_params.begin() + param_base,
                                gds_batch->io_params.begin() + param_base +
                                    param_count);
-        auto result = cuFileBatchIOSubmit(
-            handles[index]->handle, static_cast<unsigned>(param_count),
-            io_batch.params.data(), 0);
-        if (result.err == CU_FILE_SUCCESS) {
-            gds_batch->io_batches.push_back(std::move(io_batch));
-            continue;
-        }
-
-        TENT_RECORD_GDS_BATCH_SUBMIT_FAILED();
-        cuFileBatchIODestroy(handles[index]->handle);
-        delete handles[index];
-        for (size_t pending = index + 1; pending < handles.size(); ++pending) {
-            releaseBatchHandle(handles[pending]);
-        }
-        for (size_t param = param_base;
-             param < last_param_index; ++param) {
-            gds_batch->io_statuses[param] = FAILED;
-        }
-        LOG(ERROR) << "Failed to submit physical GDS batch: logical_requests="
-                   << request_list.size() << ", physical_batch=" << index
-                   << "/" << handles.size() << ", io_count=" << param_count
-                   << ", cuFile_error=" << result.err;
-        break;
+        gds_batch->io_batches.push_back(std::move(io_batch));
     }
 
-    auto restore_status = device_guard.restore();
-    if (!restore_status.ok()) LOG(ERROR) << restore_status.ToString();
-    return Status::OK();
+    return submitNextIoBatch(gds_batch);
 }
 
 Status GdsTransport::getTransferStatus(SubBatchRef batch, int task_id,
@@ -675,7 +705,8 @@ Status GdsTransport::getTransferStatus(SubBatchRef batch, int task_id,
         return Status::InvalidArgument("Invalid task ID");
     auto range = gds_batch->io_param_ranges[task_id];
 
-    for (const auto& io_batch : gds_batch->io_batches) {
+    for (auto& io_batch : gds_batch->io_batches) {
+        if (io_batch.state != GdsIoBatch::State::SUBMITTED) continue;
         size_t pending_count = 0;
         for (size_t index = io_batch.param_base;
              index < io_batch.param_base + io_batch.param_count; ++index) {
@@ -742,7 +773,20 @@ Status GdsTransport::getTransferStatus(SubBatchRef batch, int task_id,
 
         auto restore_status = device_guard.restore();
         if (!restore_status.ok()) LOG(ERROR) << restore_status.ToString();
+
+        pending_count = 0;
+        for (size_t index = io_batch.param_base;
+             index < io_batch.param_base + io_batch.param_count; ++index) {
+            if (gds_batch->io_statuses[index] == PENDING) ++pending_count;
+        }
+        if (pending_count == 0) {
+            releaseBatchHandle(io_batch.batch_handle);
+            io_batch.batch_handle = nullptr;
+            io_batch.state = GdsIoBatch::State::COMPLETE;
+        }
     }
+
+    CHECK_STATUS(submitNextIoBatch(gds_batch));
 
     status = TransferStatus{PENDING, 0};
     size_t complete_count = 0;

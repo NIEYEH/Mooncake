@@ -51,10 +51,14 @@ struct BatchHandle {
 };
 
 struct GdsIoBatch {
+    enum class State { QUEUED, SUBMITTED, COMPLETE };
+
     BatchHandle* batch_handle;
+    int device_id;
     size_t param_base;
     size_t param_count;
     std::vector<CUfileIOParams_t> params;
+    State state;
 };
 
 struct GdsSubBatch : public Transport::SubBatch {
@@ -116,6 +120,8 @@ class GdsTransport : public Transport {
     Status acquireBatchHandle(int device_id, BatchHandle*& handle);
 
     void releaseBatchHandle(BatchHandle* handle);
+
+    Status submitNextIoBatch(GdsSubBatch* batch);
 
    private:
     bool installed_;
