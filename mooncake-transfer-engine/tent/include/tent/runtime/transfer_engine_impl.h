@@ -238,7 +238,7 @@ class TransferEngineImpl {
 
     void notifyRuntimeQueueReady();
 
-    Status dispatchQueuedOwner(QueueOwnerId owner_id);
+    Status dispatchQueuedOwners(const std::vector<QueueOwnerId>& owner_ids);
 
     Status markQueuedOwnerSubmitted(QueueOwnerId owner_id);
 

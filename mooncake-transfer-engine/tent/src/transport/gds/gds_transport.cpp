@@ -41,6 +41,7 @@ namespace tent {
 namespace {
 
 constexpr size_t kMaxCuFileBatchDepth = 64;
+constexpr size_t kDefaultInflightCuFileBatches = 4;
 constexpr size_t kMaxInflightCuFileBatches = 16;
 constexpr size_t kSafeUnregisteredBatchIoSize = 960 * 1024;
 
@@ -160,7 +161,7 @@ GdsTransport::GdsTransport()
     : installed_(false),
       io_batch_depth_(0),
       max_io_size_(1ull << 20),
-      max_inflight_batches_(1) {}
+      max_inflight_batches_(kDefaultInflightCuFileBatches) {}
 
 GdsTransport::~GdsTransport() { uninstall(); }
 
@@ -196,8 +197,9 @@ Status GdsTransport::install(std::string& local_segment_name,
                      << " exceeds the safe cuFile batch depth; using "
                      << io_batch_depth_;
     }
-    const int configured_inflight_batches =
-        conf_->get("transports/gds/max_inflight_batches", 1);
+    const int configured_inflight_batches = conf_->get(
+        "transports/gds/max_inflight_batches",
+        static_cast<int>(kDefaultInflightCuFileBatches));
     if (configured_inflight_batches <= 0)
         return Status::InvalidArgument(
             "GDS max_inflight_batches must be greater than zero" LOC_MARK);

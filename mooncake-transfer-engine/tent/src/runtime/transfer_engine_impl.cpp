@@ -18,8 +18,10 @@
 #include <algorithm>
 #include <cstdlib>
 #include <fstream>
+#include <iterator>
 #include <limits>
 #include <map>
+#include <numeric>
 #include <optional>
 #include <random>
 #include <stdexcept>
@@ -299,18 +301,33 @@ Status TransferEngineImpl::construct() {
         conf_->get("runtime_queue/staging_owner_reserve", 0UL);
     runtime_queue_config_.limits.staging_byte_reserve =
         conf_->get("runtime_queue/staging_byte_reserve", 0UL);
+    const bool gds_enabled = conf_->get("transports/gds/enable", false);
+    const size_t default_max_dispatch_owners = gds_enabled ? 256UL : 64UL;
     runtime_queue_config_.max_dispatch_owners =
-        conf_->get("runtime_queue/max_dispatch_owners", 64UL);
+        conf_->get("runtime_queue/max_dispatch_owners",
+                   default_max_dispatch_owners);
     runtime_queue_config_.max_dispatch_bytes =
         conf_->get("runtime_queue/max_dispatch_bytes", 64UL << 20);
+    const size_t default_progress_fallback_interval_us =
+        gds_enabled ? 1000UL : 50000UL;
     runtime_queue_config_.progress_fallback_interval =
         std::chrono::microseconds(
-            conf_->get("runtime_queue/progress_fallback_interval_us", 50000UL));
+            conf_->get("runtime_queue/progress_fallback_interval_us",
+                       default_progress_fallback_interval_us));
     if (runtime_queue_config_.enabled &&
         (runtime_queue_config_.max_dispatch_owners == 0 ||
          runtime_queue_config_.max_dispatch_bytes == 0)) {
         return Status::InvalidArgument(
             "runtime queue dispatch window must be non-zero" LOC_MARK);
+    }
+    if (runtime_queue_config_.enabled) {
+        LOG(INFO) << "Runtime queue config: max_dispatch_owners="
+                  << runtime_queue_config_.max_dispatch_owners
+                  << ", max_dispatch_bytes="
+                  << runtime_queue_config_.max_dispatch_bytes
+                  << ", progress_fallback_interval_us="
+                  << runtime_queue_config_.progress_fallback_interval.count()
+                  << ", gds_enabled=" << gds_enabled;
     }
     runtime_queue_ = std::make_unique<LocalTransferAdmissionQueue>(
         runtime_queue_config_.limits);
@@ -1664,53 +1681,126 @@ Status TransferEngineImpl::markQueuedOwnerSubmitted(QueueOwnerId owner_id) {
     return Status::OK();
 }
 
-Status TransferEngineImpl::dispatchQueuedOwner(QueueOwnerId owner_id) {
-    auto queued_it = queued_owners_.find(owner_id);
-    if (queued_it == queued_owners_.end()) {
-        return Status::InternalError("queued owner metadata missing" LOC_MARK);
-    }
-    const auto queued = queued_it->second;
-    auto* batch = queued.batch;
-    auto& task = batch->task_list[queued.owner_task_id];
-    auto route = resolveTransport(task.request, 0);
-    task.type = route.transport;
-    task.device_mask = route.device_mask;
-    if (task.type == UNSPEC) {
-        return finishQueuedOwner(owner_id, FAILED);
+Status TransferEngineImpl::dispatchQueuedOwners(
+    const std::vector<QueueOwnerId>& owner_ids) {
+    struct DispatchGroup {
+        Batch* batch{nullptr};
+        TransportType type{UNSPEC};
+        uint64_t device_mask{~0ULL};
+        std::vector<QueueOwnerId> owner_ids;
+        std::vector<Request> requests;
+    };
+
+    std::vector<DispatchGroup> groups;
+    groups.reserve(owner_ids.size());
+    for (const auto owner_id : owner_ids) {
+        auto queued_it = queued_owners_.find(owner_id);
+        if (queued_it == queued_owners_.end()) {
+            return Status::InternalError(
+                "queued owner metadata missing" LOC_MARK);
+        }
+        const auto queued = queued_it->second;
+        auto* batch = queued.batch;
+        auto& task = batch->task_list[queued.owner_task_id];
+        auto route = resolveTransport(task.request, 0);
+        task.type = route.transport;
+        task.device_mask = route.device_mask;
+        if (task.type == UNSPEC) {
+            CHECK_STATUS(finishQueuedOwner(owner_id, FAILED));
+            continue;
+        }
+
+        if (task.type == TCP) {
+            std::vector<std::string> staging_params;
+            findStagingPolicy(task.request, staging_params);
+            if (!staging_params.empty() && staging_proxy_) {
+                task.staging = true;
+                auto status = staging_proxy_->submit(
+                    &task, (BatchID)batch, staging_params);
+                if (!status.ok()) {
+                    CHECK_STATUS(finishQueuedOwner(owner_id, FAILED));
+                } else {
+                    CHECK_STATUS(markQueuedOwnerSubmitted(owner_id));
+                }
+                continue;
+            }
+        }
+
+        auto group_it = std::find_if(
+            groups.begin(), groups.end(), [&](const DispatchGroup& group) {
+                return group.batch == batch && group.type == task.type &&
+                       group.device_mask == task.device_mask;
+            });
+        if (group_it == groups.end()) {
+            groups.push_back(
+                DispatchGroup{batch, task.type, task.device_mask, {}, {}});
+            group_it = std::prev(groups.end());
+        }
+        group_it->owner_ids.push_back(owner_id);
+        group_it->requests.push_back(task.request);
     }
 
-    if (task.type == TCP) {
-        std::vector<std::string> staging_params;
-        findStagingPolicy(task.request, staging_params);
-        if (!staging_params.empty() && staging_proxy_) {
-            task.staging = true;
+    for (auto& group : groups) {
+        auto& transport = transport_list_[group.type];
+        auto fail_group = [&]() -> Status {
+            for (const auto owner_id : group.owner_ids) {
+                auto queued_it = queued_owners_.find(owner_id);
+                if (queued_it == queued_owners_.end()) continue;
+                auto& task = queued_it->second.batch->task_list[
+                    queued_it->second.owner_task_id];
+                task.type = UNSPEC;
+                CHECK_STATUS(finishQueuedOwner(owner_id, FAILED));
+            }
+            return Status::OK();
+        };
+        if (!transport) {
+            CHECK_STATUS(fail_group());
+            continue;
+        }
+
+        auto& sub_batch = group.batch->sub_batch[group.type];
+        if (!sub_batch) {
             auto status =
-                staging_proxy_->submit(&task, (BatchID)batch, staging_params);
-            if (!status.ok()) return finishQueuedOwner(owner_id, FAILED);
-            return markQueuedOwnerSubmitted(owner_id);
+                transport->allocateSubBatch(sub_batch, group.batch->max_size);
+            if (!status.ok()) {
+                CHECK_STATUS(fail_group());
+                continue;
+            }
+            attachProgressNotifier(group.batch, sub_batch);
+        }
+        if (group.type == RDMA) sub_batch->device_mask = group.device_mask;
+
+        const size_t first_sub_task_id = sub_batch->size();
+        for (size_t index = 0; index < group.owner_ids.size(); ++index) {
+            const auto queued_it = queued_owners_.find(group.owner_ids[index]);
+            if (queued_it == queued_owners_.end()) {
+                return Status::InternalError(
+                    "queued owner metadata disappeared" LOC_MARK);
+            }
+            auto& task = group.batch->task_list[queued_it->second.owner_task_id];
+            task.sub_task_id = first_sub_task_id + index;
+        }
+
+        auto status = transport->submitTransferTasks(sub_batch, group.requests);
+        if (!status.ok()) {
+            CHECK_STATUS(fail_group());
+            continue;
+        }
+        LOG_EVERY_N(INFO, 256)
+            << "Runtime queue transport dispatch: transport="
+            << transportTypeName(group.type)
+            << ", requests=" << group.requests.size()
+            << ", bytes="
+            << std::accumulate(group.requests.begin(), group.requests.end(),
+                               size_t{0},
+                               [](size_t total, const Request& request) {
+                                   return total + request.length;
+                               });
+        for (const auto owner_id : group.owner_ids) {
+            CHECK_STATUS(markQueuedOwnerSubmitted(owner_id));
         }
     }
-
-    if (!batch->sub_batch[task.type]) {
-        auto& transport = transport_list_[task.type];
-        if (!transport) return finishQueuedOwner(owner_id, FAILED);
-        auto status = transport->allocateSubBatch(batch->sub_batch[task.type],
-                                                  batch->max_size);
-        if (!status.ok()) return finishQueuedOwner(owner_id, FAILED);
-        attachProgressNotifier(batch, batch->sub_batch[task.type]);
-    }
-
-    auto& transport = transport_list_[task.type];
-    if (!transport) return finishQueuedOwner(owner_id, FAILED);
-    auto& sub_batch = batch->sub_batch[task.type];
-    if (task.type == RDMA) sub_batch->device_mask = task.device_mask;
-    task.sub_task_id = sub_batch->size();
-    auto status = transport->submitTransferTasks(sub_batch, {task.request});
-    if (!status.ok()) {
-        task.type = UNSPEC;
-        return finishQueuedOwner(owner_id, FAILED);
-    }
-    return markQueuedOwnerSubmitted(owner_id);
+    return Status::OK();
 }
 
 Status TransferEngineImpl::refillDispatchWindow() {
@@ -1727,9 +1817,7 @@ Status TransferEngineImpl::refillDispatchWindow() {
     const size_t byte_budget =
         runtime_queue_config_.max_dispatch_bytes - dispatch_inflight_bytes_;
     auto picked = runtime_queue_->pickForDispatch(owner_budget, byte_budget);
-    for (const auto owner_id : picked) {
-        CHECK_STATUS(dispatchQueuedOwner(owner_id));
-    }
+    CHECK_STATUS(dispatchQueuedOwners(picked));
     return Status::OK();
 }
 

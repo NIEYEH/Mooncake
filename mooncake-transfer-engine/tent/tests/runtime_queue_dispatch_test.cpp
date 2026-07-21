@@ -304,6 +304,40 @@ TEST(RuntimeQueueDispatch, DispatchesOnlyOneWindowOnSubmit) {
         engine.unregisterLocalMemory(buffer.data(), buffer.size()).ok());
 }
 
+TEST(RuntimeQueueDispatch, BatchesOwnersPickedInTheSameDispatchWindow) {
+    constexpr size_t kRequestCount = 4;
+    constexpr size_t kReqLen = 4096;
+    auto cfg = makeRuntimeQueueConfig(kRequestCount, 1UL << 20);
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+
+    auto fake_rdma = std::make_shared<FakeTransport>(RDMA);
+    installFakeRdma(engine, fake_rdma);
+
+    std::vector<uint8_t> buffer(kReqLen * kRequestCount, 0x44);
+    ASSERT_TRUE(engine.registerLocalMemory(buffer.data(), buffer.size()).ok());
+    BatchID batch = engine.allocateBatch(kRequestCount);
+    ASSERT_NE(batch, (BatchID)0);
+
+    std::vector<Request> requests;
+    for (size_t index = 0; index < kRequestCount; ++index) {
+        requests.push_back(
+            makeLocalWrite(buffer.data() + index * kReqLen, kReqLen));
+    }
+    ASSERT_TRUE(engine.submitTransfer(batch, requests).ok());
+    EXPECT_EQ(fake_rdma->submit_calls.load(), 1);
+
+    for (size_t index = 0; index < kRequestCount; ++index) {
+        TransferStatus status{};
+        ASSERT_TRUE(engine.getTransferStatus(batch, index, status).ok());
+        EXPECT_EQ(status.s, TransferStatusEnum::COMPLETED);
+        EXPECT_EQ(status.transferred_bytes, kReqLen);
+    }
+
+    EXPECT_TRUE(engine.freeBatch(batch).ok());
+    EXPECT_TRUE(engine.unregisterLocalMemory(buffer.data(), buffer.size()).ok());
+}
+
 TEST(RuntimeQueueDispatch, KeepsDispatchWindowUntilOwnerIsTerminal) {
     auto cfg = makeRuntimeQueueConfig(1, 1UL << 20);
     TransferEngineImpl engine(cfg);
