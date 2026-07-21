@@ -1527,6 +1527,8 @@ bool TransferSubmitter::buildGdsSsdTransferRequests(
     coalesced_slices.reserve(slices.size());
     std::vector<std::pair<uint64_t, uint64_t>> source_ranges;
     source_ranges.reserve(slices.size());
+    const size_t max_coalesced_size =
+        static_cast<size_t>(kMaxSliceSize + 16);
     uint64_t slices_size = 0;
     for (const auto& slice : slices) {
         if (slice.size == 0) {
@@ -1548,15 +1550,6 @@ bool TransferSubmitter::buildGdsSsdTransferRequests(
                        << ", slice_size=" << slice.size;
             requests.clear();
             return false;
-        }
-        for (const auto& [existing_begin, existing_end] : source_ranges) {
-            if (source_address < existing_end &&
-                existing_begin < source_end) {
-                LOG(ERROR) << "GDS SSD slices overlap: ptr=" << slice.ptr
-                           << ", slice_size=" << slice.size;
-                requests.clear();
-                return false;
-            }
         }
         source_ranges.emplace_back(source_address, source_end);
 
@@ -1585,22 +1578,41 @@ bool TransferSubmitter::buildGdsSsdTransferRequests(
                 requests.clear();
                 return false;
             }
-            const bool previous_needs_coalescing = !IsAligned(
-                static_cast<uint64_t>(previous.size), alignment);
-            if (previous_end == source_address &&
-                previous_needs_coalescing) {
+            if (previous_end == source_address) {
                 if (slice.size >
                     std::numeric_limits<size_t>::max() - previous.size) {
                     LOG(ERROR) << "GDS SSD coalesced slice size overflows";
                     requests.clear();
                     return false;
                 }
-                previous.size += slice.size;
-                continue;
+                const size_t combined_size = previous.size + slice.size;
+                if (combined_size <= max_coalesced_size) {
+                    previous.size = combined_size;
+                    continue;
+                }
             }
         }
         coalesced_slices.emplace_back(slice);
     }
+
+    std::sort(source_ranges.begin(), source_ranges.end());
+    for (size_t index = 1; index < source_ranges.size(); ++index) {
+        if (source_ranges[index].first < source_ranges[index - 1].second) {
+            LOG(ERROR) << "GDS SSD slices overlap: range=["
+                       << source_ranges[index].first << ", "
+                       << source_ranges[index].second
+                       << "), previous_range=["
+                       << source_ranges[index - 1].first << ", "
+                       << source_ranges[index - 1].second << ")";
+            requests.clear();
+            return false;
+        }
+    }
+
+    LOG_EVERY_N(INFO, 256)
+        << "GDS SSD slice coalescing: input_slices=" << slices.size()
+        << ", coalesced_slices=" << coalesced_slices.size()
+        << ", object_size=" << descriptor.object_size;
 
     if (slices_size != descriptor.object_size) {
         LOG(ERROR) << "GDS SSD transfer size mismatch: segment_name="

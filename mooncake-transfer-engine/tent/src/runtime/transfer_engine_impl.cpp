@@ -328,6 +328,11 @@ Status TransferEngineImpl::construct() {
                   << ", progress_fallback_interval_us="
                   << runtime_queue_config_.progress_fallback_interval.count()
                   << ", gds_enabled=" << gds_enabled;
+    } else if (gds_enabled) {
+        LOG(WARNING)
+            << "GDS transport is enabled while the TENT runtime queue is "
+               "disabled; large vLLM KV batches will be submitted to cuFile "
+               "without an owner/byte admission window.";
     }
     runtime_queue_ = std::make_unique<LocalTransferAdmissionQueue>(
         runtime_queue_config_.limits);

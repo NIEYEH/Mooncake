@@ -240,7 +240,29 @@ TEST_F(TransferTaskTest, BuildGdsSsdTransferRequests) {
     };
     ASSERT_TRUE(TransferSubmitter::buildGdsSsdTransferRequests(
         descriptor, slices, TransferRequest::WRITE, requests));
-    EXPECT_EQ(requests.size(), 2u);
+    ASSERT_EQ(requests.size(), 1u);
+    EXPECT_EQ(requests[0].source, slices[0].ptr);
+    EXPECT_EQ(requests[0].length, descriptor.object_size);
+
+    GdsSsdDescriptor large_descriptor = descriptor;
+    constexpr size_t kLargeSliceCount = 8192;
+    large_descriptor.object_size = kLargeSliceCount * 4096;
+    slices.clear();
+    slices.reserve(kLargeSliceCount);
+    constexpr uintptr_t kLargeBufferAddress = 0x100000;
+    for (size_t index = 0; index < kLargeSliceCount; ++index) {
+        slices.push_back(
+            {reinterpret_cast<void*>(kLargeBufferAddress + index * 4096),
+             4096});
+    }
+    ASSERT_TRUE(TransferSubmitter::buildGdsSsdTransferRequests(
+        large_descriptor, slices, TransferRequest::WRITE, requests));
+    ASSERT_EQ(requests.size(), 2u);
+    EXPECT_EQ(requests[0].source, slices[0].ptr);
+    EXPECT_EQ(requests[0].length, kMaxSliceSize + 16);
+    EXPECT_EQ(requests[1].target_offset,
+              large_descriptor.offset + kMaxSliceSize + 16);
+    EXPECT_EQ(requests[1].length, kMaxSliceSize + 16);
 }
 
 TEST_F(TransferTaskTest, RejectsInvalidGdsSsdTransferRequests) {
