@@ -1,0 +1,51 @@
+{
+  "verbose": true,
+
+  "enable_runtime_queue": true,
+
+  "runtime_queue": {
+    "max_outstanding_owners": 1024,
+    "max_outstanding_bytes": 1073741824,
+
+    "max_dispatch_owners": 256,
+    "max_dispatch_bytes": 67108864,
+
+    "staging_owner_reserve": 0,
+    "staging_byte_reserve": 0,
+
+    "progress_fallback_interval_us": 1000
+  },
+
+  "transports": {
+    "tcp": {
+      "enable": true
+    },
+
+    "rdma": {
+      "enable": false
+    },
+
+    "gds": {
+      "enable": true,
+      "io_batch_depth": 64,
+      "max_inflight_batches": 1,
+      "allow_concurrent_batches": false
+    },
+
+    "io_uring": {
+      "enable": false
+    },
+
+    "shm": {
+      "enable": false
+    },
+
+    "nvlink": {
+      "enable": false
+    },
+
+    "mnnvl": {
+      "enable": false
+    }
+  }
+}
