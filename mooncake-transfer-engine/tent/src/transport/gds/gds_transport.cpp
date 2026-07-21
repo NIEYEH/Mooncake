@@ -41,7 +41,7 @@ namespace tent {
 namespace {
 
 constexpr size_t kMaxCuFileBatchDepth = 64;
-constexpr size_t kDefaultInflightCuFileBatches = 4;
+constexpr size_t kDefaultInflightCuFileBatches = 1;
 constexpr size_t kMaxInflightCuFileBatches = 16;
 constexpr size_t kSafeUnregisteredBatchIoSize = 960 * 1024;
 
@@ -197,12 +197,24 @@ Status GdsTransport::install(std::string& local_segment_name,
                      << " exceeds the safe cuFile batch depth; using "
                      << io_batch_depth_;
     }
-    const int configured_inflight_batches = conf_->get(
+    const int requested_inflight_batches = conf_->get(
         "transports/gds/max_inflight_batches",
         static_cast<int>(kDefaultInflightCuFileBatches));
-    if (configured_inflight_batches <= 0)
+    if (requested_inflight_batches <= 0)
         return Status::InvalidArgument(
             "GDS max_inflight_batches must be greater than zero" LOC_MARK);
+    const bool allow_concurrent_batches = conf_->get(
+        "transports/gds/allow_concurrent_batches", false);
+    const int configured_inflight_batches =
+        allow_concurrent_batches ? requested_inflight_batches : 1;
+    if (requested_inflight_batches > 1 && !allow_concurrent_batches) {
+        LOG(WARNING)
+            << "GDS max_inflight_batches=" << requested_inflight_batches
+            << " requested, but concurrent cuFile batch handles can abort "
+               "some driver versions; using 1. Set "
+               "transports/gds/allow_concurrent_batches=true only after "
+               "validating the installed cuFile stack.";
+    }
     max_inflight_batches_ = std::min(
         static_cast<size_t>(configured_inflight_batches),
         kMaxInflightCuFileBatches);
@@ -230,7 +242,10 @@ Status GdsTransport::install(std::string& local_segment_name,
               << configured_batch_depth
               << ", effective_batch_depth=" << io_batch_depth_
               << ", max_io_size=" << max_io_size_
-              << ", max_inflight_batches=" << max_inflight_batches_;
+              << ", requested_inflight_batches="
+              << requested_inflight_batches
+              << ", max_inflight_batches=" << max_inflight_batches_
+              << ", allow_concurrent_batches=" << allow_concurrent_batches;
     installed_ = true;
     caps.dram_to_file = true;
     caps.gpu_to_file = true;
@@ -737,6 +752,15 @@ Status GdsTransport::submitTransferTasks(
     TentMetrics::instance().recordGdsTransportSubmission(
         request_list.size(), num_params, physical_batch_count,
         small_request_count, underfilled_batch_count);
+    if (physical_batch_count > 16) {
+        LOG(WARNING)
+            << "Large GDS transport submission: logical_requests="
+            << request_list.size() << ", physical_ios=" << num_params
+            << ", physical_batches=" << physical_batch_count
+            << ". Enable the TENT runtime queue and keep "
+               "runtime_queue/max_dispatch_owners bounded to avoid an "
+               "unbounded cuFile batch backlog.";
+    }
     LOG_EVERY_N(INFO, 256)
         << "GDS transport submission: logical_requests="
         << request_list.size() << ", physical_ios=" << num_params

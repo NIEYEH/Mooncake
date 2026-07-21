@@ -142,7 +142,6 @@ std::shared_ptr<Config> makeGdsConfig() {
     config->set("transports/mnnvl/enable", false);
     config->set("transports/gds/enable", true);
     config->set("transports/gds/io_batch_depth", 1);
-    config->set("transports/gds/max_inflight_batches", 2);
     return config;
 }
 
