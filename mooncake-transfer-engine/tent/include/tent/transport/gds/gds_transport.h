@@ -69,6 +69,7 @@ struct GdsSubBatch : public Transport::SubBatch {
     std::vector<CUfileIOEvents_t> io_events;
     std::vector<TransferStatusEnum> io_statuses;
     std::vector<size_t> io_transferred_bytes;
+    bool dispatch_window_blocked{false};
     std::mutex status_lock;
     virtual size_t size() const { return io_param_ranges.size(); }
 };
@@ -136,6 +137,7 @@ class GdsTransport : public Transport {
     FileContextMap file_context_map_;
     size_t io_batch_depth_;
     size_t max_io_size_;
+    size_t max_inflight_batches_;
 
     // Object pool for BatchHandle to avoid frequent cuFileBatchIOSetUp/Destroy
     // CUfileBatchHandle_t is reusable per cuFile API documentation

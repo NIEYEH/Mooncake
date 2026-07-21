@@ -41,6 +41,7 @@ namespace tent {
 namespace {
 
 constexpr size_t kMaxCuFileBatchDepth = 64;
+constexpr size_t kMaxInflightCuFileBatches = 16;
 constexpr size_t kSafeUnregisteredBatchIoSize = 960 * 1024;
 
 class CudaDeviceGuard {
@@ -156,7 +157,10 @@ TransferStatusEnum parseTransferStatus(CUfileStatus_t status) {
 }
 
 GdsTransport::GdsTransport()
-    : installed_(false), io_batch_depth_(0), max_io_size_(1ull << 20) {}
+    : installed_(false),
+      io_batch_depth_(0),
+      max_io_size_(1ull << 20),
+      max_inflight_batches_(1) {}
 
 GdsTransport::~GdsTransport() { uninstall(); }
 
@@ -192,6 +196,21 @@ Status GdsTransport::install(std::string& local_segment_name,
                      << " exceeds the safe cuFile batch depth; using "
                      << io_batch_depth_;
     }
+    const int configured_inflight_batches =
+        conf_->get("transports/gds/max_inflight_batches", 1);
+    if (configured_inflight_batches <= 0)
+        return Status::InvalidArgument(
+            "GDS max_inflight_batches must be greater than zero" LOC_MARK);
+    max_inflight_batches_ = std::min(
+        static_cast<size_t>(configured_inflight_batches),
+        kMaxInflightCuFileBatches);
+    if (static_cast<size_t>(configured_inflight_batches) >
+        max_inflight_batches_) {
+        LOG(WARNING) << "GDS max_inflight_batches="
+                     << configured_inflight_batches
+                     << " exceeds the safety limit; using "
+                     << max_inflight_batches_;
+    }
 
     CUfileDrvProps_t properties{};
     auto properties_result = cuFileDriverGetProperties(&properties);
@@ -208,7 +227,8 @@ Status GdsTransport::install(std::string& local_segment_name,
     LOG(INFO) << "GDS transport limits: configured_batch_depth="
               << configured_batch_depth
               << ", effective_batch_depth=" << io_batch_depth_
-              << ", max_io_size=" << max_io_size_;
+              << ", max_io_size=" << max_io_size_
+              << ", max_inflight_batches=" << max_inflight_batches_;
     installed_ = true;
     caps.dram_to_file = true;
     caps.gpu_to_file = true;
@@ -261,6 +281,7 @@ Status GdsTransport::allocateSubBatch(SubBatchRef& batch, size_t max_size) {
     gds_batch->io_statuses.reserve(io_batch_depth_);
     gds_batch->io_transferred_bytes.clear();
     gds_batch->io_transferred_bytes.reserve(io_batch_depth_);
+    gds_batch->dispatch_window_blocked = false;
 
     // Track this batch for cleanup on uninstall
     {
@@ -438,15 +459,33 @@ void GdsTransport::releaseBatchHandle(BatchHandle* handle) {
 Status GdsTransport::submitNextIoBatch(GdsSubBatch* batch) {
     if (!batch)
         return Status::InvalidArgument("Invalid GDS sub-batch" LOC_MARK);
-    if (std::any_of(batch->io_batches.begin(), batch->io_batches.end(),
-                    [](const GdsIoBatch& io_batch) {
-                        return io_batch.state ==
-                               GdsIoBatch::State::SUBMITTED;
-                    })) {
+
+    size_t inflight_batches = static_cast<size_t>(std::count_if(
+        batch->io_batches.begin(), batch->io_batches.end(),
+        [](const GdsIoBatch& io_batch) {
+            return io_batch.state == GdsIoBatch::State::SUBMITTED;
+        }));
+    if (inflight_batches >= max_inflight_batches_) {
+        const size_t queued_batches = static_cast<size_t>(std::count_if(
+            batch->io_batches.begin(), batch->io_batches.end(),
+            [](const GdsIoBatch& io_batch) {
+                return io_batch.state == GdsIoBatch::State::QUEUED;
+            }));
+        if (queued_batches > 0 && !batch->dispatch_window_blocked) {
+            TentMetrics::instance().recordGdsDispatchWindowFull(
+                queued_batches, inflight_batches);
+            batch->dispatch_window_blocked = true;
+            LOG_EVERY_N(INFO, 256)
+                << "GDS dispatch window full: queued_batches="
+                << queued_batches
+                << ", inflight_batches=" << inflight_batches
+                << ", max_inflight_batches=" << max_inflight_batches_;
+        }
         return Status::OK();
     }
+    batch->dispatch_window_blocked = false;
 
-    while (true) {
+    while (inflight_batches < max_inflight_batches_) {
         auto it = std::find_if(
             batch->io_batches.begin(), batch->io_batches.end(),
             [](const GdsIoBatch& io_batch) {
@@ -496,9 +535,10 @@ Status GdsTransport::submitNextIoBatch(GdsSubBatch* batch) {
             TentMetrics::instance().recordGdsPhysicalBatch(
                 it->param_count, physical_bytes, submit_seconds);
             it->state = GdsIoBatch::State::SUBMITTED;
+            ++inflight_batches;
             auto restore_status = device_guard.restore();
             if (!restore_status.ok()) LOG(ERROR) << restore_status.ToString();
-            return Status::OK();
+            continue;
         }
 
         TENT_RECORD_GDS_BATCH_SUBMIT_FAILED();
@@ -515,6 +555,7 @@ Status GdsTransport::submitNextIoBatch(GdsSubBatch* batch) {
                    << ", first_file_offset=" << first.u.batch.file_offset
                    << ", first_size=" << first.u.batch.size;
     }
+    return Status::OK();
 }
 
 Status GdsTransport::validateRequest(const Request& request) {
@@ -686,6 +727,22 @@ Status GdsTransport::submitTransferTasks(
     const size_t last_param_index = gds_batch->io_params.size();
     const size_t physical_batch_count =
         1 + (num_params - 1) / io_batch_depth_;
+    const size_t small_request_count = static_cast<size_t>(std::count_if(
+        request_list.begin(), request_list.end(),
+        [](const Request& request) { return request.length <= 64 * 1024; }));
+    const size_t underfilled_batch_count =
+        num_params % io_batch_depth_ == 0 ? 0 : 1;
+    TentMetrics::instance().recordGdsTransportSubmission(
+        request_list.size(), num_params, physical_batch_count,
+        small_request_count, underfilled_batch_count);
+    LOG_EVERY_N(INFO, 256)
+        << "GDS transport submission: logical_requests="
+        << request_list.size() << ", physical_ios=" << num_params
+        << ", physical_batches=" << physical_batch_count
+        << ", small_requests=" << small_request_count
+        << ", underfilled_batches=" << underfilled_batch_count
+        << ", batch_depth=" << io_batch_depth_
+        << ", max_inflight_batches=" << max_inflight_batches_;
     for (size_t index = 0; index < physical_batch_count; ++index) {
         const size_t param_base = first_param_index + index * io_batch_depth_;
         const size_t param_count =

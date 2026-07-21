@@ -85,6 +85,13 @@ class TentMetrics {
     void recordGdsBatchSubmitFailed();
     void recordGdsCoalescing(size_t input_requests, size_t merged_requests,
                              size_t bytes);
+    void recordGdsTransportSubmission(size_t logical_requests,
+                                      size_t physical_ios,
+                                      size_t physical_batches,
+                                      size_t small_requests,
+                                      size_t underfilled_batches);
+    void recordGdsDispatchWindowFull(size_t queued_batches,
+                                     size_t inflight_batches);
     void recordGdsPhysicalBatch(size_t io_count, size_t bytes,
                                 double submit_latency_seconds);
     void updateRuntimeQueue(size_t queued_owners, size_t queued_bytes,
@@ -170,6 +177,24 @@ class TentMetrics {
         "tent_gds_physical_bytes_total", "Physical cuFile IO bytes"};
     ylt::metric::counter_t gds_physical_batches_total_{
         "tent_gds_physical_batches_total", "Submitted cuFile batches"};
+    ylt::metric::counter_t gds_transport_submit_calls_total_{
+        "tent_gds_transport_submit_calls_total",
+        "Calls into the GDS transport submit path"};
+    ylt::metric::counter_t gds_transport_logical_requests_total_{
+        "tent_gds_transport_logical_requests_total",
+        "Logical requests received by GDS transport submit calls"};
+    ylt::metric::counter_t gds_transport_physical_ios_created_total_{
+        "tent_gds_transport_physical_ios_created_total",
+        "Physical IO entries created by GDS transport submit calls"};
+    ylt::metric::counter_t gds_small_requests_total_{
+        "tent_gds_small_requests_total",
+        "GDS logical requests no larger than 64 KiB"};
+    ylt::metric::counter_t gds_underfilled_batches_total_{
+        "tent_gds_underfilled_batches_total",
+        "Physical GDS batches below configured batch depth"};
+    ylt::metric::counter_t gds_dispatch_window_full_total_{
+        "tent_gds_dispatch_window_full_total",
+        "Attempts blocked by the per-sub-batch inflight batch limit"};
 
     ylt::metric::gauge_t runtime_queue_owners_{
         "tent_runtime_queue_owners", "Owners waiting in the runtime queue"};
@@ -199,6 +224,28 @@ class TentMetrics {
     ylt::metric::histogram_t gds_batch_submit_latency_{
         "tent_gds_batch_submit_latency_us",
         "cuFile batch submission latency in microseconds", kLatencyBuckets};
+    static inline const std::vector<double> kBatchCountBuckets{
+        1, 2, 4, 8, 16, 32, 64, 128, 256, 512};
+    ylt::metric::histogram_t gds_requests_per_submit_{
+        "tent_gds_requests_per_submit",
+        "Logical GDS requests received per transport submit call",
+        kBatchCountBuckets};
+    ylt::metric::histogram_t gds_physical_ios_per_batch_{
+        "tent_gds_physical_ios_per_batch",
+        "Physical IO entries in each submitted cuFile batch",
+        kBatchCountBuckets};
+    ylt::metric::histogram_t gds_physical_batches_per_submit_{
+        "tent_gds_physical_batches_per_submit",
+        "Physical cuFile batches created by each transport submit call",
+        kBatchCountBuckets};
+    ylt::metric::histogram_t gds_dispatch_queued_batches_{
+        "tent_gds_dispatch_queued_batches",
+        "Queued physical GDS batches when the inflight limit is reached",
+        kBatchCountBuckets};
+    ylt::metric::histogram_t gds_dispatch_inflight_batches_{
+        "tent_gds_dispatch_inflight_batches",
+        "Inflight physical GDS batches when the limit is reached",
+        kBatchCountBuckets};
     // Size histograms for request size distribution (in bytes)
     // Default buckets: 1KB, 4KB, 16KB, 64KB, 256KB, 1MB, 4MB, 16MB, 64MB,
     // 256MB, 1GB

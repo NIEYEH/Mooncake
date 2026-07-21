@@ -223,6 +223,10 @@ TEST_F(MasterMetricsTest, GdsSsdStorageMetricsTest) {
               std::string::npos);
     ASSERT_NE(serialized.find("reason=\"capacity\""), std::string::npos);
 
+    const auto summary = metrics.get_summary_string();
+    ASSERT_NE(summary.find("GDS SSD: "), std::string::npos);
+    ASSERT_EQ(summary.find("GDS SSD: used"), std::string::npos);
+
     metrics.dec_gds_pending_size(segment_name, kPending);
     metrics.dec_gds_used_size(segment_name, kUsed);
     metrics.dec_allocated_gds_size(segment_name, kAllocated);

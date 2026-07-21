@@ -2164,8 +2164,6 @@ std::string MasterMetricManager::get_summary_string(
     int64_t nof_allocated = nof_allocated_size_.value();
     int64_t nof_capacity = nof_total_capacity_.value();
     int64_t gds_allocated = gds_allocated_size_.value();
-    int64_t gds_used = gds_used_size_.value();
-    int64_t gds_pending = gds_pending_size_.value();
     int64_t gds_capacity = gds_total_capacity_.value();
     int64_t file_allocated = file_allocated_size_.value();
     int64_t file_capacity = file_total_capacity_.value();
@@ -2464,8 +2462,7 @@ std::string MasterMetricManager::get_summary_string(
         ss << " (" << std::fixed << std::setprecision(1)
            << ((double)nof_allocated / (double)nof_capacity * 100.0) << "%)";
     }
-    ss << " | GDS SSD: used " << byte_size_to_string(gds_used)
-       << " + pending " << byte_size_to_string(gds_pending) << " / "
+    ss << " | GDS SSD: " << byte_size_to_string(gds_allocated) << " / "
        << byte_size_to_string(gds_capacity);
     if (gds_capacity > 0) {
         ss << " (" << std::fixed << std::setprecision(1)
