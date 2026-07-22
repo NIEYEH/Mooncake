@@ -143,6 +143,10 @@ std::shared_ptr<Config> makeGdsConfig() {
     config->set("transports/gds/enable", true);
     config->set("transports/gds/io_batch_depth", 64);
     config->set("transports/gds/max_inflight_batches", 1);
+    config->set("transports/gds/read_batch_depth", 64);
+    config->set("transports/gds/write_batch_depth", 32);
+    config->set("transports/gds/max_read_batch_bytes", 256UL << 20);
+    config->set("transports/gds/max_write_batch_bytes", 64UL << 20);
     config->set("transports/gds/aggregation_delay_us", 1000);
     config->set("transports/gds/status_poll_interval_us", 50);
     return config;

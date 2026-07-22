@@ -67,6 +67,8 @@ struct GdsIoBatch {
     std::vector<IoRef> refs;
     std::vector<CUfileIOEvents_t> events;
     size_t consecutive_poll_errors{0};
+    bool capacity_filled{false};
+    size_t split_retry_limit{0};
 };
 
 struct GdsSubBatch : public Transport::SubBatch {
@@ -122,7 +124,8 @@ class GdsTransport : public Transport {
     Status resolveIoBuffer(const Request& request, void*& io_base,
                            size_t& io_offset, int& device_id);
 
-    Status acquireBatchHandle(int device_id, BatchHandle*& handle);
+    Status acquireBatchHandle(int device_id, size_t required_depth,
+                              BatchHandle*& handle);
 
     void releaseBatchHandle(BatchHandle* handle);
 
@@ -132,6 +135,10 @@ class GdsTransport : public Transport {
         int device_id;
         CUfileIOParams_t params;
         std::chrono::steady_clock::time_point enqueued_at;
+        // Zero uses the configured opcode limit. A failed multi-entry batch
+        // is requeued with a smaller limit so one driver rejection does not
+        // fail every logical request in the physical batch.
+        size_t max_group_entries{0};
     };
 
     // All methods with the Locked suffix require scheduler_lock_. A global
@@ -160,6 +167,10 @@ class GdsTransport : public Transport {
     size_t io_batch_depth_;
     size_t max_io_size_;
     size_t max_inflight_batches_;
+    size_t read_batch_depth_;
+    size_t write_batch_depth_;
+    size_t max_read_batch_bytes_;
+    size_t max_write_batch_bytes_;
     size_t submit_retry_count_;
     size_t max_status_poll_errors_;
     std::chrono::microseconds aggregation_delay_;

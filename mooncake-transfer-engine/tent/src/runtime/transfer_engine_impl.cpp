@@ -1999,8 +1999,12 @@ Status TransferEngineImpl::resubmitTransferTask(Batch* batch, size_t task_id) {
     auto result = resolveTransport(task.request, task.xport_priority);
     auto type = result.transport;
     if (type == UNSPEC) {
-        LOG(WARNING) << "No more transports available after "
-                     << transportTypeName(prev_type) << " failed";
+        // One failed physical GDS batch can contain many logical tasks. Avoid
+        // emitting the same failover warning once per task while preserving a
+        // periodic signal for sustained failures.
+        LOG_EVERY_N(WARNING, 64)
+            << "No more transports available after "
+            << transportTypeName(prev_type) << " failed";
         return Status::InvalidEntry("All available transports are failed");
     }
 

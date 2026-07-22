@@ -2548,6 +2548,9 @@ std::vector<tl::expected<void, ErrorCode>> Client::CollectResults(
     results.reserve(ops.size());
 
     int no_available_handle_count = 0;
+    size_t batched_gds_failure_count = 0;
+    std::string first_batched_gds_failure_key;
+    std::string first_batched_gds_failure_context;
     for (const auto& op : ops) {
         // With the new structure, result is always set (never nullopt)
         results.emplace_back(op.result);
@@ -2563,6 +2566,14 @@ std::vector<tl::expected<void, ErrorCode>> Client::CollectResults(
             }
             if (op.result.error() == ErrorCode::NO_AVAILABLE_HANDLE) {
                 no_available_handle_count++;
+            } else if (op.failure_context &&
+                       op.failure_context->find(
+                           "Batched GDS transfer failed") == 0) {
+                ++batched_gds_failure_count;
+                if (first_batched_gds_failure_key.empty()) {
+                    first_batched_gds_failure_key = op.key;
+                    first_batched_gds_failure_context = *op.failure_context;
+                }
             } else {
                 LOG(ERROR) << "Operation for key " << op.key
                            << " failed: " << toString(op.result.error())
@@ -2578,6 +2589,12 @@ std::vector<tl::expected<void, ErrorCode>> Client::CollectResults(
     if (no_available_handle_count > 0) {
         LOG(WARNING) << "BatchPut failed for " << no_available_handle_count
                      << " keys" << PUT_NO_SPACE_HELPER_STR;
+    }
+    if (batched_gds_failure_count > 0) {
+        LOG(ERROR) << "BatchPut GDS transfer failed: failed_keys="
+                   << batched_gds_failure_count
+                   << ", first_key=" << first_batched_gds_failure_key
+                   << " (" << first_batched_gds_failure_context << ")";
     }
 
     return results;

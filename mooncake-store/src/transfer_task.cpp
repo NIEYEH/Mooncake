@@ -804,13 +804,18 @@ void TransferEngineOperationState::check_task_status() {
     // All tasks have reached a terminal state.
     ErrorCode ec = ErrorCode::OK;
     if (!failed_task_ids.empty()) {
+        constexpr size_t kMaxLoggedFailedTaskIds = 16;
         std::ostringstream oss;
-        for (size_t j = 0; j < failed_task_ids.size(); ++j) {
+        const size_t logged_count =
+            std::min(failed_task_ids.size(), kMaxLoggedFailedTaskIds);
+        for (size_t j = 0; j < logged_count; ++j) {
             if (j > 0) oss << ", ";
             oss << failed_task_ids[j];
         }
+        if (failed_task_ids.size() > logged_count) oss << ", ...";
         LOG(ERROR) << "Batch " << batch_id_
-                   << " completed with task failures: task_ids=[" << oss.str()
+                   << " completed with task failures: failed_count="
+                   << failed_task_ids.size() << ", task_ids=[" << oss.str()
                    << "]";
         ec = ErrorCode::TRANSFER_FAIL;
     }
