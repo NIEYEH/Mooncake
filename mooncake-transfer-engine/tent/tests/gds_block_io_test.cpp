@@ -312,6 +312,11 @@ TEST(GdsBlockIoTest, DestructiveWriteReadAtTwoOffsets) {
         << "The test intentionally refuses to overwrite the first block";
     ASSERT_EQ(*offset % alignment, 0u);
     ASSERT_EQ(*length % alignment, 0u);
+    ASSERT_LE(alignment,
+              static_cast<uint64_t>(std::numeric_limits<size_t>::max()));
+    ASSERT_LE(*length, static_cast<uint64_t>(
+                           std::numeric_limits<size_t>::max()) -
+                           alignment);
     ASSERT_LE(*length,
               (std::numeric_limits<uint64_t>::max() - *offset) / 2);
     const uint64_t test_range_end = *offset + *length * 2;
@@ -345,26 +350,33 @@ TEST(GdsBlockIoTest, DestructiveWriteReadAtTwoOffsets) {
     ASSERT_EQ(info.buffers[0].length, device_size);
 
     const size_t io_length = static_cast<size_t>(*length);
+    const size_t buffer_offset = static_cast<size_t>(alignment);
+    const size_t buffer_length = io_length + buffer_offset;
     RegisteredCudaBuffer source;
     RegisteredCudaBuffer destination;
     std::string error;
-    ASSERT_TRUE(source.initialize(engine, io_length, gpu, error)) << error;
-    ASSERT_TRUE(destination.initialize(engine, io_length, gpu, error))
+    ASSERT_TRUE(source.initialize(engine, buffer_length, gpu, error)) << error;
+    ASSERT_TRUE(destination.initialize(engine, buffer_length, gpu, error))
         << error;
-    ASSERT_EQ(reinterpret_cast<std::uintptr_t>(source.get()) % alignment, 0u);
-    ASSERT_EQ(reinterpret_cast<std::uintptr_t>(destination.get()) % alignment,
+    void* source_io = static_cast<char*>(source.get()) + buffer_offset;
+    void* destination_io =
+        static_cast<char*>(destination.get()) + buffer_offset;
+    ASSERT_NE(source_io, source.get());
+    ASSERT_NE(destination_io, destination.get());
+    ASSERT_EQ(reinterpret_cast<std::uintptr_t>(source_io) % alignment, 0u);
+    ASSERT_EQ(reinterpret_cast<std::uintptr_t>(destination_io) % alignment,
               0u);
 
     const auto first_pattern = makePattern(io_length, 0x31);
     const auto second_pattern = makePattern(io_length, 0xa7);
     TransferStatus transfer_status{};
     if (!read_only) {
-        ASSERT_EQ(cudaMemcpy(source.get(), first_pattern.data(), io_length,
+        ASSERT_EQ(cudaMemcpy(source_io, first_pattern.data(), io_length,
                              cudaMemcpyHostToDevice),
                   cudaSuccess);
         ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
 
-        auto write_request = makeRequest(Request::WRITE, source.get(), segment,
+        auto write_request = makeRequest(Request::WRITE, source_io, segment,
                                          *offset, io_length);
         auto second_write_request = write_request;
         second_write_request.target_offset = *offset + *length;
@@ -374,7 +386,7 @@ TEST(GdsBlockIoTest, DestructiveWriteReadAtTwoOffsets) {
         ASSERT_EQ(transfer_status.s, COMPLETED);
         ASSERT_EQ(transfer_status.transferred_bytes, io_length * 2);
 
-        ASSERT_EQ(cudaMemcpy(source.get(), second_pattern.data(), io_length,
+        ASSERT_EQ(cudaMemcpy(source_io, second_pattern.data(), io_length,
                              cudaMemcpyHostToDevice),
                   cudaSuccess);
         ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
@@ -386,28 +398,28 @@ TEST(GdsBlockIoTest, DestructiveWriteReadAtTwoOffsets) {
     }
 
     std::vector<uint8_t> actual(io_length);
-    ASSERT_EQ(cudaMemset(destination.get(), 0, io_length), cudaSuccess);
+    ASSERT_EQ(cudaMemset(destination_io, 0, io_length), cudaSuccess);
     ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
-    auto request = makeRequest(Request::READ, destination.get(), reader_segment,
+    auto request = makeRequest(Request::READ, destination_io, reader_segment,
                                *offset, io_length);
     ASSERT_TRUE(runTransfer(engine, request, transfer_status, error)) << error;
     ASSERT_EQ(transfer_status.s, COMPLETED);
-    ASSERT_EQ(cudaMemcpy(actual.data(), destination.get(), io_length,
+    ASSERT_EQ(cudaMemcpy(actual.data(), destination_io, io_length,
                          cudaMemcpyDeviceToHost),
               cudaSuccess);
     EXPECT_EQ(std::memcmp(actual.data(), first_pattern.data(), io_length), 0);
 
-    ASSERT_EQ(cudaMemset(destination.get(), 0, io_length), cudaSuccess);
+    ASSERT_EQ(cudaMemset(destination_io, 0, io_length), cudaSuccess);
     ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
     request.target_offset = *offset + *length;
     ASSERT_TRUE(runTransfer(engine, request, transfer_status, error)) << error;
     ASSERT_EQ(transfer_status.s, COMPLETED);
-    ASSERT_EQ(cudaMemcpy(actual.data(), destination.get(), io_length,
+    ASSERT_EQ(cudaMemcpy(actual.data(), destination_io, io_length,
                          cudaMemcpyDeviceToHost),
               cudaSuccess);
     EXPECT_EQ(std::memcmp(actual.data(), second_pattern.data(), io_length), 0);
 
-    request = makeRequest(Request::READ, destination.get(), segment,
+    request = makeRequest(Request::READ, destination_io, segment,
                           *offset + 1, io_length);
     ASSERT_TRUE(runTransfer(engine, request, transfer_status, error)) << error;
     EXPECT_EQ(transfer_status.s, FAILED);

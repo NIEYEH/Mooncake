@@ -237,11 +237,12 @@ Status GdsTransport::install(std::string& local_segment_name,
         LOG(WARNING) << "Unable to query cuFile max_direct_io_size; using "
                      << max_io_size_ << " bytes";
     }
-    max_io_size_ = std::min(max_io_size_, kSafeUnregisteredBatchIoSize);
     LOG(INFO) << "GDS transport limits: configured_batch_depth="
               << configured_batch_depth
               << ", effective_batch_depth=" << io_batch_depth_
-              << ", max_io_size=" << max_io_size_
+              << ", registered_max_io_size=" << max_io_size_
+              << ", unregistered_max_io_size="
+              << std::min(max_io_size_, kSafeUnregisteredBatchIoSize)
               << ", requested_inflight_batches="
               << requested_inflight_batches
               << ", max_inflight_batches=" << max_inflight_batches_
@@ -268,6 +269,10 @@ Status GdsTransport::uninstall() {
                 Slab<GdsSubBatch>::Get().deallocate(gds_batch);
             }
             allocated_batches_.clear();
+        }
+        {
+            std::lock_guard<std::mutex> lock(inflight_batches_lock_);
+            inflight_batches_ = 0;
         }
 
         // Clean up all handles in the pool
@@ -477,12 +482,11 @@ Status GdsTransport::submitNextIoBatch(GdsSubBatch* batch) {
     if (!batch)
         return Status::InvalidArgument("Invalid GDS sub-batch" LOC_MARK);
 
-    size_t inflight_batches = static_cast<size_t>(std::count_if(
-        batch->io_batches.begin(), batch->io_batches.end(),
-        [](const GdsIoBatch& io_batch) {
-            return io_batch.state == GdsIoBatch::State::SUBMITTED;
-        }));
-    if (inflight_batches >= max_inflight_batches_) {
+    // Admission is transport-wide. A per-SubBatch count permits independent
+    // callers to submit concurrent cuFile handles even when concurrency is
+    // explicitly disabled.
+    std::lock_guard<std::mutex> inflight_guard(inflight_batches_lock_);
+    if (inflight_batches_ >= max_inflight_batches_) {
         const size_t queued_batches = static_cast<size_t>(std::count_if(
             batch->io_batches.begin(), batch->io_batches.end(),
             [](const GdsIoBatch& io_batch) {
@@ -490,19 +494,19 @@ Status GdsTransport::submitNextIoBatch(GdsSubBatch* batch) {
             }));
         if (queued_batches > 0 && !batch->dispatch_window_blocked) {
             TentMetrics::instance().recordGdsDispatchWindowFull(
-                queued_batches, inflight_batches);
+                queued_batches, inflight_batches_);
             batch->dispatch_window_blocked = true;
             LOG_EVERY_N(INFO, 256)
                 << "GDS dispatch window full: queued_batches="
                 << queued_batches
-                << ", inflight_batches=" << inflight_batches
+                << ", inflight_batches=" << inflight_batches_
                 << ", max_inflight_batches=" << max_inflight_batches_;
         }
         return Status::OK();
     }
     batch->dispatch_window_blocked = false;
 
-    while (inflight_batches < max_inflight_batches_) {
+    while (inflight_batches_ < max_inflight_batches_) {
         auto it = std::find_if(
             batch->io_batches.begin(), batch->io_batches.end(),
             [](const GdsIoBatch& io_batch) {
@@ -552,7 +556,7 @@ Status GdsTransport::submitNextIoBatch(GdsSubBatch* batch) {
             TentMetrics::instance().recordGdsPhysicalBatch(
                 it->param_count, physical_bytes, submit_seconds);
             it->state = GdsIoBatch::State::SUBMITTED;
-            ++inflight_batches;
+            ++inflight_batches_;
             auto restore_status = device_guard.restore();
             if (!restore_status.ok()) LOG(ERROR) << restore_status.ToString();
             continue;
@@ -669,7 +673,13 @@ Status GdsTransport::submitTransferTasks(
     size_t num_params = 0;
     size_t first_param_index = gds_batch->io_params.size();
     std::vector<GdsFileContext*> contexts;
+    std::vector<void*> io_bases;
+    std::vector<size_t> io_offsets;
+    std::vector<size_t> io_chunk_sizes;
     contexts.reserve(request_list.size());
+    io_bases.reserve(request_list.size());
+    io_offsets.reserve(request_list.size());
+    io_chunk_sizes.reserve(request_list.size());
     int batch_device_id = -1;
     for (const auto& request : request_list) {
         auto status = validateRequest(request);
@@ -682,13 +692,6 @@ Status GdsTransport::submitTransferTasks(
                        << status.ToString();
             return status;
         }
-
-        const size_t request_params =
-            1 + (request.length - 1) / max_io_size_;
-        if (request_params > std::numeric_limits<size_t>::max() - num_params)
-            return Status::TooManyRequests(
-                "GDS request count overflows" LOC_MARK);
-        num_params += request_params;
 
         void* io_base = nullptr;
         size_t io_offset = 0;
@@ -704,22 +707,39 @@ Status GdsTransport::submitTransferTasks(
             }
             batch_device_id = request_device_id;
         }
-        (void)io_base;
-        (void)io_offset;
+
+        // Registered CUDA buffers can use the driver's full direct-I/O size.
+        // The 960 KiB limit exists only for cuFile's unregistered/bounce-buffer
+        // path; applying it to vLLM's registered KV allocation triples the
+        // physical I/O count for every 2.25 MiB cache object.
+        const size_t io_chunk_size =
+            request_device_id >= 0
+                ? max_io_size_
+                : std::min(max_io_size_, kSafeUnregisteredBatchIoSize);
+        const size_t request_params =
+            1 + (request.length - 1) / io_chunk_size;
+        if (request_params > std::numeric_limits<size_t>::max() - num_params)
+            return Status::TooManyRequests(
+                "GDS request count overflows" LOC_MARK);
+        num_params += request_params;
 
         GdsFileContext* context = findFileContext(request.target_id);
         if (!context || !context->ready())
             return Status::InvalidArgument("Invalid remote segment" LOC_MARK);
         contexts.push_back(context);
+        io_bases.push_back(io_base);
+        io_offsets.push_back(io_offset);
+        io_chunk_sizes.push_back(io_chunk_size);
     }
     for (size_t request_index = 0; request_index < request_list.size();
          ++request_index) {
         const auto& request = request_list[request_index];
         GdsFileContext* context = contexts[request_index];
         IOParamRange range{gds_batch->io_params.size(), 0};
+        const size_t io_chunk_size = io_chunk_sizes[request_index];
         for (size_t offset = 0; offset < request.length;
-             offset += max_io_size_) {
-            size_t length = std::min(max_io_size_, request.length - offset);
+             offset += io_chunk_size) {
+            size_t length = std::min(io_chunk_size, request.length - offset);
             const size_t param_index = gds_batch->io_params.size();
             CUfileIOParams_t params{};
             params.mode = CUFILE_BATCH;
@@ -727,9 +747,12 @@ Status GdsTransport::submitTransferTasks(
                 (request.opcode == Request::READ) ? CUFILE_READ : CUFILE_WRITE;
             params.cookie = reinterpret_cast<void*>(
                 static_cast<std::uintptr_t>(param_index + 1));
-            params.u.batch.devPtr_base =
-                static_cast<char*>(request.source) + offset;
-            params.u.batch.devPtr_offset = 0;
+            // Keep the base pointer identical to the pointer registered with
+            // cuFileBufRegister. KV blocks are interior slices of one large
+            // registered allocation and must be addressed via devPtr_offset.
+            params.u.batch.devPtr_base = io_bases[request_index];
+            params.u.batch.devPtr_offset = static_cast<off_t>(
+                io_offsets[request_index] + offset);
             params.u.batch.file_offset = request.target_offset + offset;
             params.u.batch.size = length;
             params.fh = context->getHandle();
@@ -875,6 +898,16 @@ Status GdsTransport::getTransferStatus(SubBatchRef batch, int task_id,
             if (gds_batch->io_statuses[index] == PENDING) ++pending_count;
         }
         if (pending_count == 0) {
+            {
+                std::lock_guard<std::mutex> inflight_guard(
+                    inflight_batches_lock_);
+                if (inflight_batches_ == 0) {
+                    return Status::InternalError(
+                        "GDS global inflight batch accounting underflow"
+                        LOC_MARK);
+                }
+                --inflight_batches_;
+            }
             releaseBatchHandle(io_batch.batch_handle);
             io_batch.batch_handle = nullptr;
             io_batch.state = GdsIoBatch::State::COMPLETE;

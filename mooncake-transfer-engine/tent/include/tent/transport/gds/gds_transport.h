@@ -139,6 +139,12 @@ class GdsTransport : public Transport {
     size_t max_io_size_;
     size_t max_inflight_batches_;
 
+    // Enforce the cuFile batch limit across the whole transport. Multiple
+    // vLLM receive threads create independent GdsSubBatches, so a per-batch
+    // counter would allow them to bypass the configured safety limit.
+    size_t inflight_batches_{0};
+    std::mutex inflight_batches_lock_;
+
     // Object pool for BatchHandle to avoid frequent cuFileBatchIOSetUp/Destroy
     // CUfileBatchHandle_t is reusable per cuFile API documentation
     std::vector<BatchHandle*> handle_pool_;

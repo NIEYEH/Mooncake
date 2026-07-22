@@ -922,6 +922,13 @@ void TransferEngineOperationState::wait_for_completion() {
         // Continue polling
         VLOG(1) << "Transfer engine operation still pending for batch "
                 << batch_id_;
+        // check_task_status() drives transport progress, but spinning here
+        // without yielding consumes a full CPU core per store request and
+        // increases contention with GDS completion/dispatch workers. Release
+        // the state lock and use a short backoff; GDS I/O latency is much
+        // larger than this interval.
+        lock.unlock();
+        std::this_thread::sleep_for(std::chrono::microseconds(50));
     }
 #endif
 }

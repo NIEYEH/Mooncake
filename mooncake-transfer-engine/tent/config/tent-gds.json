@@ -5,15 +5,15 @@
 
   "runtime_queue": {
     "max_outstanding_owners": 1024,
-    "max_outstanding_bytes": 1073741824,
+    "max_outstanding_bytes": 2147483648,
 
-    "max_dispatch_owners": 256,
-    "max_dispatch_bytes": 67108864,
+    "max_dispatch_owners": 128,
+    "max_dispatch_bytes": 536870912,
 
     "staging_owner_reserve": 0,
     "staging_byte_reserve": 0,
 
-    "progress_fallback_interval_us": 1000
+    "progress_fallback_interval_us": 200
   },
 
   "transports": {
