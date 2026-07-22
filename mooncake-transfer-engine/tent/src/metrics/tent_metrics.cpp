@@ -313,8 +313,7 @@ void TentMetrics::recordGdsCoalescing(size_t input_requests,
 void TentMetrics::recordGdsTransportSubmission(size_t logical_requests,
                                                size_t physical_ios,
                                                size_t physical_batches,
-                                               size_t small_requests,
-                                               size_t underfilled_batches) {
+                                               size_t small_requests) {
     if (!initialized_ || !runtime_enabled_.load(std::memory_order_relaxed))
         return;
     gds_transport_submit_calls_total_.inc();
@@ -323,8 +322,6 @@ void TentMetrics::recordGdsTransportSubmission(size_t logical_requests,
     gds_transport_physical_ios_created_total_.inc(
         static_cast<int64_t>(physical_ios));
     gds_small_requests_total_.inc(static_cast<int64_t>(small_requests));
-    gds_underfilled_batches_total_.inc(
-        static_cast<int64_t>(underfilled_batches));
     gds_requests_per_submit_.observe(static_cast<int64_t>(logical_requests));
     gds_physical_batches_per_submit_.observe(
         static_cast<int64_t>(physical_batches));
@@ -342,12 +339,14 @@ void TentMetrics::recordGdsDispatchWindowFull(size_t queued_batches,
 }
 
 void TentMetrics::recordGdsPhysicalBatch(size_t io_count, size_t bytes,
-                                         double submit_latency_seconds) {
+                                         double submit_latency_seconds,
+                                         bool underfilled) {
     if (!initialized_ || !runtime_enabled_.load(std::memory_order_relaxed))
         return;
     gds_physical_ios_total_.inc(static_cast<int64_t>(io_count));
     gds_physical_bytes_total_.inc(static_cast<int64_t>(bytes));
     gds_physical_batches_total_.inc();
+    if (underfilled) gds_underfilled_batches_total_.inc();
     gds_physical_ios_per_batch_.observe(static_cast<int64_t>(io_count));
     if (submit_latency_seconds > 0.0) {
         gds_batch_submit_latency_.observe(static_cast<int64_t>(
@@ -509,10 +508,10 @@ void TentMetrics::recordGdsHandleRegistrationFailed() {}
 void TentMetrics::recordGdsBufferRegistrationFailed() {}
 void TentMetrics::recordGdsBatchSubmitFailed() {}
 void TentMetrics::recordGdsCoalescing(size_t, size_t, size_t) {}
-void TentMetrics::recordGdsTransportSubmission(size_t, size_t, size_t, size_t,
+void TentMetrics::recordGdsTransportSubmission(size_t, size_t, size_t,
                                                size_t) {}
 void TentMetrics::recordGdsDispatchWindowFull(size_t, size_t) {}
-void TentMetrics::recordGdsPhysicalBatch(size_t, size_t, double) {}
+void TentMetrics::recordGdsPhysicalBatch(size_t, size_t, double, bool) {}
 void TentMetrics::updateRuntimeQueue(size_t, size_t, size_t, size_t) {}
 void TentMetrics::recordDeadlineMLU(double) {}
 

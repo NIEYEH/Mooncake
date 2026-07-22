@@ -141,7 +141,10 @@ std::shared_ptr<Config> makeGdsConfig() {
     config->set("transports/nvlink/enable", false);
     config->set("transports/mnnvl/enable", false);
     config->set("transports/gds/enable", true);
-    config->set("transports/gds/io_batch_depth", 1);
+    config->set("transports/gds/io_batch_depth", 64);
+    config->set("transports/gds/max_inflight_batches", 1);
+    config->set("transports/gds/aggregation_delay_us", 1000);
+    config->set("transports/gds/status_poll_interval_us", 50);
     return config;
 }
 
@@ -211,6 +214,78 @@ bool runTransfers(TransferEngine& engine,
 bool runTransfer(TransferEngine& engine, const Request& request,
                  TransferStatus& final_status, std::string& error) {
     return runTransfers(engine, {request}, final_status, error);
+}
+
+bool runIndependentTransfers(TransferEngine& engine,
+                             const std::vector<Request>& requests,
+                             std::vector<TransferStatus>& final_statuses,
+                             std::string& error) {
+    std::vector<BatchID> batches;
+    batches.reserve(requests.size());
+    final_statuses.assign(requests.size(), TransferStatus{INITIAL, 0});
+
+    auto free_all = [&] {
+        for (auto batch : batches) (void)engine.freeBatch(batch);
+        batches.clear();
+    };
+
+    for (const auto& request : requests) {
+        BatchID batch = engine.allocateBatch(1);
+        if (batch == 0) {
+            error = "allocateBatch failed for independent GDS request";
+            free_all();
+            return false;
+        }
+        batches.push_back(batch);
+        auto status = engine.submitTransfer(batch, {request});
+        if (!status.ok()) {
+            error = "submitTransfer failed for independent GDS request: " +
+                    status.ToString();
+            free_all();
+            return false;
+        }
+    }
+
+    constexpr int kPollLimit = 60000;
+    for (int poll = 0; poll < kPollLimit; ++poll) {
+        bool all_terminal = true;
+        for (size_t index = 0; index < batches.size(); ++index) {
+            if (final_statuses[index].s != PENDING &&
+                final_statuses[index].s != INITIAL) {
+                continue;
+            }
+            auto status = engine.getTransferStatus(batches[index],
+                                                   final_statuses[index]);
+            if (!status.ok()) {
+                error = "getTransferStatus failed for independent GDS "
+                        "request: " +
+                        status.ToString();
+                free_all();
+                return false;
+            }
+            if (final_statuses[index].s == PENDING ||
+                final_statuses[index].s == INITIAL) {
+                all_terminal = false;
+            }
+        }
+        if (all_terminal) {
+            for (auto batch : batches) {
+                auto status = engine.freeBatch(batch);
+                if (!status.ok()) {
+                    error = "freeBatch failed for independent GDS request: " +
+                            status.ToString();
+                    return false;
+                }
+            }
+            batches.clear();
+            return true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+
+    error = "Independent GDS transfers did not finish within 60 seconds";
+    free_all();
+    return false;
 }
 
 Request makeRequest(Request::OpCode opcode, void* buffer, SegmentID segment,
@@ -354,13 +429,19 @@ TEST(GdsBlockIoTest, DestructiveWriteReadAtTwoOffsets) {
     const size_t buffer_length = io_length + buffer_offset;
     RegisteredCudaBuffer source;
     RegisteredCudaBuffer destination;
+    RegisteredCudaBuffer second_destination;
     std::string error;
     ASSERT_TRUE(source.initialize(engine, buffer_length, gpu, error)) << error;
     ASSERT_TRUE(destination.initialize(engine, buffer_length, gpu, error))
         << error;
+    ASSERT_TRUE(
+        second_destination.initialize(engine, buffer_length, gpu, error))
+        << error;
     void* source_io = static_cast<char*>(source.get()) + buffer_offset;
     void* destination_io =
         static_cast<char*>(destination.get()) + buffer_offset;
+    void* second_destination_io =
+        static_cast<char*>(second_destination.get()) + buffer_offset;
     ASSERT_NE(source_io, source.get());
     ASSERT_NE(destination_io, destination.get());
     ASSERT_EQ(reinterpret_cast<std::uintptr_t>(source_io) % alignment, 0u);
@@ -415,6 +496,33 @@ TEST(GdsBlockIoTest, DestructiveWriteReadAtTwoOffsets) {
     ASSERT_TRUE(runTransfer(engine, request, transfer_status, error)) << error;
     ASSERT_EQ(transfer_status.s, COMPLETED);
     ASSERT_EQ(cudaMemcpy(actual.data(), destination_io, io_length,
+                         cudaMemcpyDeviceToHost),
+              cudaSuccess);
+    EXPECT_EQ(std::memcmp(actual.data(), second_pattern.data(), io_length), 0);
+
+    // Submit one request per TransferEngine Batch. This is the shape produced
+    // by concurrent Store/vLLM loads and verifies that the GDS transport-level
+    // scheduler can coalesce work across independent logical SubBatches.
+    ASSERT_EQ(cudaMemset(destination_io, 0, io_length), cudaSuccess);
+    ASSERT_EQ(cudaMemset(second_destination_io, 0, io_length), cudaSuccess);
+    ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+    std::vector<TransferStatus> independent_statuses;
+    ASSERT_TRUE(runIndependentTransfers(
+        engine,
+        {makeRequest(Request::READ, destination_io, reader_segment, *offset,
+                     io_length),
+         makeRequest(Request::READ, second_destination_io, reader_segment,
+                     *offset + *length, io_length)},
+        independent_statuses, error))
+        << error;
+    ASSERT_EQ(independent_statuses.size(), 2u);
+    EXPECT_EQ(independent_statuses[0].s, COMPLETED);
+    EXPECT_EQ(independent_statuses[1].s, COMPLETED);
+    ASSERT_EQ(cudaMemcpy(actual.data(), destination_io, io_length,
+                         cudaMemcpyDeviceToHost),
+              cudaSuccess);
+    EXPECT_EQ(std::memcmp(actual.data(), first_pattern.data(), io_length), 0);
+    ASSERT_EQ(cudaMemcpy(actual.data(), second_destination_io, io_length,
                          cudaMemcpyDeviceToHost),
               cudaSuccess);
     EXPECT_EQ(std::memcmp(actual.data(), second_pattern.data(), io_length), 0);

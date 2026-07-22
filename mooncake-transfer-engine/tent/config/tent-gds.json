@@ -29,7 +29,11 @@
       "enable": true,
       "io_batch_depth": 64,
       "max_inflight_batches": 1,
-      "allow_concurrent_batches": false
+      "allow_concurrent_batches": false,
+      "aggregation_delay_us": 50,
+      "status_poll_interval_us": 50,
+      "submit_retry_count": 1,
+      "max_status_poll_errors": 20
     },
 
     "io_uring": {

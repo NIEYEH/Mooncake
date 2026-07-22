@@ -17,8 +17,11 @@
 
 #include <bits/stdint-uintn.h>
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
+#include <list>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -50,27 +53,28 @@ struct BatchHandle {
     int device_id;  // CUDA device whose context created this handle
 };
 
+struct GdsSubBatch;
+
 struct GdsIoBatch {
-    enum class State { QUEUED, SUBMITTED, COMPLETE };
+    struct IoRef {
+        GdsSubBatch* owner;
+        size_t param_index;
+    };
 
     BatchHandle* batch_handle;
     int device_id;
-    size_t param_base;
-    size_t param_count;
     std::vector<CUfileIOParams_t> params;
-    State state;
+    std::vector<IoRef> refs;
+    std::vector<CUfileIOEvents_t> events;
+    size_t consecutive_poll_errors{0};
 };
 
 struct GdsSubBatch : public Transport::SubBatch {
     size_t max_size;
-    std::vector<GdsIoBatch> io_batches;
     std::vector<IOParamRange> io_param_ranges;
     std::vector<CUfileIOParams_t> io_params;
-    std::vector<CUfileIOEvents_t> io_events;
     std::vector<TransferStatusEnum> io_statuses;
     std::vector<size_t> io_transferred_bytes;
-    bool dispatch_window_blocked{false};
-    std::mutex status_lock;
     virtual size_t size() const { return io_param_ranges.size(); }
 };
 
@@ -122,7 +126,25 @@ class GdsTransport : public Transport {
 
     void releaseBatchHandle(BatchHandle* handle);
 
-    Status submitNextIoBatch(GdsSubBatch* batch);
+    struct PendingIo {
+        GdsSubBatch* owner;
+        size_t param_index;
+        int device_id;
+        CUfileIOParams_t params;
+        std::chrono::steady_clock::time_point enqueued_at;
+    };
+
+    // All methods with the Locked suffix require scheduler_lock_. A global
+    // scheduler is necessary because Store clients commonly submit one KV
+    // object per SubBatch. Per-SubBatch cuFile queues turn that workload into
+    // depth-1 physical I/O even when dozens of requests are waiting.
+    Status dispatchPendingIoLocked();
+
+    Status pollInflightIoLocked();
+
+    void failPhysicalBatchLocked(GdsIoBatch& io_batch);
+
+    bool subBatchHasWorkLocked(const GdsSubBatch* batch) const;
 
    private:
     bool installed_;
@@ -138,12 +160,18 @@ class GdsTransport : public Transport {
     size_t io_batch_depth_;
     size_t max_io_size_;
     size_t max_inflight_batches_;
+    size_t submit_retry_count_;
+    size_t max_status_poll_errors_;
+    std::chrono::microseconds aggregation_delay_;
+    std::chrono::microseconds status_poll_interval_;
 
-    // Enforce the cuFile batch limit across the whole transport. Multiple
-    // vLLM receive threads create independent GdsSubBatches, so a per-batch
-    // counter would allow them to bypass the configured safety limit.
-    size_t inflight_batches_{0};
-    std::mutex inflight_batches_lock_;
+    // The physical scheduler is transport-wide. It coalesces I/O from
+    // independent logical SubBatches and enforces one bounded cuFile window.
+    std::deque<PendingIo> pending_ios_;
+    std::list<std::unique_ptr<GdsIoBatch>> inflight_io_batches_;
+    std::chrono::steady_clock::time_point last_status_poll_{};
+    bool dispatch_window_blocked_{false};
+    std::mutex scheduler_lock_;
 
     // Object pool for BatchHandle to avoid frequent cuFileBatchIOSetUp/Destroy
     // CUfileBatchHandle_t is reusable per cuFile API documentation

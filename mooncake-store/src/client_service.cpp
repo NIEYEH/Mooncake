@@ -1490,13 +1490,18 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
         ErrorCode batch_result = ErrorCode::TRANSFER_FAIL;
         if (future.has_value()) batch_result = future->get();
 
+        if (batch_result != ErrorCode::OK) {
+            LOG(ERROR) << "Batched GDS transfer failed: key_count="
+                       << gds_keys.size() << ", error="
+                       << static_cast<int>(batch_result)
+                       << ". See the preceding TENT GDS error for the "
+                          "physical I/O cause.";
+        }
+
         for (size_t i = 0; i < gds_result_indices.size(); ++i) {
             const size_t index = gds_result_indices[i];
             const auto& key = gds_keys[i];
             if (batch_result != ErrorCode::OK) {
-                LOG(ERROR) << "Batched GDS transfer failed for key: " << key
-                           << " with error: "
-                           << static_cast<int>(batch_result);
                 results[index] = tl::unexpected(batch_result);
                 continue;
             }

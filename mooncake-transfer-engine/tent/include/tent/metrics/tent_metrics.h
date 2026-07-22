@@ -87,13 +87,13 @@ class TentMetrics {
                              size_t bytes);
     void recordGdsTransportSubmission(size_t logical_requests,
                                       size_t physical_ios,
-                                      size_t physical_batches,
-                                      size_t small_requests,
-                                      size_t underfilled_batches);
+                                      size_t unaggregated_physical_batches,
+                                      size_t small_requests);
     void recordGdsDispatchWindowFull(size_t queued_batches,
                                      size_t inflight_batches);
     void recordGdsPhysicalBatch(size_t io_count, size_t bytes,
-                                double submit_latency_seconds);
+                                double submit_latency_seconds,
+                                bool underfilled);
     void updateRuntimeQueue(size_t queued_owners, size_t queued_bytes,
                             size_t inflight_owners, size_t inflight_bytes);
 
@@ -194,7 +194,7 @@ class TentMetrics {
         "Physical GDS batches below configured batch depth"};
     ylt::metric::counter_t gds_dispatch_window_full_total_{
         "tent_gds_dispatch_window_full_total",
-        "Attempts blocked by the per-sub-batch inflight batch limit"};
+        "Attempts blocked by the transport-wide inflight batch limit"};
 
     ylt::metric::gauge_t runtime_queue_owners_{
         "tent_runtime_queue_owners", "Owners waiting in the runtime queue"};
@@ -236,7 +236,7 @@ class TentMetrics {
         kBatchCountBuckets};
     ylt::metric::histogram_t gds_physical_batches_per_submit_{
         "tent_gds_physical_batches_per_submit",
-        "Physical cuFile batches created by each transport submit call",
+        "Physical batches needed before cross-submit GDS aggregation",
         kBatchCountBuckets};
     ylt::metric::histogram_t gds_dispatch_queued_batches_{
         "tent_gds_dispatch_queued_batches",
