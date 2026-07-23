@@ -155,9 +155,9 @@ class GdsTransport : public Transport {
     // depth-1 physical I/O even when dozens of requests are waiting.
     Status dispatchPendingIoLocked();
 
-    Status dispatchDirectWritesLocked(int device_id);
+    Status dispatchDirectIoLocked(int device_id, bool write);
 
-    void executeDirectWrite(std::shared_ptr<DirectIo> direct_io);
+    void executeDirectIo(std::shared_ptr<DirectIo> direct_io);
 
     Status pollInflightIoLocked();
 
@@ -183,8 +183,11 @@ class GdsTransport : public Transport {
     size_t write_batch_depth_;
     size_t max_read_batch_bytes_;
     size_t max_write_batch_bytes_;
+    bool batch_read_enabled_;
     bool batch_write_enabled_;
+    size_t read_worker_threads_;
     size_t write_worker_threads_;
+    size_t max_inflight_reads_;
     size_t max_inflight_writes_;
     size_t submit_retry_count_;
     size_t max_status_poll_errors_;
@@ -196,11 +199,14 @@ class GdsTransport : public Transport {
     std::deque<PendingIo> pending_ios_;
     std::list<std::unique_ptr<GdsIoBatch>> inflight_io_batches_;
     std::unordered_map<uint64_t, std::shared_ptr<DirectIo>>
+        inflight_direct_reads_;
+    std::unordered_map<uint64_t, std::shared_ptr<DirectIo>>
         inflight_direct_writes_;
     uint64_t next_direct_io_id_{1};
     std::chrono::steady_clock::time_point last_status_poll_{};
     bool dispatch_window_blocked_{false};
     std::mutex scheduler_lock_;
+    std::unique_ptr<ThreadPool> read_thread_pool_;
     std::unique_ptr<ThreadPool> write_thread_pool_;
     std::atomic<bool> shutting_down_{false};
 

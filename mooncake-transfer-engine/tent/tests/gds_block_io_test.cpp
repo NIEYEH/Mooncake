@@ -147,8 +147,11 @@ std::shared_ptr<Config> makeGdsConfig() {
     config->set("transports/gds/write_batch_depth", 32);
     config->set("transports/gds/max_read_batch_bytes", 256UL << 20);
     config->set("transports/gds/max_write_batch_bytes", 64UL << 20);
+    config->set("transports/gds/enable_batch_read", false);
     config->set("transports/gds/enable_batch_write", false);
+    config->set("transports/gds/read_worker_threads", 4);
     config->set("transports/gds/write_worker_threads", 4);
+    config->set("transports/gds/max_inflight_reads", 8);
     config->set("transports/gds/max_inflight_writes", 8);
     config->set("transports/gds/aggregation_delay_us", 1000);
     config->set("transports/gds/status_poll_interval_us", 50);
