@@ -27,6 +27,16 @@ target_include_directories(admission_queue_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME admission_queue_test COMMAND admission_queue_test)
 
+add_executable(
+  tent_gds_operation_scheduler_test
+  gds_operation_scheduler_test.cpp
+  ../src/runtime/gds_operation_scheduler.cpp)
+target_link_libraries(tent_gds_operation_scheduler_test PRIVATE tent_common)
+target_include_directories(tent_gds_operation_scheduler_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME tent_gds_operation_scheduler_test
+         COMMAND tent_gds_operation_scheduler_test)
+
 add_executable(tent_ip_utils_test ip_utils_test.cpp)
 target_link_libraries(tent_ip_utils_test PRIVATE tent_common gtest gtest_main)
 target_include_directories(tent_ip_utils_test
