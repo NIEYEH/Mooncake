@@ -79,14 +79,14 @@ Two checked-in example configurations define reproducible modes.
 | WRITE physical inflight | 1 |
 | cuFile Batch | disabled |
 | Async | disabled |
-| merge mode | `off` |
+| merge mode | `shadow` (statistics only) |
 
 ### Weighted-fair mode
 
 | Setting | Default |
 | --- | ---: |
 | shared physical tokens | 16 |
-| READ minimum reservation | 12 |
+| READ protected capacity during normal/boosted contention | 15 / 14 |
 | READ standalone maximum | 16 |
 | WRITE minimum reservation | 1 |
 | WRITE standalone maximum | 2, configurable 1-4 |
@@ -523,3 +523,31 @@ At the same workload and data set:
 No single metric is sufficient. The optimized mode is accepted only when the
 operation, scheduler, GPU, inference, correctness, and bounded-queue gates hold
 together.
+
+## Implementation status (2026-07-23)
+
+The fixed baseline and opt-in weighted-fair scheduler are implemented. Runtime
+admission reserves planned physical tokens and bytes, actual completed bytes
+settle WDRR service debt, idle credit is bounded, and the primary READ
+operation can fill its window through multiple bounded segments before a
+secondary operation is considered. WRITE pressure promotion uses explicit
+promotion, demotion, READ-P99 protection, and cooldown windows.
+
+GDS consumes the runtime-selected order through separate READ and WRITE worker
+pools under one shared device budget. cuFile Batch and Async calls are absent
+from the production path. Physical merge execution is not enabled; shadow
+statistics report safe contiguous candidates. Operation timeline logs and the
+synchronized baseline collector expose queue wait, active workers, cuFile
+latency, physical completion bytes, operation latency, queue lengths, and
+config/executable identity.
+
+Indirect lease refresh is intentionally not implemented in the production
+path. Master expiry/group behavior tests and the external load-probe evaluator
+define the acceptance gate. Async likewise remains disabled until a
+startup-only independent probe is implemented and validated.
+
+Host-independent scheduler, admission, FIFO, operation-timeline, collector,
+lease-probe, and warmup tests are available. CUDA/cuFile, NVMe-oF, Master load,
+data-integrity failure injection, and the 80-session GPU/inference matrix remain
+target-host gates; no claim of end-to-end GDS success is made until those gates
+pass.
