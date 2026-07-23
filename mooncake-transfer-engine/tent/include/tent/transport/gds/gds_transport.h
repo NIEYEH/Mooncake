@@ -17,6 +17,7 @@
 
 #include <bits/stdint-uintn.h>
 
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -32,6 +33,7 @@
 
 #include <cufile.h>
 
+#include "tent/common/concurrent/thread_pool.h"
 #include "tent/runtime/control_plane.h"
 #include "tent/runtime/transport.h"
 
@@ -139,11 +141,23 @@ class GdsTransport : public Transport {
         size_t max_group_entries{0};
     };
 
+    struct DirectIo {
+        uint64_t id;
+        GdsSubBatch* owner;
+        size_t param_index;
+        int device_id;
+        CUfileIOParams_t params;
+    };
+
     // All methods with the Locked suffix require scheduler_lock_. A global
     // scheduler is necessary because Store clients commonly submit one KV
     // object per SubBatch. Per-SubBatch cuFile queues turn that workload into
     // depth-1 physical I/O even when dozens of requests are waiting.
     Status dispatchPendingIoLocked();
+
+    Status dispatchDirectWritesLocked(int device_id);
+
+    void executeDirectWrite(std::shared_ptr<DirectIo> direct_io);
 
     Status pollInflightIoLocked();
 
@@ -169,6 +183,9 @@ class GdsTransport : public Transport {
     size_t write_batch_depth_;
     size_t max_read_batch_bytes_;
     size_t max_write_batch_bytes_;
+    bool batch_write_enabled_;
+    size_t write_worker_threads_;
+    size_t max_inflight_writes_;
     size_t submit_retry_count_;
     size_t max_status_poll_errors_;
     std::chrono::microseconds aggregation_delay_;
@@ -178,9 +195,14 @@ class GdsTransport : public Transport {
     // independent logical SubBatches and enforces one bounded cuFile window.
     std::deque<PendingIo> pending_ios_;
     std::list<std::unique_ptr<GdsIoBatch>> inflight_io_batches_;
+    std::unordered_map<uint64_t, std::shared_ptr<DirectIo>>
+        inflight_direct_writes_;
+    uint64_t next_direct_io_id_{1};
     std::chrono::steady_clock::time_point last_status_poll_{};
     bool dispatch_window_blocked_{false};
     std::mutex scheduler_lock_;
+    std::unique_ptr<ThreadPool> write_thread_pool_;
+    std::atomic<bool> shutting_down_{false};
 
     // Object pool for BatchHandle to avoid frequent cuFileBatchIOSetUp/Destroy
     // CUfileBatchHandle_t is reusable per cuFile API documentation

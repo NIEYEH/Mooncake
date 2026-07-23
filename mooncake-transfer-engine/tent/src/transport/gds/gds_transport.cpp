@@ -25,6 +25,7 @@
 #include <cstdint>
 #include <cstring>
 #include <deque>
+#include <exception>
 #include <iomanip>
 #include <limits>
 #include <list>
@@ -53,6 +54,10 @@ constexpr size_t kDefaultReadBatchDepth = 64;
 constexpr size_t kDefaultWriteBatchDepth = 32;
 constexpr size_t kDefaultMaxReadBatchBytes = 256ull << 20;
 constexpr size_t kDefaultMaxWriteBatchBytes = 64ull << 20;
+constexpr size_t kDefaultWriteWorkerThreads = 8;
+constexpr size_t kDefaultMaxInflightWrites = 32;
+constexpr size_t kMaxWriteWorkerThreads = 64;
+constexpr size_t kMaxInflightWrites = 256;
 constexpr size_t kDefaultSubmitRetryCount = 1;
 constexpr size_t kDefaultMaxStatusPollErrors = 20;
 constexpr size_t kDefaultAggregationDelayUs = 50;
@@ -180,6 +185,9 @@ GdsTransport::GdsTransport()
       write_batch_depth_(kDefaultWriteBatchDepth),
       max_read_batch_bytes_(kDefaultMaxReadBatchBytes),
       max_write_batch_bytes_(kDefaultMaxWriteBatchBytes),
+      batch_write_enabled_(false),
+      write_worker_threads_(kDefaultWriteWorkerThreads),
+      max_inflight_writes_(kDefaultMaxInflightWrites),
       submit_retry_count_(kDefaultSubmitRetryCount),
       max_status_poll_errors_(kDefaultMaxStatusPollErrors),
       aggregation_delay_(kDefaultAggregationDelayUs),
@@ -270,6 +278,24 @@ Status GdsTransport::install(std::string& local_segment_name,
     write_batch_depth_ =
         std::min(static_cast<size_t>(configured_write_batch_depth),
                  io_batch_depth_);
+    batch_write_enabled_ =
+        conf_->get("transports/gds/enable_batch_write", false);
+    const int configured_write_threads = conf_->get(
+        "transports/gds/write_worker_threads",
+        static_cast<int>(kDefaultWriteWorkerThreads));
+    const int configured_inflight_writes = conf_->get(
+        "transports/gds/max_inflight_writes",
+        static_cast<int>(kDefaultMaxInflightWrites));
+    if (configured_write_threads <= 0 || configured_inflight_writes <= 0) {
+        return Status::InvalidArgument(
+            "GDS write worker limits must be greater than zero" LOC_MARK);
+    }
+    max_inflight_writes_ = std::min(
+        static_cast<size_t>(configured_inflight_writes),
+        kMaxInflightWrites);
+    write_worker_threads_ = std::min(
+        {static_cast<size_t>(configured_write_threads),
+         kMaxWriteWorkerThreads, max_inflight_writes_});
     const int configured_submit_retries =
         conf_->get("transports/gds/submit_retry_count",
                    static_cast<int>(kDefaultSubmitRetryCount));
@@ -321,11 +347,20 @@ Status GdsTransport::install(std::string& local_segment_name,
               << ", write_batch_depth=" << write_batch_depth_
               << ", max_read_batch_bytes=" << max_read_batch_bytes_
               << ", max_write_batch_bytes=" << max_write_batch_bytes_
+              << ", write_mode="
+              << (batch_write_enabled_ ? "batch" : "parallel_cufile")
+              << ", write_worker_threads=" << write_worker_threads_
+              << ", max_inflight_writes=" << max_inflight_writes_
               << ", aggregation_delay_us=" << aggregation_delay_.count()
               << ", status_poll_interval_us="
               << status_poll_interval_.count()
               << ", submit_retry_count=" << submit_retry_count_
               << ", max_status_poll_errors=" << max_status_poll_errors_;
+    shutting_down_.store(false, std::memory_order_release);
+    if (!batch_write_enabled_) {
+        write_thread_pool_ =
+            std::make_unique<ThreadPool>(write_worker_threads_);
+    }
     installed_ = true;
     caps.dram_to_file = true;
     caps.gpu_to_file = true;
@@ -334,6 +369,17 @@ Status GdsTransport::install(std::string& local_segment_name,
 
 Status GdsTransport::uninstall() {
     if (installed_) {
+        // Stop admitting new direct writes, then drain/join the worker pool
+        // before sub-batches and cuFile handles are released. Do not hold the
+        // scheduler mutex while joining: completing workers acquire it to
+        // publish their final status.
+        shutting_down_.store(true, std::memory_order_release);
+        std::unique_ptr<ThreadPool> write_pool_to_stop;
+        {
+            std::lock_guard<std::mutex> scheduler_guard(scheduler_lock_);
+            write_pool_to_stop = std::move(write_thread_pool_);
+        }
+        write_pool_to_stop.reset();
         {
             std::lock_guard<std::mutex> scheduler_guard(scheduler_lock_);
             pending_ios_.clear();
@@ -344,6 +390,7 @@ Status GdsTransport::uninstall() {
                 io_batch->batch_handle = nullptr;
             }
             inflight_io_batches_.clear();
+            inflight_direct_writes_.clear();
             dispatch_window_blocked_ = false;
             last_status_poll_ = {};
         }
@@ -576,6 +623,14 @@ bool GdsTransport::subBatchHasWorkLocked(const GdsSubBatch* batch) const {
                     })) {
         return true;
     }
+    if (std::any_of(
+            inflight_direct_writes_.begin(),
+            inflight_direct_writes_.end(),
+            [batch](const auto& entry) {
+                return entry.second && entry.second->owner == batch;
+            })) {
+        return true;
+    }
     return std::any_of(
         inflight_io_batches_.begin(), inflight_io_batches_.end(),
         [batch](const std::unique_ptr<GdsIoBatch>& io_batch) {
@@ -587,17 +642,191 @@ bool GdsTransport::subBatchHasWorkLocked(const GdsSubBatch* batch) const {
         });
 }
 
+Status GdsTransport::dispatchDirectWritesLocked(int device_id) {
+    if (batch_write_enabled_ || !write_thread_pool_) {
+        return Status::InvalidEntry(
+            "GDS parallel write workers are not available" LOC_MARK);
+    }
+    if (shutting_down_.load(std::memory_order_acquire)) {
+        return Status::InvalidEntry("GDS transport is shutting down" LOC_MARK);
+    }
+
+    const size_t available_slots =
+        max_inflight_writes_ - inflight_direct_writes_.size();
+    if (available_slots == 0) return Status::OK();
+
+    std::vector<std::shared_ptr<DirectIo>> scheduled;
+    scheduled.reserve(available_slots);
+    size_t scheduled_bytes = 0;
+    for (auto it = pending_ios_.begin();
+         it != pending_ios_.end() && scheduled.size() < available_slots;) {
+        if (it->device_id != device_id ||
+            it->params.opcode != CUFILE_WRITE) {
+            ++it;
+            continue;
+        }
+        auto direct_io = std::make_shared<DirectIo>(DirectIo{
+            next_direct_io_id_++, it->owner, it->param_index, it->device_id,
+            it->params});
+        scheduled_bytes += it->params.u.batch.size;
+        inflight_direct_writes_.emplace(direct_io->id, direct_io);
+        scheduled.emplace_back(std::move(direct_io));
+        it = pending_ios_.erase(it);
+    }
+
+    size_t enqueue_failures = 0;
+    for (const auto& direct_io : scheduled) {
+        try {
+            (void)write_thread_pool_->enqueue(
+                [this, direct_io] { executeDirectWrite(direct_io); });
+        } catch (const std::exception& error) {
+            ++enqueue_failures;
+            inflight_direct_writes_.erase(direct_io->id);
+            if (direct_io->owner &&
+                direct_io->param_index <
+                    direct_io->owner->io_statuses.size()) {
+                direct_io->owner->io_statuses[direct_io->param_index] = FAILED;
+                direct_io->owner->notifyProgress();
+            }
+            LOG(ERROR) << "Failed to enqueue parallel GDS write: "
+                       << error.what();
+        }
+    }
+
+    if (!scheduled.empty()) {
+        LOG_EVERY_N(INFO, 64)
+            << "GDS parallel cuFileWrite dispatch: scheduled_ios="
+            << scheduled.size() - enqueue_failures
+            << ", scheduled_bytes=" << scheduled_bytes
+            << ", inflight_writes=" << inflight_direct_writes_.size()
+            << ", worker_threads=" << write_worker_threads_
+            << ", max_inflight_writes=" << max_inflight_writes_
+            << ", queued_ios_after_dispatch=" << pending_ios_.size();
+    }
+    return Status::OK();
+}
+
+void GdsTransport::executeDirectWrite(
+    std::shared_ptr<DirectIo> direct_io) {
+    TransferStatusEnum final_status = FAILED;
+    size_t transferred_bytes = 0;
+    ssize_t direct_result = -1;
+    int direct_errno = 0;
+    const auto io_start = std::chrono::steady_clock::now();
+
+    CudaDeviceGuard device_guard;
+    auto activation_status = device_guard.activate(direct_io->device_id);
+    if (activation_status.ok()) {
+        for (size_t attempt = 0; attempt <= submit_retry_count_; ++attempt) {
+            errno = 0;
+            const auto& param = direct_io->params;
+            direct_result = cuFileWrite(
+                param.fh, param.u.batch.devPtr_base, param.u.batch.size,
+                param.u.batch.file_offset, param.u.batch.devPtr_offset);
+            direct_errno = errno;
+            if (direct_result ==
+                static_cast<ssize_t>(param.u.batch.size)) {
+                final_status = COMPLETED;
+                transferred_bytes = param.u.batch.size;
+                break;
+            }
+            if (attempt < submit_retry_count_) {
+                std::this_thread::sleep_for(
+                    std::chrono::microseconds(kSubmitRetryBackoffUs));
+            }
+        }
+    } else {
+        LOG(ERROR) << "Failed to activate CUDA device for parallel GDS write: "
+                   << activation_status.ToString();
+    }
+
+    const double io_seconds = std::chrono::duration<double>(
+                                  std::chrono::steady_clock::now() - io_start)
+                                  .count();
+    if (final_status == COMPLETED) {
+        TentMetrics::instance().recordGdsPhysicalBatch(
+            1, transferred_bytes, io_seconds, false);
+        LOG_EVERY_N(INFO, 256)
+            << "Parallel cuFileWrite completed: bytes=" << transferred_bytes
+            << ", latency_us=" << io_seconds * 1e6;
+    } else {
+        const auto& param = direct_io->params;
+        LOG_EVERY_N(ERROR, 64)
+            << "Parallel cuFileWrite failed: result=" << direct_result
+            << ", errno=" << direct_errno
+            << ", device_id=" << direct_io->device_id
+            << ", dev_ptr=" << param.u.batch.devPtr_base
+            << ", dev_offset=" << param.u.batch.devPtr_offset
+            << ", file_offset=" << param.u.batch.file_offset
+            << ", size=" << param.u.batch.size;
+    }
+
+    std::lock_guard<std::mutex> scheduler_guard(scheduler_lock_);
+    auto inflight_it = inflight_direct_writes_.find(direct_io->id);
+    if (inflight_it == inflight_direct_writes_.end()) return;
+    if (direct_io->owner &&
+        direct_io->param_index < direct_io->owner->io_statuses.size()) {
+        direct_io->owner->io_transferred_bytes[direct_io->param_index] =
+            transferred_bytes;
+        direct_io->owner->io_statuses[direct_io->param_index] = final_status;
+    }
+    inflight_direct_writes_.erase(inflight_it);
+    if (direct_io->owner) direct_io->owner->notifyProgress();
+
+    if (!shutting_down_.load(std::memory_order_acquire)) {
+        auto dispatch_status = dispatchPendingIoLocked();
+        if (!dispatch_status.ok()) {
+            LOG(ERROR) << "Failed to refill GDS dispatch window: "
+                       << dispatch_status.ToString();
+        }
+    }
+}
+
 Status GdsTransport::dispatchPendingIoLocked() {
-    while (!pending_ios_.empty() &&
-           inflight_io_batches_.size() < max_inflight_batches_) {
-        const int device_id = pending_ios_.front().device_id;
-        const auto opcode = pending_ios_.front().params.opcode;
+    while (!pending_ios_.empty()) {
+        auto selected = pending_ios_.begin();
+        if (!batch_write_enabled_) {
+            const bool direct_slots_available =
+                inflight_direct_writes_.size() < max_inflight_writes_;
+            const bool batch_slots_available =
+                inflight_io_batches_.size() < max_inflight_batches_;
+            if (selected->params.opcode == CUFILE_WRITE &&
+                !direct_slots_available) {
+                if (!batch_slots_available) break;
+                selected = std::find_if(
+                    pending_ios_.begin(), pending_ios_.end(),
+                    [](const PendingIo& pending) {
+                        return pending.params.opcode != CUFILE_WRITE;
+                    });
+                if (selected == pending_ios_.end()) break;
+            } else if (selected->params.opcode != CUFILE_WRITE &&
+                       !batch_slots_available) {
+                if (!direct_slots_available) break;
+                selected = std::find_if(
+                    pending_ios_.begin(), pending_ios_.end(),
+                    [](const PendingIo& pending) {
+                        return pending.params.opcode == CUFILE_WRITE;
+                    });
+                if (selected == pending_ios_.end()) break;
+            }
+        } else if (inflight_io_batches_.size() >= max_inflight_batches_) {
+            break;
+        }
+
+        const int device_id = selected->device_id;
+        const auto opcode = selected->params.opcode;
+        if (opcode == CUFILE_WRITE && !batch_write_enabled_) {
+            if (inflight_direct_writes_.size() >= max_inflight_writes_) break;
+            CHECK_STATUS(dispatchDirectWritesLocked(device_id));
+            continue;
+        }
+        if (inflight_io_batches_.size() >= max_inflight_batches_) break;
         const size_t opcode_batch_depth =
             opcode == CUFILE_WRITE ? write_batch_depth_ : read_batch_depth_;
         const size_t max_batch_bytes =
             opcode == CUFILE_WRITE ? max_write_batch_bytes_
                                    : max_read_batch_bytes_;
-        const size_t split_depth = pending_ios_.front().max_group_entries;
+        const size_t split_depth = selected->max_group_entries;
         const size_t max_entries =
             split_depth == 0 ? opcode_batch_depth
                              : std::min(split_depth, opcode_batch_depth);
@@ -633,7 +862,7 @@ Status GdsTransport::dispatchPendingIoLocked() {
         const auto now = std::chrono::steady_clock::now();
         const bool aggregation_due =
             aggregation_delay_.count() == 0 ||
-            now - pending_ios_.front().enqueued_at >= aggregation_delay_;
+            now - selected->enqueued_at >= aggregation_delay_;
         if (!capacity_filled && !aggregation_due) break;
 
         auto io_batch = std::make_unique<GdsIoBatch>();
@@ -820,20 +1049,34 @@ Status GdsTransport::dispatchPendingIoLocked() {
         inflight_io_batches_.push_back(std::move(io_batch));
     }
 
-    if (!pending_ios_.empty() &&
-        inflight_io_batches_.size() >= max_inflight_batches_) {
-        const size_t queued_batches =
-            (pending_ios_.size() + io_batch_depth_ - 1) / io_batch_depth_;
+    const bool direct_write_window_full =
+        !pending_ios_.empty() && !batch_write_enabled_ &&
+        pending_ios_.front().params.opcode == CUFILE_WRITE &&
+        inflight_direct_writes_.size() >= max_inflight_writes_;
+    const bool batch_window_full =
+        !pending_ios_.empty() &&
+        (batch_write_enabled_ ||
+         pending_ios_.front().params.opcode != CUFILE_WRITE) &&
+        inflight_io_batches_.size() >= max_inflight_batches_;
+    if (direct_write_window_full || batch_window_full) {
+        const size_t queued_batches = direct_write_window_full
+                                          ? pending_ios_.size()
+                                          : (pending_ios_.size() +
+                                             io_batch_depth_ - 1) /
+                                                io_batch_depth_;
         if (!dispatch_window_blocked_) {
             TentMetrics::instance().recordGdsDispatchWindowFull(
-                queued_batches, inflight_io_batches_.size());
+                queued_batches, inflight_io_batches_.size() +
+                                    inflight_direct_writes_.size());
             dispatch_window_blocked_ = true;
             LOG_EVERY_N(INFO, 256)
                 << "GDS dispatch window full: queued_batches="
                 << queued_batches
                 << ", queued_ios=" << pending_ios_.size()
                 << ", inflight_batches=" << inflight_io_batches_.size()
-                << ", max_inflight_batches=" << max_inflight_batches_;
+                << ", inflight_writes=" << inflight_direct_writes_.size()
+                << ", max_inflight_batches=" << max_inflight_batches_
+                << ", max_inflight_writes=" << max_inflight_writes_;
         }
     } else {
         dispatch_window_blocked_ = false;
@@ -1179,18 +1422,29 @@ Status GdsTransport::submitTransferTasks(
         if (batch_entries > 0) ++batch_count;
         return batch_count;
     };
+    const size_t read_batch_count = count_planned_batches(
+        CUFILE_READ, read_batch_depth_, max_read_batch_bytes_);
+    const size_t write_io_count = static_cast<size_t>(std::count_if(
+        gds_batch->io_params.begin() + first_param_index,
+        gds_batch->io_params.end(), [](const CUfileIOParams_t& param) {
+            return param.opcode == CUFILE_WRITE;
+        }));
+    const size_t write_submission_count =
+        batch_write_enabled_
+            ? count_planned_batches(CUFILE_WRITE, write_batch_depth_,
+                                    max_write_batch_bytes_)
+            : write_io_count;
     const size_t physical_batch_count =
-        count_planned_batches(CUFILE_READ, read_batch_depth_,
-                              max_read_batch_bytes_) +
-        count_planned_batches(CUFILE_WRITE, write_batch_depth_,
-                              max_write_batch_bytes_);
+        read_batch_count + write_submission_count;
     const size_t small_request_count = static_cast<size_t>(std::count_if(
         request_list.begin(), request_list.end(),
         [](const Request& request) { return request.length <= 64 * 1024; }));
     TentMetrics::instance().recordGdsTransportSubmission(
         request_list.size(), num_params, physical_batch_count,
         small_request_count);
-    if (physical_batch_count > 16) {
+    const size_t queued_batch_api_groups =
+        read_batch_count + (batch_write_enabled_ ? write_submission_count : 0);
+    if (queued_batch_api_groups > 16) {
         LOG(WARNING)
             << "Large GDS transport submission: logical_requests="
             << request_list.size() << ", physical_ios=" << num_params
@@ -1203,6 +1457,11 @@ Status GdsTransport::submitTransferTasks(
         << "GDS transport submission: logical_requests="
         << request_list.size() << ", physical_ios=" << num_params
         << ", unaggregated_physical_batches=" << physical_batch_count
+        << ", read_batches=" << read_batch_count
+        << ", parallel_write_ios="
+        << (batch_write_enabled_ ? 0 : write_io_count)
+        << ", write_mode="
+        << (batch_write_enabled_ ? "batch" : "parallel_cufile")
         << ", small_requests=" << small_request_count
         << ", read_batch_depth=" << read_batch_depth_
         << ", write_batch_depth=" << write_batch_depth_
