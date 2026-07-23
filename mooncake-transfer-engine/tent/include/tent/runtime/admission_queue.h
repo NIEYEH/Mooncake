@@ -49,6 +49,9 @@ struct QueueOwnerInput {
     size_t owner_task_id{0};
     std::vector<size_t> derived_task_ids;
     Request request{};
+    // Initial route resolved by TransferEngineImpl. Dispatch prioritization is
+    // scoped to GDS so unrelated transports retain FIFO behavior.
+    TransportType transport{UNSPEC};
     QueueOwnerKind kind{QueueOwnerKind::User};
 };
 
@@ -78,6 +81,11 @@ class LocalTransferAdmissionQueue {
     std::vector<QueueOwnerId> pickForDispatch(size_t max_owners,
                                               size_t max_bytes);
 
+    std::vector<QueueOwnerId> pickForDispatch(size_t max_owners,
+                                              size_t max_bytes,
+                                              size_t max_gds_reads,
+                                              size_t max_gds_writes);
+
     Status complete(QueueOwnerId owner_id, TransferStatusEnum terminal_status);
 
     Status retireBatch(uint64_t batch_token);
@@ -102,6 +110,7 @@ class LocalTransferAdmissionQueue {
     struct QueueOwner {
         uint64_t batch_token{0};
         Request request{};
+        TransportType transport{UNSPEC};
         QueueOwnerKind kind{QueueOwnerKind::User};
         QueueState state{QueueState::Queued};
         TransferStatusEnum terminal_status{TransferStatusEnum::PENDING};
@@ -117,6 +126,9 @@ class LocalTransferAdmissionQueue {
     size_t outstanding_bytes_{0};
     size_t outstanding_user_owners_{0};
     size_t outstanding_user_bytes_{0};
+    // Bound READ preference so sustained restores cannot starve WRITE-back.
+    static constexpr size_t kMaxConsecutiveReadDispatches = 16;
+    size_t consecutive_read_dispatches_{0};
 };
 
 }  // namespace tent

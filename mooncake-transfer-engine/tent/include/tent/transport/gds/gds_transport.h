@@ -15,14 +15,11 @@
 #ifndef GDS_TRANSPORT_H_
 #define GDS_TRANSPORT_H_
 
-#include <bits/stdint-uintn.h>
-
 #include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
-#include <list>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -30,6 +27,8 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
+
+#include <sys/types.h>
 
 #include <cufile.h>
 
@@ -47,39 +46,36 @@ struct IOParamRange {
     size_t count;
 };
 
-// Wrapper for reusable CUfileBatchHandle_t
-// cuFileBatchIOSetUp is expensive, so we reuse handles
-struct BatchHandle {
-    CUfileBatchHandle_t handle;
-    int max_nr;  // max number of batch entries
-    int device_id;  // CUDA device whose context created this handle
-};
-
-struct GdsSubBatch;
-
-struct GdsIoBatch {
-    struct IoRef {
-        GdsSubBatch* owner;
-        size_t param_index;
-    };
-
-    BatchHandle* batch_handle;
-    int device_id;
-    std::vector<CUfileIOParams_t> params;
-    std::vector<IoRef> refs;
-    std::vector<CUfileIOEvents_t> events;
-    size_t consecutive_poll_errors{0};
-    bool capacity_filled{false};
-};
-
 struct GdsSubBatch : public Transport::SubBatch {
     size_t max_size;
     std::vector<IOParamRange> io_param_ranges;
-    std::vector<CUfileIOParams_t> io_params;
     std::vector<TransferStatusEnum> io_statuses;
     std::vector<size_t> io_transferred_bytes;
     virtual size_t size() const { return io_param_ranges.size(); }
 };
+
+enum class GdsAdaptiveAction { NONE, REDUCE, RECOVER };
+
+// Pure adaptive-control state and helpers are intentionally independent of a
+// CUDA device so overload behavior remains covered by ordinary unit tests.
+struct GdsAdaptiveState {
+    size_t configured_limit{1};
+    size_t current_limit{1};
+    size_t minimum_limit{1};
+    size_t completions_since_evaluation{0};
+    size_t healthy_windows{0};
+    double baseline_p99_us{0.0};
+    bool saturation_since_evaluation{false};
+    std::deque<double> recent_io_latency_us;
+};
+
+GdsAdaptiveAction adjustGdsAdaptiveConcurrency(
+    GdsAdaptiveState& state, double p99_us, size_t queued_ios,
+    double degradation_ratio, double recovery_ratio,
+    size_t recovery_windows);
+
+size_t gdsAvailableWorkerSlots(size_t effective_limit,
+                               size_t inflight_ios);
 
 class GdsTransport : public Transport {
    public:
@@ -111,6 +107,11 @@ class GdsTransport : public Transport {
 
     virtual const char* getName() const { return "gds"; }
 
+    size_t runtimeQueueDispatchLimit(Request::OpCode opcode) const override;
+
+    void updateRuntimeQueueDepth(size_t queued_reads,
+                                 size_t queued_writes) override;
+
    private:
     std::string getGdsFilePath(SegmentID handle);
 
@@ -125,20 +126,21 @@ class GdsTransport : public Transport {
     Status resolveIoBuffer(const Request& request, void*& io_base,
                            size_t& io_offset, int& device_id);
 
-    Status acquireBatchHandle(int device_id, BatchHandle*& handle);
-
-    void releaseBatchHandle(BatchHandle* handle);
+    struct IoOperation {
+        CUfileHandle_t file_handle;
+        void* dev_ptr_base;
+        size_t size;
+        off_t file_offset;
+        off_t dev_ptr_offset;
+        bool write;
+    };
 
     struct PendingIo {
         GdsSubBatch* owner;
         size_t param_index;
         int device_id;
-        CUfileIOParams_t params;
+        IoOperation operation;
         std::chrono::steady_clock::time_point enqueued_at;
-        // Zero uses the configured opcode limit. A failed multi-entry batch
-        // is requeued with a smaller limit so one driver rejection does not
-        // fail every logical request in the physical batch.
-        size_t max_group_entries{0};
     };
 
     struct DirectIo {
@@ -146,24 +148,30 @@ class GdsTransport : public Transport {
         GdsSubBatch* owner;
         size_t param_index;
         int device_id;
-        CUfileIOParams_t params;
+        IoOperation operation;
+        std::chrono::steady_clock::time_point enqueued_at;
+        bool dispatched_at_capacity{false};
     };
 
-    // All methods with the Locked suffix require scheduler_lock_. A global
-    // scheduler is necessary because Store clients commonly submit one KV
-    // object per SubBatch. Per-SubBatch cuFile queues turn that workload into
-    // depth-1 physical I/O even when dozens of requests are waiting.
+    // Runtime may pass several logical requests at once, but this scheduler
+    // always dequeues and submits them as independent synchronous cuFile IOs.
+    // No cuFile Batch API handle is created by this transport.
     Status dispatchPendingIoLocked();
 
-    Status dispatchDirectIoLocked(int device_id, bool write);
+    Status dispatchDirectIoLocked(bool write, size_t max_to_schedule);
 
     void executeDirectIo(std::shared_ptr<DirectIo> direct_io);
 
     Status pollInflightIoLocked();
 
-    void failPhysicalBatchLocked(GdsIoBatch& io_batch);
-
     bool subBatchHasWorkLocked(const GdsSubBatch* batch) const;
+
+    void updateIoMetricsLocked() const;
+
+    void recordAdaptiveSampleLocked(bool write, double io_latency_us,
+                                    bool dispatched_at_capacity);
+
+    void evaluateAdaptiveConcurrencyLocked(bool write);
 
    private:
     bool installed_;
@@ -176,46 +184,46 @@ class GdsTransport : public Transport {
     using FileContextMap =
         std::unordered_map<SegmentID, std::shared_ptr<GdsFileContext>>;
     FileContextMap file_context_map_;
-    size_t io_batch_depth_;
     size_t max_io_size_;
-    size_t max_inflight_batches_;
-    size_t read_batch_depth_;
-    size_t write_batch_depth_;
-    size_t max_read_batch_bytes_;
-    size_t max_write_batch_bytes_;
-    bool batch_read_enabled_;
-    bool batch_write_enabled_;
     size_t read_worker_threads_;
     size_t write_worker_threads_;
     size_t max_inflight_reads_;
     size_t max_inflight_writes_;
     size_t submit_retry_count_;
-    size_t max_status_poll_errors_;
-    std::chrono::microseconds aggregation_delay_;
-    std::chrono::microseconds status_poll_interval_;
+    bool adaptive_concurrency_enabled_;
+    size_t adaptive_sample_window_;
+    size_t adaptive_evaluation_interval_;
+    double adaptive_degradation_ratio_;
+    double adaptive_recovery_ratio_;
+    size_t adaptive_recovery_windows_;
+    std::chrono::microseconds write_starvation_timeout_;
 
-    // The physical scheduler is transport-wide. It coalesces I/O from
-    // independent logical SubBatches and enforces one bounded cuFile window.
-    std::deque<PendingIo> pending_ios_;
-    std::list<std::unique_ptr<GdsIoBatch>> inflight_io_batches_;
+    // READ and WRITE have independent pools and inflight windows. Work stays
+    // in these transport queues until a real worker slot is available, so an
+    // item is never counted as inflight while waiting inside ThreadPool.
+    std::deque<PendingIo> pending_reads_;
+    std::deque<PendingIo> pending_writes_;
+    size_t pending_read_bytes_{0};
+    size_t pending_write_bytes_{0};
     std::unordered_map<uint64_t, std::shared_ptr<DirectIo>>
         inflight_direct_reads_;
     std::unordered_map<uint64_t, std::shared_ptr<DirectIo>>
         inflight_direct_writes_;
+    size_t active_read_workers_{0};
+    size_t active_write_workers_{0};
+    GdsAdaptiveState read_adaptive_;
+    GdsAdaptiveState write_adaptive_;
     uint64_t next_direct_io_id_{1};
-    std::chrono::steady_clock::time_point last_status_poll_{};
-    bool dispatch_window_blocked_{false};
-    std::mutex scheduler_lock_;
+    bool read_window_blocked_{false};
+    bool write_window_blocked_{false};
+    mutable std::mutex scheduler_lock_;
     std::unique_ptr<ThreadPool> read_thread_pool_;
     std::unique_ptr<ThreadPool> write_thread_pool_;
     std::atomic<bool> shutting_down_{false};
+    std::atomic<size_t> runtime_queued_reads_{0};
+    std::atomic<size_t> runtime_queued_writes_{0};
 
-    // Object pool for BatchHandle to avoid frequent cuFileBatchIOSetUp/Destroy
-    // CUfileBatchHandle_t is reusable per cuFile API documentation
-    std::vector<BatchHandle*> handle_pool_;
-    std::mutex handle_pool_lock_;
-
-    // Track all allocated sub-batches to clean up on uninstall
+    // Track all allocated sub-batches to clean up on uninstall.
     std::vector<GdsSubBatch*> allocated_batches_;
     std::mutex allocated_batches_lock_;
 

@@ -24,6 +24,7 @@
 #include <cstdint>
 #include <functional>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <queue>
 #include <string>
@@ -145,6 +146,24 @@ class Transport {
     }
 
     virtual const char *getName() const { return "<generic>"; }
+
+    // Optional transport-side cap for the runtime queue's directional
+    // dispatch window. Most transports do not need a second concurrency
+    // controller, so the default leaves the runtime-configured window
+    // unchanged.
+    virtual size_t runtimeQueueDispatchLimit(Request::OpCode opcode) const {
+        (void)opcode;
+        return std::numeric_limits<size_t>::max();
+    }
+
+    // Publish owners that are still waiting outside a transport's dispatch
+    // window. The default is a no-op because only transports with their own
+    // adaptive controller need this cross-layer backlog signal.
+    virtual void updateRuntimeQueueDepth(size_t queued_reads,
+                                         size_t queued_writes) {
+        (void)queued_reads;
+        (void)queued_writes;
+    }
 
    protected:
     Capabilities caps;

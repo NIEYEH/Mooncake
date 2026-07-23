@@ -2,6 +2,7 @@
 
 set -ex
 
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 VLLM_SRC_PATH=${VLLM_SRC_PATH:-"vllm-src"}
 MOONCAKE_CONFIG_PATH=${MOONCAKE_CONFIG_PATH:-"mooncake.json"}
 MODEL=${MODEL:-"Qwen/Qwen2.5-7B-Instruct"}
@@ -17,6 +18,21 @@ PROXY_PORT=${PROXY_PORT:-"8000"}
 logs_root=${LOG_ROOT:-"logs"}
 results_root=${RESULT_ROOT:-"results"}
 
+# Readiness only covers server startup. These requests execute the real vLLM
+# scheduler/attention path before benchmark_serving.py starts its timer, so
+# Triton kernels (including _compute_slot_mapping_kernel on V1) compile during
+# warmup. A round-robin proxy needs at least one request per participating
+# instance; four rounds per instance also exercise a small steady-state load.
+VLLM_WARMUP_ENABLED=${VLLM_WARMUP_ENABLED:-1}
+VLLM_WARMUP_SCRIPT=${VLLM_WARMUP_SCRIPT:-"${SCRIPT_DIR}/../../vllm_warmup.py"}
+VLLM_WARMUP_REQUESTS_PER_INSTANCE=${VLLM_WARMUP_REQUESTS_PER_INSTANCE:-4}
+VLLM_WARMUP_CONCURRENCY=${VLLM_WARMUP_CONCURRENCY:-4}
+VLLM_WARMUP_PROMPT_TOKEN_COUNTS=${VLLM_WARMUP_PROMPT_TOKEN_COUNTS:-"8,128,512"}
+VLLM_WARMUP_MIN_DURATION_SECONDS=${VLLM_WARMUP_MIN_DURATION_SECONDS:-30}
+VLLM_WARMUP_SETTLE_SECONDS=${VLLM_WARMUP_SETTLE_SECONDS:-10}
+VLLM_WARMUP_MAX_TOKENS=${VLLM_WARMUP_MAX_TOKENS:-8}
+VLLM_WARMUP_NAMESPACE=${VLLM_WARMUP_NAMESPACE:-"xypd-$$"}
+
 PROXY_ID=0
 CUDA_VISIBLE_ID=0
 
@@ -24,7 +40,7 @@ INPUT_LENS=(1024 4096)
 OUTPUT_LENS=(6 256)
 
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
-export VLLM_USE_V1=0
+export VLLM_USE_V1=${VLLM_USE_V1:-0}
 
 wait_for_server() {
   # wait for vllm server to start
@@ -34,6 +50,65 @@ wait_for_server() {
     until curl -X POST -s http://localhost:${port}/v1/models > /dev/null; do
       sleep 1
     done" && return 0 || return 1
+}
+
+wait_for_proxy() {
+  local deadline=$((SECONDS + 120))
+  until curl -fsS "http://localhost:${PROXY_PORT}/status" > /dev/null; do
+    if (( SECONDS >= deadline )); then
+      echo "Proxy did not become ready on port ${PROXY_PORT}" >&2
+      return 1
+    fi
+    if [ -n "${PROXY_ID}" ] && ! kill -0 "${PROXY_ID}" 2>/dev/null; then
+      echo "Proxy process ${PROXY_ID} exited before becoming ready" >&2
+      return 1
+    fi
+    sleep 1
+  done
+}
+
+warmup_vllm_cluster() {
+  local num_prefill=$1
+  local num_decode=$2
+  local topology="${num_prefill}p${num_decode}d"
+
+  case "${VLLM_WARMUP_ENABLED}" in
+    0)
+      echo "Skipping vLLM inference warmup because VLLM_WARMUP_ENABLED=0"
+      return 0
+      ;;
+    1) ;;
+    *)
+      echo "VLLM_WARMUP_ENABLED must be 0 or 1" >&2
+      return 1
+      ;;
+  esac
+
+  if [ ! -f "${VLLM_WARMUP_SCRIPT}" ]; then
+    echo "vLLM warmup script not found: ${VLLM_WARMUP_SCRIPT}" >&2
+    return 1
+  fi
+
+  local max_instances=$num_prefill
+  if (( num_decode > max_instances )); then
+    max_instances=$num_decode
+  fi
+  local warmup_requests=$((max_instances * VLLM_WARMUP_REQUESTS_PER_INSTANCE))
+  local warmup_summary="${logs_root}/warmup-${topology}.json"
+
+  echo "Warming vLLM topology ${topology} before timed traffic (${warmup_requests} load requests)"
+  python3 "${VLLM_WARMUP_SCRIPT}" \
+    --base-url "http://localhost:${PROXY_PORT}" \
+    --ready-path "/status" \
+    --model "${MODEL}" \
+    --prompt-token-counts "${VLLM_WARMUP_PROMPT_TOKEN_COUNTS}" \
+    --requests "${warmup_requests}" \
+    --concurrency "${VLLM_WARMUP_CONCURRENCY}" \
+    --min-duration-seconds "${VLLM_WARMUP_MIN_DURATION_SECONDS}" \
+    --settle-seconds "${VLLM_WARMUP_SETTLE_SECONDS}" \
+    --max-tokens "${VLLM_WARMUP_MAX_TOKENS}" \
+    --namespace "${VLLM_WARMUP_NAMESPACE}" \
+    --output "${warmup_summary}"
 }
 
 get_related_pids()
@@ -62,7 +137,7 @@ destroy_vllm_engine()
 
 kill_nodes() {
   # kill all processes by port
-  lsof -t -i:$(PROXY_PORT) | xargs -r kill -9
+  lsof -t -i:${PROXY_PORT} | xargs -r kill -9
   for ((i=0; i<NUM_PREFILL; i++)); do
     destroy_vllm_engine $((${PREFILL_PORT_BASE} + i))
   done
@@ -150,11 +225,12 @@ launch_disagg_proxy() {
   --model $MODEL \
   --prefill $prefill_ports_str \
   --decode $decode_ports_str \
-  --port 8000 \
+  --port ${PROXY_PORT} \
   2>&1 | tee ${logs_root}/proxy-${num_prefill}-${num_decode}.txt 2>&1 &
   PROXY_ID=$!
   echo "Launched disagg_proxy with PID: $PROXY_ID"
-  sleep 1
+  wait_for_proxy
+  warmup_vllm_cluster "$num_prefill" "$num_decode"
 }
 
 benchmark() {

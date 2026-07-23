@@ -94,8 +94,27 @@ class TentMetrics {
     void recordGdsPhysicalBatch(size_t io_count, size_t bytes,
                                 double submit_latency_seconds,
                                 bool underfilled);
+    void recordGdsDirectIo(bool is_read, size_t bytes, bool success,
+                           double queue_wait_seconds,
+                           double io_latency_seconds,
+                           double total_latency_seconds);
+    void updateGdsIoState(size_t queued_read_ios,
+                          size_t queued_read_bytes,
+                          size_t queued_write_ios,
+                          size_t queued_write_bytes,
+                          size_t active_read_workers,
+                          size_t active_write_workers,
+                          size_t read_inflight_limit,
+                          size_t write_inflight_limit);
+    void observeGdsAdaptiveWindow(bool is_read,
+                                  double p99_latency_seconds,
+                                  size_t queued_ios);
+    void recordGdsAdaptiveConcurrency(bool is_read, bool reduced,
+                                      size_t new_limit);
     void updateRuntimeQueue(size_t queued_owners, size_t queued_bytes,
                             size_t inflight_owners, size_t inflight_bytes);
+    void recordRuntimeQueueWait(bool is_read, double latency_seconds);
+    void recordRuntimeQueueTotal(bool is_read, double latency_seconds);
 
     // Record the deadline feasibility ratio (MLU) for a completed transfer
     // that carried a deadline. mlu = actual_transfer_seconds / window_seconds,
@@ -194,7 +213,23 @@ class TentMetrics {
         "Physical GDS batches below configured batch depth"};
     ylt::metric::counter_t gds_dispatch_window_full_total_{
         "tent_gds_dispatch_window_full_total",
-        "Attempts blocked by the transport-wide inflight batch limit"};
+        "Attempts blocked by a GDS single-IO inflight limit"};
+    ylt::metric::counter_t gds_read_io_failures_total_{
+        "tent_gds_read_io_failures_total", "Failed cuFileRead operations"};
+    ylt::metric::counter_t gds_write_io_failures_total_{
+        "tent_gds_write_io_failures_total", "Failed cuFileWrite operations"};
+    ylt::metric::counter_t gds_read_concurrency_reductions_total_{
+        "tent_gds_read_concurrency_reductions_total",
+        "Adaptive READ inflight limit reductions"};
+    ylt::metric::counter_t gds_write_concurrency_reductions_total_{
+        "tent_gds_write_concurrency_reductions_total",
+        "Adaptive WRITE inflight limit reductions"};
+    ylt::metric::counter_t gds_read_concurrency_recoveries_total_{
+        "tent_gds_read_concurrency_recoveries_total",
+        "Cautious adaptive READ inflight limit recoveries"};
+    ylt::metric::counter_t gds_write_concurrency_recoveries_total_{
+        "tent_gds_write_concurrency_recoveries_total",
+        "Cautious adaptive WRITE inflight limit recoveries"};
 
     ylt::metric::gauge_t runtime_queue_owners_{
         "tent_runtime_queue_owners", "Owners waiting in the runtime queue"};
@@ -204,6 +239,36 @@ class TentMetrics {
         "tent_runtime_inflight_owners", "Owners in the dispatch window"};
     ylt::metric::gauge_t runtime_inflight_bytes_{
         "tent_runtime_inflight_bytes", "Bytes in the dispatch window"};
+    ylt::metric::gauge_t gds_read_queue_ios_{
+        "tent_gds_read_queue_ios", "READ IOs waiting for a GDS worker"};
+    ylt::metric::gauge_t gds_read_queue_bytes_{
+        "tent_gds_read_queue_bytes", "READ bytes waiting for a GDS worker"};
+    ylt::metric::gauge_t gds_write_queue_ios_{
+        "tent_gds_write_queue_ios", "WRITE IOs waiting for a GDS worker"};
+    ylt::metric::gauge_t gds_write_queue_bytes_{
+        "tent_gds_write_queue_bytes", "WRITE bytes waiting for a GDS worker"};
+    ylt::metric::gauge_t gds_active_read_workers_{
+        "tent_gds_active_read_workers", "Workers currently executing cuFileRead"};
+    ylt::metric::gauge_t gds_active_write_workers_{
+        "tent_gds_active_write_workers", "Workers currently executing cuFileWrite"};
+    ylt::metric::gauge_t gds_read_inflight_limit_{
+        "tent_gds_read_inflight_limit", "Current effective READ inflight limit"};
+    ylt::metric::gauge_t gds_write_inflight_limit_{
+        "tent_gds_write_inflight_limit", "Current effective WRITE inflight limit"};
+    ylt::metric::gauge_t gds_read_window_p99_latency_us_{
+        "tent_gds_read_window_p99_latency_us",
+        "Latest READ adaptive-window P99 cuFile latency in microseconds"};
+    ylt::metric::gauge_t gds_write_window_p99_latency_us_{
+        "tent_gds_write_window_p99_latency_us",
+        "Latest WRITE adaptive-window P99 cuFile latency in microseconds"};
+    ylt::metric::gauge_t gds_read_adaptive_queued_ios_{
+        "tent_gds_read_adaptive_queued_ios",
+        "Queued READ work items (internal IOs plus runtime owners) at the "
+        "latest adaptive decision"};
+    ylt::metric::gauge_t gds_write_adaptive_queued_ios_{
+        "tent_gds_write_adaptive_queued_ios",
+        "Queued WRITE work items (internal IOs plus runtime owners) at the "
+        "latest adaptive decision"};
 
     // Histograms - stored as pointers for unified management
     std::vector<ylt::metric::histogram_t*> histograms_;
@@ -221,9 +286,54 @@ class TentMetrics {
     ylt::metric::histogram_t write_latency_{
         "tent_write_latency_us", "Write latency distribution in microseconds",
         kLatencyBuckets};
+    ylt::metric::histogram_t runtime_queue_read_wait_latency_{
+        "tent_runtime_queue_read_wait_latency_us",
+        "READ owner wait before entering the runtime dispatch window",
+        kLatencyBuckets};
+    ylt::metric::histogram_t runtime_queue_write_wait_latency_{
+        "tent_runtime_queue_write_wait_latency_us",
+        "WRITE owner wait before entering the runtime dispatch window",
+        kLatencyBuckets};
+    ylt::metric::histogram_t runtime_queue_read_total_latency_{
+        "tent_runtime_queue_read_total_latency_us",
+        "READ owner latency from runtime enqueue to terminal state",
+        kLatencyBuckets};
+    ylt::metric::histogram_t runtime_queue_write_total_latency_{
+        "tent_runtime_queue_write_total_latency_us",
+        "WRITE owner latency from runtime enqueue to terminal state",
+        kLatencyBuckets};
+    ylt::metric::histogram_t gds_read_queue_wait_latency_{
+        "tent_gds_read_queue_wait_latency_us",
+        "READ IO wait in the GDS transport queue", kLatencyBuckets};
+    ylt::metric::histogram_t gds_write_queue_wait_latency_{
+        "tent_gds_write_queue_wait_latency_us",
+        "WRITE IO wait in the GDS transport queue", kLatencyBuckets};
+    ylt::metric::histogram_t gds_read_cufile_io_latency_{
+        "tent_gds_read_cufile_io_latency_us", "cuFileRead call latency",
+        kLatencyBuckets};
+    ylt::metric::histogram_t gds_write_cufile_io_latency_{
+        "tent_gds_write_cufile_io_latency_us", "cuFileWrite call latency",
+        kLatencyBuckets};
+    ylt::metric::histogram_t gds_read_total_latency_{
+        "tent_gds_read_total_latency_us",
+        "READ IO latency from GDS enqueue to terminal publication",
+        kLatencyBuckets};
+    ylt::metric::histogram_t gds_write_total_latency_{
+        "tent_gds_write_total_latency_us",
+        "WRITE IO latency from GDS enqueue to terminal publication",
+        kLatencyBuckets};
+    ylt::metric::histogram_t gds_read_adaptive_p99_latency_{
+        "tent_gds_read_adaptive_p99_latency_us",
+        "READ rolling P99 samples evaluated by adaptive concurrency",
+        kLatencyBuckets};
+    ylt::metric::histogram_t gds_write_adaptive_p99_latency_{
+        "tent_gds_write_adaptive_p99_latency_us",
+        "WRITE rolling P99 samples evaluated by adaptive concurrency",
+        kLatencyBuckets};
     ylt::metric::histogram_t gds_batch_submit_latency_{
         "tent_gds_batch_submit_latency_us",
-        "cuFile batch submission latency in microseconds", kLatencyBuckets};
+        "Legacy GDS physical submission latency in microseconds",
+        kLatencyBuckets};
     static inline const std::vector<double> kBatchCountBuckets{
         1, 2, 4, 8, 16, 32, 64, 128, 256, 512};
     ylt::metric::histogram_t gds_requests_per_submit_{
@@ -232,11 +342,11 @@ class TentMetrics {
         kBatchCountBuckets};
     ylt::metric::histogram_t gds_physical_ios_per_batch_{
         "tent_gds_physical_ios_per_batch",
-        "Physical IO entries in each submitted cuFile batch",
+        "Physical IO entries in each GDS submission (always one for GDS)",
         kBatchCountBuckets};
     ylt::metric::histogram_t gds_physical_batches_per_submit_{
         "tent_gds_physical_batches_per_submit",
-        "Physical batches needed before cross-submit GDS aggregation",
+        "Single-IO submissions created per GDS transport call",
         kBatchCountBuckets};
     ylt::metric::histogram_t gds_dispatch_queued_batches_{
         "tent_gds_dispatch_queued_batches",

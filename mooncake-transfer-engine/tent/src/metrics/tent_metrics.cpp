@@ -173,10 +173,10 @@ void TentMetrics::shutdown() {
 
 void TentMetrics::registerMetrics() {
     // Pre-allocate vectors to avoid reallocation
-    counters_.reserve(22);
-    gauges_.reserve(4);
-    histograms_.reserve(11);
-    histogram_boundaries_.reserve(11);
+    counters_.reserve(28);
+    gauges_.reserve(16);
+    histograms_.reserve(23);
+    histogram_boundaries_.reserve(23);
 
     // Register all counters - add new counters here
     counters_ = {
@@ -193,11 +193,24 @@ void TentMetrics::registerMetrics() {
         &gds_transport_physical_ios_created_total_,
         &gds_small_requests_total_,
         &gds_underfilled_batches_total_, &gds_dispatch_window_full_total_,
+        &gds_read_io_failures_total_, &gds_write_io_failures_total_,
+        &gds_read_concurrency_reductions_total_,
+        &gds_write_concurrency_reductions_total_,
+        &gds_read_concurrency_recoveries_total_,
+        &gds_write_concurrency_recoveries_total_,
     };
 
     gauges_ = {
         &runtime_queue_owners_, &runtime_queue_bytes_,
         &runtime_inflight_owners_, &runtime_inflight_bytes_,
+        &gds_read_queue_ios_, &gds_read_queue_bytes_,
+        &gds_write_queue_ios_, &gds_write_queue_bytes_,
+        &gds_active_read_workers_, &gds_active_write_workers_,
+        &gds_read_inflight_limit_, &gds_write_inflight_limit_,
+        &gds_read_window_p99_latency_us_,
+        &gds_write_window_p99_latency_us_,
+        &gds_read_adaptive_queued_ios_,
+        &gds_write_adaptive_queued_ios_,
     };
     for (auto* gauge : gauges_) gauge->update(0);
 
@@ -209,6 +222,15 @@ void TentMetrics::registerMetrics() {
         &gds_requests_per_submit_, &gds_physical_ios_per_batch_,
         &gds_physical_batches_per_submit_, &gds_dispatch_queued_batches_,
         &gds_dispatch_inflight_batches_,
+        &runtime_queue_read_wait_latency_,
+        &runtime_queue_write_wait_latency_,
+        &runtime_queue_read_total_latency_,
+        &runtime_queue_write_total_latency_,
+        &gds_read_queue_wait_latency_, &gds_write_queue_wait_latency_,
+        &gds_read_cufile_io_latency_, &gds_write_cufile_io_latency_,
+        &gds_read_total_latency_, &gds_write_total_latency_,
+        &gds_read_adaptive_p99_latency_,
+        &gds_write_adaptive_p99_latency_,
     };
     histogram_boundaries_ = {
         kLatencyBuckets, kLatencyBuckets,     kSizeBuckets,
@@ -216,6 +238,9 @@ void TentMetrics::registerMetrics() {
         kBatchCountBuckets, kBatchCountBuckets, kBatchCountBuckets,
         kBatchCountBuckets,
         kBatchCountBuckets,
+        kLatencyBuckets, kLatencyBuckets, kLatencyBuckets, kLatencyBuckets,
+        kLatencyBuckets, kLatencyBuckets, kLatencyBuckets, kLatencyBuckets,
+        kLatencyBuckets, kLatencyBuckets, kLatencyBuckets, kLatencyBuckets,
     };
 }
 
@@ -354,6 +379,118 @@ void TentMetrics::recordGdsPhysicalBatch(size_t io_count, size_t bytes,
     }
 }
 
+void TentMetrics::recordGdsDirectIo(bool is_read, size_t bytes, bool success,
+                                    double queue_wait_seconds,
+                                    double io_latency_seconds,
+                                    double total_latency_seconds) {
+    if (!initialized_ || !runtime_enabled_.load(std::memory_order_relaxed))
+        return;
+
+    gds_physical_ios_total_.inc();
+    gds_physical_bytes_total_.inc(static_cast<int64_t>(bytes));
+    // Preserve the legacy counter: with Batch disabled, every physical
+    // submission contains exactly one IO.
+    gds_physical_batches_total_.inc();
+    gds_physical_ios_per_batch_.observe(1);
+    const auto observe_nonnegative_seconds = [](
+        ylt::metric::histogram_t& histogram, double seconds) {
+        if (seconds >= 0.0) {
+            histogram.observe(
+                static_cast<int64_t>(seconds * 1000000.0));
+        }
+    };
+    const auto observe_positive_seconds = [](
+        ylt::metric::histogram_t& histogram, double seconds) {
+        if (seconds > 0.0) {
+            histogram.observe(
+                static_cast<int64_t>(seconds * 1000000.0));
+        }
+    };
+    if (is_read) {
+        if (!success) gds_read_io_failures_total_.inc();
+        observe_nonnegative_seconds(gds_read_queue_wait_latency_,
+                                    queue_wait_seconds);
+        observe_positive_seconds(gds_read_cufile_io_latency_,
+                                 io_latency_seconds);
+        observe_nonnegative_seconds(gds_read_total_latency_,
+                                    total_latency_seconds);
+    } else {
+        if (!success) gds_write_io_failures_total_.inc();
+        observe_nonnegative_seconds(gds_write_queue_wait_latency_,
+                                    queue_wait_seconds);
+        observe_positive_seconds(gds_write_cufile_io_latency_,
+                                 io_latency_seconds);
+        observe_nonnegative_seconds(gds_write_total_latency_,
+                                    total_latency_seconds);
+    }
+    observe_positive_seconds(gds_batch_submit_latency_, io_latency_seconds);
+}
+
+void TentMetrics::updateGdsIoState(size_t queued_read_ios,
+                                   size_t queued_read_bytes,
+                                   size_t queued_write_ios,
+                                   size_t queued_write_bytes,
+                                   size_t active_read_workers,
+                                   size_t active_write_workers,
+                                   size_t read_inflight_limit,
+                                   size_t write_inflight_limit) {
+    if (!initialized_ || !runtime_enabled_.load(std::memory_order_relaxed))
+        return;
+    gds_read_queue_ios_.update(static_cast<int64_t>(queued_read_ios));
+    gds_read_queue_bytes_.update(static_cast<int64_t>(queued_read_bytes));
+    gds_write_queue_ios_.update(static_cast<int64_t>(queued_write_ios));
+    gds_write_queue_bytes_.update(static_cast<int64_t>(queued_write_bytes));
+    gds_active_read_workers_.update(
+        static_cast<int64_t>(active_read_workers));
+    gds_active_write_workers_.update(
+        static_cast<int64_t>(active_write_workers));
+    gds_read_inflight_limit_.update(
+        static_cast<int64_t>(read_inflight_limit));
+    gds_write_inflight_limit_.update(
+        static_cast<int64_t>(write_inflight_limit));
+}
+
+void TentMetrics::observeGdsAdaptiveWindow(bool is_read,
+                                           double p99_latency_seconds,
+                                           size_t queued_ios) {
+    if (!initialized_ || !runtime_enabled_.load(std::memory_order_relaxed))
+        return;
+    const int64_t p99_us =
+        static_cast<int64_t>(p99_latency_seconds * 1000000.0);
+    if (is_read) {
+        gds_read_window_p99_latency_us_.update(p99_us);
+        gds_read_adaptive_queued_ios_.update(
+            static_cast<int64_t>(queued_ios));
+        gds_read_adaptive_p99_latency_.observe(p99_us);
+    } else {
+        gds_write_window_p99_latency_us_.update(p99_us);
+        gds_write_adaptive_queued_ios_.update(
+            static_cast<int64_t>(queued_ios));
+        gds_write_adaptive_p99_latency_.observe(p99_us);
+    }
+}
+
+void TentMetrics::recordGdsAdaptiveConcurrency(bool is_read, bool reduced,
+                                               size_t new_limit) {
+    if (!initialized_ || !runtime_enabled_.load(std::memory_order_relaxed))
+        return;
+    if (is_read) {
+        if (reduced) {
+            gds_read_concurrency_reductions_total_.inc();
+        } else {
+            gds_read_concurrency_recoveries_total_.inc();
+        }
+        gds_read_inflight_limit_.update(static_cast<int64_t>(new_limit));
+    } else {
+        if (reduced) {
+            gds_write_concurrency_reductions_total_.inc();
+        } else {
+            gds_write_concurrency_recoveries_total_.inc();
+        }
+        gds_write_inflight_limit_.update(static_cast<int64_t>(new_limit));
+    }
+}
+
 void TentMetrics::updateRuntimeQueue(size_t queued_owners,
                                      size_t queued_bytes,
                                      size_t inflight_owners,
@@ -364,6 +501,36 @@ void TentMetrics::updateRuntimeQueue(size_t queued_owners,
     runtime_queue_bytes_.update(static_cast<int64_t>(queued_bytes));
     runtime_inflight_owners_.update(static_cast<int64_t>(inflight_owners));
     runtime_inflight_bytes_.update(static_cast<int64_t>(inflight_bytes));
+}
+
+void TentMetrics::recordRuntimeQueueWait(bool is_read,
+                                         double latency_seconds) {
+    if (!initialized_ || !runtime_enabled_.load(std::memory_order_relaxed) ||
+        latency_seconds < 0.0) {
+        return;
+    }
+    const int64_t latency_us =
+        static_cast<int64_t>(latency_seconds * 1000000.0);
+    if (is_read) {
+        runtime_queue_read_wait_latency_.observe(latency_us);
+    } else {
+        runtime_queue_write_wait_latency_.observe(latency_us);
+    }
+}
+
+void TentMetrics::recordRuntimeQueueTotal(bool is_read,
+                                          double latency_seconds) {
+    if (!initialized_ || !runtime_enabled_.load(std::memory_order_relaxed) ||
+        latency_seconds < 0.0) {
+        return;
+    }
+    const int64_t latency_us =
+        static_cast<int64_t>(latency_seconds * 1000000.0);
+    if (is_read) {
+        runtime_queue_read_total_latency_.observe(latency_us);
+    } else {
+        runtime_queue_write_total_latency_.observe(latency_us);
+    }
 }
 
 std::string TentMetrics::getPrometheusMetrics() {
@@ -512,7 +679,15 @@ void TentMetrics::recordGdsTransportSubmission(size_t, size_t, size_t,
                                                size_t) {}
 void TentMetrics::recordGdsDispatchWindowFull(size_t, size_t) {}
 void TentMetrics::recordGdsPhysicalBatch(size_t, size_t, double, bool) {}
+void TentMetrics::recordGdsDirectIo(bool, size_t, bool, double, double,
+                                    double) {}
+void TentMetrics::updateGdsIoState(size_t, size_t, size_t, size_t, size_t,
+                                   size_t, size_t, size_t) {}
+void TentMetrics::observeGdsAdaptiveWindow(bool, double, size_t) {}
+void TentMetrics::recordGdsAdaptiveConcurrency(bool, bool, size_t) {}
 void TentMetrics::updateRuntimeQueue(size_t, size_t, size_t, size_t) {}
+void TentMetrics::recordRuntimeQueueWait(bool, double) {}
+void TentMetrics::recordRuntimeQueueTotal(bool, double) {}
 void TentMetrics::recordDeadlineMLU(double) {}
 
 std::string TentMetrics::getPrometheusMetrics() {

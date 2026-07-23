@@ -4,16 +4,18 @@
   "enable_runtime_queue": true,
 
   "runtime_queue": {
-    "max_outstanding_owners": 1024,
-    "max_outstanding_bytes": 2147483648,
+    "max_outstanding_owners": 64,
+    "max_outstanding_bytes": 268435456,
 
-    "max_dispatch_owners": 128,
-    "max_dispatch_bytes": 536870912,
+    "max_dispatch_owners": 16,
+    "max_dispatch_bytes": 67108864,
+    "max_dispatch_read_owners": 16,
+    "max_dispatch_write_owners": 4,
 
     "staging_owner_reserve": 0,
     "staging_byte_reserve": 0,
 
-    "progress_fallback_interval_us": 200
+    "progress_fallback_interval_us": 1000
   },
 
   "transports": {
@@ -27,23 +29,22 @@
 
     "gds": {
       "enable": true,
-      "io_batch_depth": 64,
-      "max_inflight_batches": 1,
-      "allow_concurrent_batches": false,
-      "read_batch_depth": 64,
-      "write_batch_depth": 32,
-      "max_read_batch_bytes": 268435456,
-      "max_write_batch_bytes": 67108864,
-      "enable_batch_read": false,
-      "enable_batch_write": false,
-      "read_worker_threads": 8,
-      "write_worker_threads": 8,
-      "max_inflight_reads": 32,
-      "max_inflight_writes": 32,
-      "aggregation_delay_us": 50,
-      "status_poll_interval_us": 50,
-      "submit_retry_count": 1,
-      "max_status_poll_errors": 20
+      "read_worker_threads": 16,
+      "write_worker_threads": 4,
+      "max_inflight_reads": 16,
+      "max_inflight_writes": 4,
+      "submit_retry_count": 0,
+      "write_starvation_timeout_us": 500000,
+      "adaptive_concurrency": true,
+      "adaptive_sample_window": 128,
+      "adaptive_evaluation_interval": 32,
+      "adaptive_recovery_windows": 3,
+      "adaptive_min_read_inflight": 4,
+      "adaptive_min_write_inflight": 1,
+      "adaptive_p99_degradation_ratio": 1.25,
+      "adaptive_p99_recovery_ratio": 1.05,
+      "adaptive_read_p99_target_us": 60000,
+      "adaptive_write_p99_target_us": 0
     },
 
     "io_uring": {

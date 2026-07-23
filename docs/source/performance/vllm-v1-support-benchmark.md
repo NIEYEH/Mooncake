@@ -84,6 +84,36 @@ python tests/v1/kv_connector/nixl_integration/toy_proxy_server.py \
   --decoder-host 10.0.28.202 --decoder-port 8020
 ```
 
+### Inference Warmup
+
+An HTTP readiness check does not execute vLLM's scheduler and attention path.
+Run completed inference requests before starting any timed benchmark so Triton
+kernels such as `_compute_slot_mapping_kernel` are compiled outside the
+measurement window.  The helper first probes several prompt shapes serially,
+then applies a small concurrent load for at least 30 seconds and waits for a
+10-second quiet period.  It exits non-zero if any response is unsuccessful.
+
+```bash
+# Run from the Mooncake repository root.
+python benchmarks/vllm_warmup.py \
+  --base-url http://127.0.0.1:8000 \
+  --model /work/models/Qwen3-8B \
+  --prompt-token-counts 8,128,512 \
+  --requests 16 \
+  --concurrency 4 \
+  --min-duration-seconds 30 \
+  --settle-seconds 10 \
+  --output warmup-summary.json
+```
+
+For a multi-instance PD proxy, send at least one request through every
+prefill/decode pair.  With a round-robin proxy, set `--requests` to at least
+`max(prefill_instances, decode_instances) * 4`.  Reuse `--namespace` after a
+vLLM restart when the warmup should also exercise external-prefix-cache restore.
+If the proxy does not expose `/v1/models`, pass its health endpoint, for
+example `--ready-path /status`.
+Do not start benchmark metrics or timers until this command has completed.
+
 ### Benchmark Script
 
 We used `vllm bench serve` to generate traffic with varying prompt lengths.

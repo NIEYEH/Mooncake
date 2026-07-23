@@ -39,6 +39,14 @@ QueueOwnerInput makeOwner(
     return owner;
 }
 
+QueueOwnerInput makeGdsOwner(size_t public_task_id, size_t length,
+                             Request::OpCode opcode) {
+    auto owner = makeOwner(public_task_id, length);
+    owner.request.opcode = opcode;
+    owner.transport = GDS;
+    return owner;
+}
+
 QueueSubmit makeSubmit(uint64_t batch_token, size_t batch_slots_left,
                        std::vector<QueueOwnerInput> owners) {
     QueueSubmit submit;
@@ -113,6 +121,21 @@ TEST(AdmissionQueueTest, RejectsUnsupportedOwnerKindWithoutPartialAdmission) {
     ASSERT_EQ(status.code(), Status::Code::kOk);
     ASSERT_EQ(admitted_ids.size(), 1u);
     EXPECT_EQ(admitted_ids[0], 1u);
+}
+
+TEST(AdmissionQueueTest, RejectsUnsupportedOpcodeWithoutPartialAdmission) {
+    LocalTransferAdmissionQueue queue({4, 128, 0, 0});
+    std::vector<QueueOwnerId> admitted_ids{99};
+    auto invalid_owner = makeOwner(0, 16);
+    invalid_owner.request.opcode = static_cast<Request::OpCode>(99);
+
+    auto status = queue.tryAdmit(
+        makeSubmit(1, 1, {std::move(invalid_owner)}), admitted_ids);
+
+    EXPECT_EQ(status.code(), Status::Code::kInvalidArgument);
+    EXPECT_TRUE(admitted_ids.empty());
+    EXPECT_EQ(queue.outstandingOwners(), 0u);
+    EXPECT_EQ(queue.outstandingBytes(), 0u);
 }
 
 TEST(AdmissionQueueTest, RejectsCapacityExceededWithoutPartialAdmission) {
@@ -249,6 +272,105 @@ TEST(AdmissionQueueTest, KeepsAdmissionOrderForDispatch) {
     auto picked = queue.pickForDispatch(2, 70);
 
     EXPECT_EQ(picked, expected_ids);
+}
+
+TEST(AdmissionQueueTest, PrioritizesReadsAndPreservesPerOpcodeFifo) {
+    LocalTransferAdmissionQueue queue({4, 128, 0, 0});
+    std::vector<QueueOwnerId> admitted_ids;
+
+    auto status = queue.tryAdmit(
+        makeSubmit(1, 4,
+                   {makeGdsOwner(0, 16, Request::WRITE),
+                    makeGdsOwner(1, 16, Request::READ),
+                    makeGdsOwner(2, 16, Request::WRITE),
+                    makeGdsOwner(3, 16, Request::READ)}),
+        admitted_ids);
+
+    ASSERT_EQ(status.code(), Status::Code::kOk);
+    const std::vector<QueueOwnerId> expected_ids{2, 4, 1, 3};
+    EXPECT_EQ(queue.pickForDispatch(4, 64), expected_ids);
+}
+
+TEST(AdmissionQueueTest, ReadPreferenceDoesNotStarveWrites) {
+    LocalTransferAdmissionQueue queue({32, 1024, 0, 0});
+    std::vector<QueueOwnerInput> owners;
+    owners.push_back(makeGdsOwner(0, 16, Request::WRITE));
+    for (size_t task_id = 1; task_id <= 17; ++task_id) {
+        owners.push_back(makeGdsOwner(task_id, 16, Request::READ));
+    }
+
+    std::vector<QueueOwnerId> admitted_ids;
+    const size_t owner_count = owners.size();
+    auto status = queue.tryAdmit(
+        makeSubmit(1, owner_count, std::move(owners)), admitted_ids);
+    ASSERT_EQ(status.code(), Status::Code::kOk);
+
+    for (QueueOwnerId expected_read_id = 2; expected_read_id <= 17;
+         ++expected_read_id) {
+        const auto picked = queue.pickForDispatch(1, 16);
+        ASSERT_EQ(picked.size(), 1u);
+        EXPECT_EQ(picked.front(), expected_read_id);
+    }
+    const auto picked_write = queue.pickForDispatch(1, 16);
+    ASSERT_EQ(picked_write.size(), 1u);
+    EXPECT_EQ(picked_write.front(), 1u);
+}
+
+TEST(AdmissionQueueTest, ByteBudgetDoesNotBypassFairnessWrite) {
+    LocalTransferAdmissionQueue queue({32, 1024, 0, 0});
+    std::vector<QueueOwnerInput> owners;
+    owners.push_back(makeGdsOwner(0, 32, Request::WRITE));
+    for (size_t task_id = 1; task_id <= 17; ++task_id) {
+        owners.push_back(makeGdsOwner(task_id, 16, Request::READ));
+    }
+
+    std::vector<QueueOwnerId> admitted_ids;
+    const size_t owner_count = owners.size();
+    auto status = queue.tryAdmit(
+        makeSubmit(1, owner_count, std::move(owners)), admitted_ids);
+    ASSERT_EQ(status.code(), Status::Code::kOk);
+
+    for (size_t index = 0; index < 16; ++index) {
+        ASSERT_EQ(queue.pickForDispatch(1, 16).size(), 1u);
+    }
+    // The fairness-selected WRITE does not fit. Do not bypass it with the
+    // seventeenth READ and thereby extend WRITE starvation.
+    EXPECT_TRUE(queue.pickForDispatch(1, 16).empty());
+    const auto picked_write = queue.pickForDispatch(1, 32);
+    ASSERT_EQ(picked_write.size(), 1u);
+    EXPECT_EQ(picked_write.front(), 1u);
+}
+
+TEST(AdmissionQueueTest, GdsReadPriorityDoesNotBypassEarlierNonGdsOwner) {
+    LocalTransferAdmissionQueue queue({3, 128, 0, 0});
+    std::vector<QueueOwnerId> admitted_ids;
+    auto status = queue.tryAdmit(
+        makeSubmit(1, 3,
+                   {makeGdsOwner(0, 16, Request::WRITE), makeOwner(1, 16),
+                    makeGdsOwner(2, 16, Request::READ)}),
+        admitted_ids);
+    ASSERT_EQ(status.code(), Status::Code::kOk);
+
+    const std::vector<QueueOwnerId> expected_ids{2, 3, 1};
+    EXPECT_EQ(queue.pickForDispatch(3, 48), expected_ids);
+}
+
+TEST(AdmissionQueueTest, EnforcesIndependentGdsDirectionBudgets) {
+    LocalTransferAdmissionQueue queue({8, 256, 0, 0});
+    std::vector<QueueOwnerId> admitted_ids;
+    auto status = queue.tryAdmit(
+        makeSubmit(1, 6,
+                   {makeGdsOwner(0, 16, Request::READ),
+                    makeGdsOwner(1, 16, Request::READ),
+                    makeGdsOwner(2, 16, Request::READ),
+                    makeGdsOwner(3, 16, Request::WRITE),
+                    makeGdsOwner(4, 16, Request::WRITE),
+                    makeGdsOwner(5, 16, Request::WRITE)}),
+        admitted_ids);
+    ASSERT_EQ(status.code(), Status::Code::kOk);
+
+    const std::vector<QueueOwnerId> expected_ids{1, 2, 4};
+    EXPECT_EQ(queue.pickForDispatch(6, 256, 2, 1), expected_ids);
 }
 
 TEST(AdmissionQueueTest, RequiresDispatchBeforeTerminalCompletion) {

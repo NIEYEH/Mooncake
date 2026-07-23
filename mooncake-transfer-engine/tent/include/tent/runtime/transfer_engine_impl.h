@@ -298,6 +298,10 @@ class TransferEngineImpl {
         QueueLimits limits{};
         size_t max_dispatch_owners{0};
         size_t max_dispatch_bytes{0};
+        // Directional caps apply to GDS owners only. All transports still
+        // share the global owner/byte window above.
+        size_t max_dispatch_read_owners{0};
+        size_t max_dispatch_write_owners{0};
         std::chrono::microseconds progress_fallback_interval{50000};
     };
 
@@ -306,7 +310,11 @@ class TransferEngineImpl {
         size_t owner_task_id{0};
         std::vector<size_t> public_task_ids;
         size_t byte_charge{0};
+        std::chrono::steady_clock::time_point enqueue_time{};
+        TransportType initial_transport{UNSPEC};
         bool in_dispatch_window{false};
+        bool gds_read_in_dispatch{false};
+        bool gds_write_in_dispatch{false};
     };
 
    private:
@@ -340,6 +348,8 @@ class TransferEngineImpl {
     std::unordered_map<QueueOwnerId, QueuedOwnerState> queued_owners_;
     size_t dispatch_inflight_owners_{0};
     size_t dispatch_inflight_bytes_{0};
+    size_t dispatch_inflight_read_owners_{0};
+    size_t dispatch_inflight_write_owners_{0};
     uint64_t next_batch_token_{1};
 
     // Guards alive_batches_ and serializes pollTaskStatus /

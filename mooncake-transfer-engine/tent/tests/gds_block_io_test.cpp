@@ -37,6 +37,7 @@
 #include "tent/common/config.h"
 #include "tent/common/types.h"
 #include "tent/transfer_engine.h"
+#include "tent/transport/gds/gds_transport.h"
 
 namespace mooncake {
 namespace tent {
@@ -141,20 +142,22 @@ std::shared_ptr<Config> makeGdsConfig() {
     config->set("transports/nvlink/enable", false);
     config->set("transports/mnnvl/enable", false);
     config->set("transports/gds/enable", true);
-    config->set("transports/gds/io_batch_depth", 64);
-    config->set("transports/gds/max_inflight_batches", 1);
-    config->set("transports/gds/read_batch_depth", 64);
-    config->set("transports/gds/write_batch_depth", 32);
-    config->set("transports/gds/max_read_batch_bytes", 256UL << 20);
-    config->set("transports/gds/max_write_batch_bytes", 64UL << 20);
-    config->set("transports/gds/enable_batch_read", false);
-    config->set("transports/gds/enable_batch_write", false);
-    config->set("transports/gds/read_worker_threads", 4);
+    config->set("transports/gds/read_worker_threads", 16);
     config->set("transports/gds/write_worker_threads", 4);
-    config->set("transports/gds/max_inflight_reads", 8);
-    config->set("transports/gds/max_inflight_writes", 8);
-    config->set("transports/gds/aggregation_delay_us", 1000);
-    config->set("transports/gds/status_poll_interval_us", 50);
+    config->set("transports/gds/max_inflight_reads", 16);
+    config->set("transports/gds/max_inflight_writes", 4);
+    config->set("transports/gds/submit_retry_count", 0);
+    config->set("transports/gds/write_starvation_timeout_us", 500000);
+    config->set("transports/gds/adaptive_concurrency", true);
+    config->set("transports/gds/adaptive_sample_window", 128);
+    config->set("transports/gds/adaptive_evaluation_interval", 32);
+    config->set("transports/gds/adaptive_recovery_windows", 3);
+    config->set("transports/gds/adaptive_min_read_inflight", 4);
+    config->set("transports/gds/adaptive_min_write_inflight", 1);
+    config->set("transports/gds/adaptive_p99_degradation_ratio", 1.25);
+    config->set("transports/gds/adaptive_p99_recovery_ratio", 1.05);
+    config->set("transports/gds/adaptive_read_p99_target_us", 60000);
+    config->set("transports/gds/adaptive_write_p99_target_us", 0);
     return config;
 }
 
@@ -308,6 +311,77 @@ Request makeRequest(Request::OpCode opcode, void* buffer, SegmentID segment,
     request.length = length;
     request.transport_hint = GDS;
     return request;
+}
+
+TEST(GdsAdaptiveConcurrencyTest,
+     ReducesUnderOverloadAndRecoversOnlyWithoutBacklog) {
+    GdsAdaptiveState state;
+    state.configured_limit = 16;
+    state.current_limit = 16;
+    state.minimum_limit = 4;
+    state.baseline_p99_us = 100.0;
+
+    EXPECT_EQ(adjustGdsAdaptiveConcurrency(state, 150.0, 64, 1.25, 1.05,
+                                           3),
+              GdsAdaptiveAction::REDUCE);
+    EXPECT_EQ(state.current_limit, 12u);
+    EXPECT_DOUBLE_EQ(state.baseline_p99_us, 100.0);
+
+    // Even a healthy-looking P99 cannot raise concurrency while a direction
+    // remains saturated and backlogged.
+    for (int window = 0; window < 8; ++window) {
+        EXPECT_EQ(adjustGdsAdaptiveConcurrency(state, 90.0, 64, 1.25,
+                                               1.05, 3),
+                  GdsAdaptiveAction::NONE);
+    }
+    EXPECT_EQ(state.current_limit, 12u);
+
+    EXPECT_EQ(adjustGdsAdaptiveConcurrency(state, 90.0, 0, 1.25, 1.05, 3),
+              GdsAdaptiveAction::NONE);
+    EXPECT_EQ(adjustGdsAdaptiveConcurrency(state, 90.0, 0, 1.25, 1.05, 3),
+              GdsAdaptiveAction::NONE);
+    EXPECT_EQ(adjustGdsAdaptiveConcurrency(state, 90.0, 0, 1.25, 1.05, 3),
+              GdsAdaptiveAction::RECOVER);
+    EXPECT_EQ(state.current_limit, 13u);
+
+    for (int window = 0; window < 30; ++window) {
+        (void)adjustGdsAdaptiveConcurrency(state, 90.0, 0, 1.25, 1.05, 3);
+    }
+    EXPECT_EQ(state.current_limit, state.configured_limit);
+}
+
+TEST(GdsAdaptiveConcurrencyTest,
+     BurstSaturationReducesAfterInflightAndQueuesAlreadyDrain) {
+    GdsAdaptiveState state;
+    state.configured_limit = 16;
+    state.current_limit = 16;
+    state.minimum_limit = 4;
+    state.baseline_p99_us = 100.0;
+
+    // The completion that triggers evaluation can observe no remaining
+    // inflight or queued IO even though earlier samples filled the window.
+    state.saturation_since_evaluation = true;
+    EXPECT_EQ(adjustGdsAdaptiveConcurrency(state, 150.0, 0, 1.25, 1.05, 3),
+              GdsAdaptiveAction::REDUCE);
+    EXPECT_EQ(state.current_limit, 12u);
+    EXPECT_FALSE(state.saturation_since_evaluation);
+}
+
+TEST(GdsAdaptiveConcurrencyTest, MinimumAndExistingInflightAreUnderflowSafe) {
+    GdsAdaptiveState state;
+    state.configured_limit = 16;
+    state.current_limit = 4;
+    state.minimum_limit = 4;
+    state.baseline_p99_us = 100.0;
+
+    EXPECT_EQ(adjustGdsAdaptiveConcurrency(state, 200.0, 64, 1.25, 1.05,
+                                           3),
+              GdsAdaptiveAction::NONE);
+    EXPECT_EQ(state.current_limit, 4u);
+    EXPECT_DOUBLE_EQ(state.baseline_p99_us, 100.0);
+    EXPECT_EQ(gdsAvailableWorkerSlots(4, 8), 0u);
+    EXPECT_EQ(gdsAvailableWorkerSlots(4, 4), 0u);
+    EXPECT_EQ(gdsAvailableWorkerSlots(4, 3), 1u);
 }
 
 TEST(GdsBlockIoTest, DestructiveWriteReadAtTwoOffsets) {
@@ -512,7 +586,7 @@ TEST(GdsBlockIoTest, DestructiveWriteReadAtTwoOffsets) {
 
     // Submit one request per TransferEngine Batch. This is the shape produced
     // by concurrent Store/vLLM loads and verifies that the GDS transport-level
-    // scheduler can coalesce work across independent logical SubBatches.
+    // scheduler runs independent single IOs across logical SubBatches.
     ASSERT_EQ(cudaMemset(destination_io, 0, io_length), cudaSuccess);
     ASSERT_EQ(cudaMemset(second_destination_io, 0, io_length), cudaSuccess);
     ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);

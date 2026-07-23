@@ -14,6 +14,8 @@
 
 #include "tent/runtime/admission_queue.h"
 
+#include <algorithm>
+#include <iterator>
 #include <limits>
 #include <set>
 
@@ -38,6 +40,10 @@ bool isSupportedOwnerKind(QueueOwnerKind kind) {
             return true;
     }
     return false;
+}
+
+bool isSupportedOpcode(Request::OpCode opcode) {
+    return opcode == Request::READ || opcode == Request::WRITE;
 }
 
 Status checkedAdd(size_t lhs, size_t rhs, size_t& out) {
@@ -84,6 +90,14 @@ Status LocalTransferAdmissionQueue::tryAdmit(
         if (!isSupportedOwnerKind(owner.kind)) {
             return Status::InvalidArgument(
                 "unsupported queue owner kind" LOC_MARK);
+        }
+        if (!isSupportedOpcode(owner.request.opcode)) {
+            return Status::InvalidArgument(
+                "unsupported queue owner opcode" LOC_MARK);
+        }
+        if (owner.transport < UNSPEC || owner.transport >= kNumTransportTypes) {
+            return Status::InvalidArgument(
+                "unsupported queue owner transport" LOC_MARK);
         }
         if (owner.request.length == 0) {
             return Status::InvalidArgument("empty transfer request" LOC_MARK);
@@ -166,6 +180,7 @@ Status LocalTransferAdmissionQueue::tryAdmit(
         QueueOwner owner;
         owner.batch_token = submit.batch_token;
         owner.request = owner_input.request;
+        owner.transport = owner_input.transport;
         owner.kind = owner_input.kind;
         owners_.emplace(owner_id, owner);
 
@@ -187,32 +202,97 @@ Status LocalTransferAdmissionQueue::tryAdmit(
 
 std::vector<QueueOwnerId> LocalTransferAdmissionQueue::pickForDispatch(
     size_t max_owners, size_t max_bytes) {
+    const size_t unlimited = std::numeric_limits<size_t>::max();
+    return pickForDispatch(max_owners, max_bytes, unlimited, unlimited);
+}
+
+std::vector<QueueOwnerId> LocalTransferAdmissionQueue::pickForDispatch(
+    size_t max_owners, size_t max_bytes, size_t max_gds_reads,
+    size_t max_gds_writes) {
     std::vector<QueueOwnerId> picked;
     if (max_owners == 0 || max_bytes == 0) return picked;
 
     size_t used_owners = 0;
     size_t used_bytes = 0;
-    while (!fifo_.empty() && used_owners < max_owners) {
-        auto owner_id = fifo_.front();
-        auto owner_it = owners_.find(owner_id);
+    size_t used_gds_reads = 0;
+    size_t used_gds_writes = 0;
+    while (used_owners < max_owners) {
         // Non-queued entries should not normally remain in fifo_, but stale
-        // entries are skipped defensively so retireBatch() does not need to
-        // scan the dispatch queue.
-        if (owner_it == owners_.end() ||
-            owner_it->second.state != QueueState::Queued) {
-            fifo_.pop_front();
-            continue;
+        // entries are removed defensively.
+        for (auto fifo_it = fifo_.begin(); fifo_it != fifo_.end();) {
+            auto owner_it = owners_.find(*fifo_it);
+            if (owner_it == owners_.end() ||
+                owner_it->second.state != QueueState::Queued) {
+                fifo_it = fifo_.erase(fifo_it);
+            } else {
+                ++fifo_it;
+            }
+        }
+        if (fifo_.empty()) {
+            consecutive_read_dispatches_ = 0;
+            break;
         }
 
+        const auto find_gds_opcode = [&](Request::OpCode opcode) {
+            return std::find_if(
+                fifo_.begin(), fifo_.end(), [&](QueueOwnerId owner_id) {
+                    const auto& owner = owners_.at(owner_id);
+                    return owner.transport == GDS &&
+                           owner.request.opcode == opcode;
+                });
+        };
+        const auto non_gds_it =
+            std::find_if(fifo_.begin(), fifo_.end(), [&](QueueOwnerId owner_id) {
+                return owners_.at(owner_id).transport != GDS;
+            });
+        auto read_it = used_gds_reads < max_gds_reads
+                           ? find_gds_opcode(Request::READ)
+                           : fifo_.end();
+        auto write_it = used_gds_writes < max_gds_writes
+                            ? find_gds_opcode(Request::WRITE)
+                            : fifo_.end();
+        const bool has_read = read_it != fifo_.end();
+        const bool has_write = write_it != fifo_.end();
+
+        const bool choose_gds_read =
+            has_read &&
+            (!has_write || consecutive_read_dispatches_ <
+                               kMaxConsecutiveReadDispatches);
+        auto gds_it = choose_gds_read ? read_it : write_it;
+        if (gds_it == fifo_.end() && non_gds_it == fifo_.end()) break;
+
+        // A GDS READ may bypass GDS WRITEs, but never an unrelated transport
+        // owner that was admitted before that READ.
+        auto selected_it = gds_it;
+        if (non_gds_it != fifo_.end() &&
+            (selected_it == fifo_.end() ||
+             std::distance(fifo_.begin(), non_gds_it) <
+                 std::distance(fifo_.begin(), selected_it))) {
+            selected_it = non_gds_it;
+        }
+        auto owner_it = owners_.find(*selected_it);
         const auto& owner = owner_it->second;
         const size_t remaining_bytes = max_bytes - used_bytes;
+        // Preserve FIFO within the selected operation class. If its oldest
+        // request cannot fit, do not bypass it with a lower-priority request.
         if (owner.request.length > remaining_bytes) break;
 
-        fifo_.pop_front();
+        const QueueOwnerId owner_id = *selected_it;
+        fifo_.erase(selected_it);
         owner_it->second.state = QueueState::Dispatching;
         picked.push_back(owner_id);
         ++used_owners;
         used_bytes += owner.request.length;
+        if (owner.transport == GDS && owner.request.opcode == Request::READ) {
+            ++used_gds_reads;
+            if (consecutive_read_dispatches_ <
+                kMaxConsecutiveReadDispatches) {
+                ++consecutive_read_dispatches_;
+            }
+        } else if (owner.transport == GDS) {
+            ++used_gds_writes;
+            consecutive_read_dispatches_ = 0;
+        }
     }
     return picked;
 }
