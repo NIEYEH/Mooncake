@@ -228,6 +228,39 @@ void testSecondaryByteWindowIncludesOutstandingReservations() {
     EXPECT_TRUE(second.empty());
 }
 
+void testSingleOversizedReadOwnerStillMakesProgress() {
+    auto config = weightedConfig();
+    config.primary_read_bytes = 16 * kMiB;
+    config.secondary_segment_bytes = 16 * kMiB;
+    GdsOperationScheduler scheduler(config);
+    EXPECT_TRUE(
+        scheduler
+            .enqueue(entry(1, 77, GdsDirection::Read,
+                           32 * kMiB, 4))
+            .ok());
+    const auto primary = scheduler.select({16, 64 * kMiB, 16});
+    EXPECT_EQ(primary.size(), 1u);
+    EXPECT_EQ(primary.front().operation_owner_id, 77u);
+    EXPECT_TRUE(
+        scheduler.complete(primary.front().id, 32 * kMiB, COMPLETED)
+            .ok());
+
+    EXPECT_TRUE(
+        scheduler
+            .enqueue(entry(2, 88, GdsDirection::Read,
+                           12 * kMiB, 12))
+            .ok());
+    EXPECT_TRUE(
+        scheduler
+            .enqueue(entry(3, 99, GdsDirection::Read,
+                           32 * kMiB, 4))
+            .ok());
+    const auto secondary = scheduler.select({16, 64 * kMiB, 16});
+    EXPECT_EQ(secondary.size(), 2u);
+    EXPECT_EQ(secondary.front().operation_owner_id, 88u);
+    EXPECT_EQ(secondary.back().operation_owner_id, 99u);
+}
+
 void testMultiPhysicalWriteMakesProgressAtOneTokenBaseline() {
     auto config = weightedConfig();
     config.mode = GdsSchedulerMode::Fixed;
@@ -489,6 +522,7 @@ int main() {
     testOnlyOneSecondaryReadOperationCanBeActive();
     testSecondaryWindowCountsLogicalEntriesNotPhysicalIos();
     testSecondaryByteWindowIncludesOutstandingReservations();
+    testSingleOversizedReadOwnerStillMakesProgress();
     testMultiPhysicalWriteMakesProgressAtOneTokenBaseline();
     testBoostDoesNotActivateSecondWriteOperation();
     testIdleDirectionCannotBankCredit();

@@ -269,12 +269,17 @@ bool GdsOperationScheduler::canReserve(
         entry.operation_owner_id == primaryReadOperation()) {
         size_t next_operation_tokens = 0;
         size_t next_operation_bytes = 0;
+        const bool single_jumbo_entry =
+            operation_it->second.reserved_entries == 0 &&
+            operation_it->second.reserved_bytes == 0 &&
+            entry.physical_bytes > config_.primary_read_bytes;
         if (!checkedAdd(operation_it->second.reserved_tokens,
                         token_charge, next_operation_tokens) ||
             !checkedAdd(operation_it->second.reserved_bytes,
                         entry.physical_bytes, next_operation_bytes) ||
             next_operation_tokens > config_.primary_read_tokens ||
-            next_operation_bytes > config_.primary_read_bytes) {
+            (next_operation_bytes > config_.primary_read_bytes &&
+             !single_jumbo_entry)) {
             return false;
         }
     }
@@ -355,11 +360,17 @@ GdsOperationScheduler::findCandidate(GdsDirection direction,
                     !canReserve(entry, budget)) {
                     return false;
                 }
+                const bool single_jumbo_entry =
+                    operation_it->second.reserved_entries == 0 &&
+                    operation_it->second.reserved_bytes == 0 &&
+                    entry.physical_bytes >
+                        config_.secondary_segment_bytes;
                 return operation_it->second.reserved_entries <
                            config_.secondary_segment_requests &&
-                       entry.physical_bytes <=
-                           config_.secondary_segment_bytes -
-                               operation_it->second.reserved_bytes;
+                       (single_jumbo_entry ||
+                        entry.physical_bytes <=
+                            config_.secondary_segment_bytes -
+                                operation_it->second.reserved_bytes);
             });
         if (candidate != queued_.end()) return candidate;
     }
