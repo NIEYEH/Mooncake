@@ -20,6 +20,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -52,6 +53,7 @@ struct TaskInfo {
     TransportType type{UNSPEC};
     int sub_task_id{-1};
     bool derived{false};          // merged by other tasks
+    bool runtime_admission_waiting{false};  // accepted, not active yet
     int xport_priority{0};        // transport priority (for fallback)
     int failover_count{0};        // number of failover attempts
     uint64_t device_mask{~0ULL};  // Device mask for quota allocation
@@ -218,6 +220,10 @@ class TransferEngineImpl {
     Status enqueuePreparedSubmit(Batch* batch, const PreparedSubmit& prepared,
                                  QueueOwnerKind owner_kind);
 
+    // Moves as many deferred owners as current owner/byte capacity permits
+    // into LocalTransferAdmissionQueue. Caller holds progress_mutex_.
+    Status admitWaitingOwners();
+
     bool shouldQueueSubmit(const PreparedSubmit& prepared,
                            QueueOwnerKind owner_kind) const;
 
@@ -317,6 +323,17 @@ class TransferEngineImpl {
         bool gds_write_in_dispatch{false};
     };
 
+    struct AdmissionWaitingOwner {
+        Batch* batch{nullptr};
+        uint64_t batch_token{0};
+        size_t owner_task_id{0};
+        std::vector<size_t> derived_task_ids;
+        size_t byte_charge{0};
+        std::chrono::steady_clock::time_point enqueue_time{};
+        TransportType initial_transport{UNSPEC};
+        QueueOwnerKind kind{QueueOwnerKind::User};
+    };
+
    private:
     std::shared_ptr<Config> conf_;
     std::shared_ptr<ControlService> metadata_;
@@ -350,6 +367,16 @@ class TransferEngineImpl {
     size_t dispatch_inflight_bytes_{0};
     size_t dispatch_inflight_read_owners_{0};
     size_t dispatch_inflight_write_owners_{0};
+    // Owners waiting in a large submit but not yet admitted. They are kept
+    // outside LocalTransferAdmissionQueue until capacity is released, so the
+    // configured outstanding limits remain hard bounds.
+    size_t admission_waiting_owners_{0};
+    size_t admission_waiting_bytes_{0};
+    size_t admission_waiting_gds_reads_{0};
+    size_t admission_waiting_gds_writes_{0};
+    std::deque<AdmissionWaitingOwner> admission_waiting_queue_;
+    static constexpr size_t kMaxConsecutiveAdmissionReads = 16;
+    size_t consecutive_admission_read_owners_{0};
     uint64_t next_batch_token_{1};
 
     // Guards alive_batches_ and serializes pollTaskStatus /

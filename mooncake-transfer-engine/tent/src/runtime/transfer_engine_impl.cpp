@@ -1621,31 +1621,59 @@ Status TransferEngineImpl::enqueuePreparedSubmit(Batch* batch,
             "batch public task capacity exceeded" LOC_MARK);
     }
 
+    const size_t owner_capacity =
+        owner_kind == QueueOwnerKind::User
+            ? runtime_queue_config_.limits.max_outstanding_owners -
+                  runtime_queue_config_.limits.staging_owner_reserve
+            : runtime_queue_config_.limits.max_outstanding_owners;
+    const size_t byte_capacity =
+        owner_kind == QueueOwnerKind::User
+            ? runtime_queue_config_.limits.max_outstanding_bytes -
+                  runtime_queue_config_.limits.staging_byte_reserve
+            : runtime_queue_config_.limits.max_outstanding_bytes;
+    if (owner_capacity == 0 || byte_capacity == 0) {
+        return Status::TooManyRequests(
+            "runtime queue has no capacity for this owner class" LOC_MARK);
+    }
+
+    size_t submit_bytes = 0;
     const uint64_t batch_token =
         batch->queue_token != 0 ? batch->queue_token : nextBatchToken();
-    QueueSubmit submit;
-    submit.batch_token = batch_token;
-    submit.batch_slots_left = batch->max_size - batch->task_list.size();
-    submit.owners.reserve(prepared.owners.size());
     for (const auto& owner : prepared.owners) {
         if (owner.request.length > runtime_queue_config_.max_dispatch_bytes) {
             return Status::TooManyRequests(
                 "request exceeds runtime queue dispatch byte window" LOC_MARK);
         }
-        QueueOwnerInput input;
-        input.owner_task_id = owner.owner_task_id;
-        input.derived_task_ids = owner.derived_task_ids;
-        input.request = owner.request;
-        input.transport = owner.route.transport;
-        input.kind = owner_kind;
-        submit.owners.push_back(std::move(input));
+        if (owner.request.length > byte_capacity) {
+            return Status::TooManyRequests(
+                "request exceeds runtime queue admission byte capacity"
+                LOC_MARK);
+        }
+        if (owner.request.length >
+            std::numeric_limits<size_t>::max() - submit_bytes) {
+            return Status::InvalidArgument(
+                "runtime queue submit byte charge overflow" LOC_MARK);
+        }
+        submit_bytes += owner.request.length;
+    }
+    if (prepared.owners.size() > owner_capacity ||
+        submit_bytes > byte_capacity) {
+        LOG_EVERY_N(INFO, 64)
+            << "Runtime queue streaming oversized submit: owners="
+            << prepared.owners.size() << ", bytes=" << submit_bytes
+            << ", admission_owner_capacity=" << owner_capacity
+            << ", admission_byte_capacity=" << byte_capacity;
+    }
+    if (prepared.owners.size() >
+            std::numeric_limits<size_t>::max() -
+                admission_waiting_owners_ ||
+        submit_bytes > std::numeric_limits<size_t>::max() -
+                           admission_waiting_bytes_) {
+        return Status::InvalidArgument(
+            "runtime queue waiting backlog overflow" LOC_MARK);
     }
 
-    std::vector<QueueOwnerId> admitted_owner_ids;
-    CHECK_STATUS(runtime_queue_->tryAdmit(submit, admitted_owner_ids));
-    const auto admitted_at = std::chrono::steady_clock::now();
     batch->queue_token = batch_token;
-
     batch->task_list.insert(batch->task_list.end(), prepared.tasks.size(),
                             TaskInfo{});
     for (const auto& task_plan : prepared.tasks) {
@@ -1661,29 +1689,174 @@ Status TransferEngineImpl::enqueuePreparedSubmit(Batch* batch,
         task.sub_task_id = -1;
         task.device_mask = owner.route.device_mask;
         task.derived = task_plan.task_id != owner.owner_task_id;
+        task.runtime_admission_waiting = true;
     }
 
-    for (size_t i = 0; i < admitted_owner_ids.size(); ++i) {
+    admission_waiting_owners_ += prepared.owners.size();
+    admission_waiting_bytes_ += submit_bytes;
+    for (const auto& owner : prepared.owners) {
+        AdmissionWaitingOwner waiting;
+        waiting.batch = batch;
+        waiting.batch_token = batch_token;
+        waiting.owner_task_id = owner.owner_task_id;
+        waiting.derived_task_ids = owner.derived_task_ids;
+        waiting.byte_charge = owner.request.length;
+        waiting.enqueue_time = prepared.submit_time;
+        waiting.initial_transport = owner.route.transport;
+        waiting.kind = owner_kind;
+        admission_waiting_queue_.push_back(std::move(waiting));
+
+        if (owner.route.transport != GDS) continue;
+        if (owner.request.opcode == Request::READ) {
+            ++admission_waiting_gds_reads_;
+        } else {
+            ++admission_waiting_gds_writes_;
+        }
+    }
+    updateRuntimeQueueMetrics();
+    return Status::OK();
+}
+
+Status TransferEngineImpl::admitWaitingOwners() {
+    while (!admission_waiting_queue_.empty()) {
+        const auto find_gds_opcode = [&](Request::OpCode opcode) {
+            return std::find_if(
+                admission_waiting_queue_.begin(),
+                admission_waiting_queue_.end(),
+                [&](const AdmissionWaitingOwner& waiting) {
+                    return waiting.initial_transport == GDS &&
+                           waiting.batch &&
+                           waiting.owner_task_id <
+                               waiting.batch->task_list.size() &&
+                           waiting.batch->task_list[waiting.owner_task_id]
+                                   .request.opcode == opcode;
+                });
+        };
+        const auto non_gds_it = std::find_if(
+            admission_waiting_queue_.begin(),
+            admission_waiting_queue_.end(),
+            [](const AdmissionWaitingOwner& waiting) {
+                return waiting.initial_transport != GDS;
+            });
+        auto read_it = find_gds_opcode(Request::READ);
+        auto write_it = find_gds_opcode(Request::WRITE);
+        const bool has_read = read_it != admission_waiting_queue_.end();
+        const bool has_write = write_it != admission_waiting_queue_.end();
+        const bool choose_read =
+            has_read &&
+            (!has_write || consecutive_admission_read_owners_ <
+                               kMaxConsecutiveAdmissionReads);
+        auto selected_it = choose_read ? read_it : write_it;
+        if (selected_it == admission_waiting_queue_.end() &&
+            non_gds_it == admission_waiting_queue_.end()) {
+            return Status::InternalError(
+                "runtime admission backlog contains no dispatchable owner"
+                LOC_MARK);
+        }
+        if (non_gds_it != admission_waiting_queue_.end() &&
+            (selected_it == admission_waiting_queue_.end() ||
+             std::distance(admission_waiting_queue_.begin(), non_gds_it) <
+                 std::distance(admission_waiting_queue_.begin(),
+                               selected_it))) {
+            selected_it = non_gds_it;
+        }
+
+        const auto waiting = *selected_it;
+        if (!waiting.batch ||
+            waiting.owner_task_id >= waiting.batch->task_list.size()) {
+            return Status::InternalError(
+                "runtime admission owner metadata is stale" LOC_MARK);
+        }
+        const auto& request =
+            waiting.batch->task_list[waiting.owner_task_id].request;
+        auto capacity = runtime_queue_->availableCapacity(waiting.kind);
+        const bool admitting_gds_read =
+            waiting.initial_transport == GDS &&
+            request.opcode == Request::READ;
+        const bool admitting_gds_write =
+            waiting.initial_transport == GDS &&
+            request.opcode == Request::WRITE;
+
+        if (capacity.owners == 0 || request.length > capacity.bytes) break;
+
+        QueueSubmit submit;
+        submit.batch_token = waiting.batch_token;
+        submit.batch_slots_left = 1 + waiting.derived_task_ids.size();
+        QueueOwnerInput input;
+        input.owner_task_id = waiting.owner_task_id;
+        input.derived_task_ids = waiting.derived_task_ids;
+        input.request = request;
+        input.transport = waiting.initial_transport;
+        input.kind = waiting.kind;
+        submit.owners.push_back(std::move(input));
+
+        std::vector<QueueOwnerId> admitted_owner_ids;
+        auto admit_status =
+            runtime_queue_->tryAdmit(submit, admitted_owner_ids);
+        if (admit_status.IsTooManyRequests()) break;
+        CHECK_STATUS(admit_status);
+        if (admitted_owner_ids.size() != 1) {
+            return Status::InternalError(
+                "runtime admission did not publish exactly one owner"
+                LOC_MARK);
+        }
+
         QueuedOwnerState queued;
-        queued.batch = batch;
-        queued.owner_task_id = prepared.owners[i].owner_task_id;
-        queued.byte_charge = prepared.owners[i].request.length;
-        queued.enqueue_time = admitted_at;
-        queued.initial_transport = prepared.owners[i].route.transport;
-        queued.public_task_ids.push_back(prepared.owners[i].owner_task_id);
-        queued.public_task_ids.insert(
-            queued.public_task_ids.end(),
-            prepared.owners[i].derived_task_ids.begin(),
-            prepared.owners[i].derived_task_ids.end());
-        queued_owners_.emplace(admitted_owner_ids[i], queued);
+        queued.batch = waiting.batch;
+        queued.owner_task_id = waiting.owner_task_id;
+        queued.byte_charge = waiting.byte_charge;
+        queued.enqueue_time = waiting.enqueue_time;
+        queued.initial_transport = waiting.initial_transport;
+        queued.public_task_ids.push_back(waiting.owner_task_id);
+        queued.public_task_ids.insert(queued.public_task_ids.end(),
+                                      waiting.derived_task_ids.begin(),
+                                      waiting.derived_task_ids.end());
+        queued_owners_.emplace(admitted_owner_ids.front(),
+                               std::move(queued));
+        waiting.batch->task_list[waiting.owner_task_id]
+            .runtime_admission_waiting = false;
+        for (const auto derived_task_id : waiting.derived_task_ids) {
+            waiting.batch->task_list[derived_task_id]
+                .runtime_admission_waiting = false;
+        }
+
+        if (admission_waiting_owners_ == 0 ||
+            admission_waiting_bytes_ < waiting.byte_charge) {
+            return Status::InternalError(
+                "runtime admission waiting accounting underflow" LOC_MARK);
+        }
+        --admission_waiting_owners_;
+        admission_waiting_bytes_ -= waiting.byte_charge;
+        if (admitting_gds_read) {
+            if (admission_waiting_gds_reads_ == 0) {
+                return Status::InternalError(
+                    "runtime READ admission accounting underflow" LOC_MARK);
+            }
+            --admission_waiting_gds_reads_;
+            if (consecutive_admission_read_owners_ <
+                kMaxConsecutiveAdmissionReads) {
+                ++consecutive_admission_read_owners_;
+            }
+        } else if (admitting_gds_write) {
+            if (admission_waiting_gds_writes_ == 0) {
+                return Status::InternalError(
+                    "runtime WRITE admission accounting underflow" LOC_MARK);
+            }
+            --admission_waiting_gds_writes_;
+            consecutive_admission_read_owners_ = 0;
+        }
+        admission_waiting_queue_.erase(selected_it);
+    }
+    if (admission_waiting_queue_.empty()) {
+        consecutive_admission_read_owners_ = 0;
     }
     updateRuntimeQueueMetrics();
     return Status::OK();
 }
 
 void TransferEngineImpl::updateRuntimeQueueMetrics() {
-    size_t queued_gds_reads = 0;
-    size_t queued_gds_writes = 0;
+    size_t queued_gds_reads = admission_waiting_gds_reads_;
+    size_t queued_gds_writes = admission_waiting_gds_writes_;
     for (const auto& entry : queued_owners_) {
         const auto& queued = entry.second;
         if (queued.in_dispatch_window ||
@@ -1711,14 +1884,18 @@ void TransferEngineImpl::updateRuntimeQueueMetrics() {
     }
     const size_t outstanding_owners = runtime_queue_->outstandingOwners();
     const size_t outstanding_bytes = runtime_queue_->outstandingBytes();
-    const size_t queued_owners =
+    const size_t admitted_queued_owners =
         outstanding_owners >= dispatch_inflight_owners_
             ? outstanding_owners - dispatch_inflight_owners_
             : 0;
-    const size_t queued_bytes =
+    const size_t admitted_queued_bytes =
         outstanding_bytes >= dispatch_inflight_bytes_
             ? outstanding_bytes - dispatch_inflight_bytes_
             : 0;
+    const size_t queued_owners =
+        admitted_queued_owners + admission_waiting_owners_;
+    const size_t queued_bytes =
+        admitted_queued_bytes + admission_waiting_bytes_;
     TentMetrics::instance().updateRuntimeQueue(
         queued_owners, queued_bytes, dispatch_inflight_owners_,
         dispatch_inflight_bytes_);
@@ -1775,6 +1952,13 @@ Status TransferEngineImpl::finishQueuedOwner(
 
 Status TransferEngineImpl::retireQueueForBatch(Batch* batch) {
     if (!batch || batch->queue_token == 0) return Status::OK();
+    if (std::any_of(batch->task_list.begin(), batch->task_list.end(),
+                    [](const TaskInfo& task) {
+                        return task.runtime_admission_waiting;
+                    })) {
+        return Status::InvalidEntry(
+            "batch still has owners waiting for runtime admission" LOC_MARK);
+    }
     auto status = runtime_queue_->retireBatch(batch->queue_token);
     if (!status.ok()) return status;
     batch->queue_token = 0;
@@ -1964,6 +2148,7 @@ Status TransferEngineImpl::dispatchQueuedOwners(
 Status TransferEngineImpl::refillDispatchWindow() {
     std::lock_guard<std::recursive_mutex> lk(progress_mutex_);
     if (!runtime_queue_config_.enabled) return Status::OK();
+    CHECK_STATUS(admitWaitingOwners());
     // Publish external GDS backlog immediately before selecting owners. The
     // post-dispatch update below then removes every owner that actually
     // entered the transport window.
@@ -2058,7 +2243,8 @@ Status TransferEngineImpl::progressRuntimeQueue() {
 
 bool TransferEngineImpl::hasActiveRuntimeQueue() {
     std::lock_guard<std::recursive_mutex> lk(progress_mutex_);
-    return runtime_queue_config_.enabled && !queued_owners_.empty();
+    return runtime_queue_config_.enabled &&
+           (!queued_owners_.empty() || !admission_waiting_queue_.empty());
 }
 
 bool TransferEngineImpl::shouldQueueSubmit(const PreparedSubmit& prepared,
@@ -2293,6 +2479,11 @@ Status TransferEngineImpl::getTransferStatus(BatchID batch_id, size_t task_id,
     Batch* batch = (Batch*)(batch_id);
     if (task_id >= batch->task_list.size())
         return Status::InvalidArgument("Invalid task ID" LOC_MARK);
+    if (batch->task_list[task_id].runtime_admission_waiting) {
+        task_status.s = PENDING;
+        task_status.transferred_bytes = 0;
+        return Status::OK();
+    }
     const size_t public_task_id = task_id;
     size_t poll_task_id = task_id;
     CHECK_STATUS(refillDispatchWindow());
@@ -2387,6 +2578,7 @@ Status TransferEngineImpl::getBatchStatus(BatchID batch_id,
         auto& task = batch->task_list[task_id];
         if (task.derived) continue;  // This task is performed by other tasks
         total_tasks++;
+        if (task.runtime_admission_waiting) continue;
         if (runtime_queue_config_.enabled && batch->queue_token != 0) {
             QueueOwnerId owner_id = 0;
             auto resolve_status = runtime_queue_->resolveOwner(

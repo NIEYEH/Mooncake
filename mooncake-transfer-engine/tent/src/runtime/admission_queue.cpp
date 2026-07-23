@@ -409,5 +409,34 @@ size_t LocalTransferAdmissionQueue::outstandingBytes() const {
     return outstanding_bytes_;
 }
 
+QueueCapacity LocalTransferAdmissionQueue::availableCapacity(
+    QueueOwnerKind kind) const {
+    if (!limits_status_.ok()) return {};
+    QueueCapacity capacity{
+        limits_.max_outstanding_owners > outstanding_owners_
+            ? limits_.max_outstanding_owners - outstanding_owners_
+            : 0,
+        limits_.max_outstanding_bytes > outstanding_bytes_
+            ? limits_.max_outstanding_bytes - outstanding_bytes_
+            : 0};
+    if (kind != QueueOwnerKind::User) return capacity;
+
+    const size_t user_owner_limit =
+        limits_.max_outstanding_owners - limits_.staging_owner_reserve;
+    const size_t user_byte_limit =
+        limits_.max_outstanding_bytes - limits_.staging_byte_reserve;
+    const size_t available_user_owners =
+        user_owner_limit > outstanding_user_owners_
+            ? user_owner_limit - outstanding_user_owners_
+            : 0;
+    const size_t available_user_bytes =
+        user_byte_limit > outstanding_user_bytes_
+            ? user_byte_limit - outstanding_user_bytes_
+            : 0;
+    capacity.owners = std::min(capacity.owners, available_user_owners);
+    capacity.bytes = std::min(capacity.bytes, available_user_bytes);
+    return capacity;
+}
+
 }  // namespace tent
 }  // namespace mooncake

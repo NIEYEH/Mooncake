@@ -274,6 +274,30 @@ TEST(AdmissionQueueTest, KeepsAdmissionOrderForDispatch) {
     EXPECT_EQ(picked, expected_ids);
 }
 
+TEST(AdmissionQueueTest, ReportsCapacityByOwnerClass) {
+    LocalTransferAdmissionQueue queue({4, 100, 1, 25});
+    std::vector<QueueOwnerId> admitted_ids;
+
+    auto user_capacity = queue.availableCapacity(QueueOwnerKind::User);
+    EXPECT_EQ(user_capacity.owners, 3u);
+    EXPECT_EQ(user_capacity.bytes, 75u);
+    auto staging_capacity =
+        queue.availableCapacity(QueueOwnerKind::StagingInternal);
+    EXPECT_EQ(staging_capacity.owners, 4u);
+    EXPECT_EQ(staging_capacity.bytes, 100u);
+
+    ASSERT_TRUE(
+        queue.tryAdmit(makeSubmit(1, 1, {makeOwner(0, 40)}), admitted_ids)
+            .ok());
+    user_capacity = queue.availableCapacity(QueueOwnerKind::User);
+    EXPECT_EQ(user_capacity.owners, 2u);
+    EXPECT_EQ(user_capacity.bytes, 35u);
+    staging_capacity =
+        queue.availableCapacity(QueueOwnerKind::StagingInternal);
+    EXPECT_EQ(staging_capacity.owners, 3u);
+    EXPECT_EQ(staging_capacity.bytes, 60u);
+}
+
 TEST(AdmissionQueueTest, PrioritizesReadsAndPreservesPerOpcodeFifo) {
     LocalTransferAdmissionQueue queue({4, 128, 0, 0});
     std::vector<QueueOwnerId> admitted_ids;

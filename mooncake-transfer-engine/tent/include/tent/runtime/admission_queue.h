@@ -44,6 +44,11 @@ struct QueueLimits {
     size_t staging_byte_reserve{0};
 };
 
+struct QueueCapacity {
+    size_t owners{0};
+    size_t bytes{0};
+};
+
 struct QueueOwnerInput {
     // Absolute task id within the caller's Batch, not relative to this submit.
     size_t owner_task_id{0};
@@ -99,6 +104,11 @@ class LocalTransferAdmissionQueue {
     size_t outstandingOwners() const;
 
     size_t outstandingBytes() const;
+
+    // Capacity currently available to one owner class. TransferEngineImpl
+    // uses this to stream a submit larger than the admission window through
+    // the bounded queue instead of rejecting the entire public batch.
+    QueueCapacity availableCapacity(QueueOwnerKind kind) const;
 
    private:
     enum class QueueState {

@@ -281,14 +281,22 @@ TEST(RuntimeQueueDispatch, RejectsOverfullBatchBeforePublishingTasks) {
         engine.unregisterLocalMemory(buffer.data(), buffer.size()).ok());
 }
 
-TEST(RuntimeQueueDispatch, RejectsAdmissionAboveOutstandingOwnerLimit) {
+TEST(RuntimeQueueDispatch, StreamsSubmitAboveOutstandingOwnerLimit) {
     constexpr size_t kOutstandingOwners = 16;
     constexpr size_t kReqLen = 4096;
     auto cfg = makeRuntimeQueueConfig(kOutstandingOwners, 1UL << 20);
     TransferEngineImpl engine(cfg);
     ASSERT_TRUE(engine.available());
 
-    auto fake_rdma = std::make_shared<FakeTransport>(RDMA);
+    std::atomic<bool> complete{false};
+    auto fake_rdma = std::make_shared<FakeTransport>(
+        RDMA, [&complete](const Request& request, int) {
+            if (!complete.load()) {
+                return TransferStatus{TransferStatusEnum::PENDING, 0};
+            }
+            return TransferStatus{TransferStatusEnum::COMPLETED,
+                                  request.length};
+        });
     installFakeRdma(engine, fake_rdma);
 
     std::vector<uint8_t> buffer(kReqLen * (kOutstandingOwners + 1), 0x12);
@@ -302,15 +310,76 @@ TEST(RuntimeQueueDispatch, RejectsAdmissionAboveOutstandingOwnerLimit) {
             makeLocalWrite(buffer.data() + index * kReqLen, kReqLen));
     }
     auto status = engine.submitTransfer(batch, requests);
-    EXPECT_TRUE(status.IsTooManyRequests()) << status.ToString();
-    EXPECT_EQ(fake_rdma->submit_calls.load(), 0);
+    ASSERT_TRUE(status.ok()) << status.ToString();
+    EXPECT_EQ(fake_rdma->submit_calls.load(), 1);
 
     TransferStatus task_status{};
-    EXPECT_TRUE(
-        engine.getTransferStatus(batch, 0, task_status).IsInvalidArgument());
+    ASSERT_TRUE(engine
+                    .getTransferStatus(batch, kOutstandingOwners, task_status)
+                    .ok());
+    EXPECT_EQ(task_status.s, TransferStatusEnum::PENDING);
+
+    complete.store(true);
+    ASSERT_TRUE(engine.getTransferStatus(batch, 0, task_status).ok());
+    EXPECT_EQ(task_status.s, TransferStatusEnum::COMPLETED);
+    EXPECT_EQ(fake_rdma->submit_calls.load(), 2);
+    ASSERT_TRUE(engine
+                    .getTransferStatus(batch, kOutstandingOwners, task_status)
+                    .ok());
+    EXPECT_EQ(task_status.s, TransferStatusEnum::COMPLETED);
 
     EXPECT_TRUE(engine.freeBatch(batch).ok());
-    EXPECT_TRUE(engine.unregisterLocalMemory(buffer.data(), buffer.size()).ok());
+    EXPECT_TRUE(
+        engine.unregisterLocalMemory(buffer.data(), buffer.size()).ok());
+}
+
+TEST(RuntimeQueueDispatch, StreamsSubmitAboveOutstandingByteLimit) {
+    constexpr size_t kReqLen = 4096;
+    constexpr size_t kOutstandingBytes = 2 * kReqLen;
+    auto cfg = makeRuntimeQueueConfig(2, kOutstandingBytes);
+    cfg->set("runtime_queue/max_outstanding_bytes", kOutstandingBytes);
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+
+    std::atomic<bool> complete{false};
+    auto fake_rdma = std::make_shared<FakeTransport>(
+        RDMA, [&complete](const Request& request, int) {
+            if (!complete.load()) {
+                return TransferStatus{TransferStatusEnum::PENDING, 0};
+            }
+            return TransferStatus{TransferStatusEnum::COMPLETED,
+                                  request.length};
+        });
+    installFakeRdma(engine, fake_rdma);
+
+    std::vector<uint8_t> buffer(3 * kReqLen, 0x13);
+    ASSERT_TRUE(engine.registerLocalMemory(buffer.data(), buffer.size()).ok());
+    BatchID batch = engine.allocateBatch(3);
+    ASSERT_NE(batch, (BatchID)0);
+
+    std::vector<Request> requests;
+    for (size_t index = 0; index < 3; ++index) {
+        requests.push_back(
+            makeLocalWrite(buffer.data() + index * kReqLen, kReqLen));
+    }
+    auto status = engine.submitTransfer(batch, requests);
+    ASSERT_TRUE(status.ok()) << status.ToString();
+    EXPECT_EQ(fake_rdma->submit_calls.load(), 1);
+
+    TransferStatus task_status{};
+    ASSERT_TRUE(engine.getTransferStatus(batch, 2, task_status).ok());
+    EXPECT_EQ(task_status.s, TransferStatusEnum::PENDING);
+
+    complete.store(true);
+    ASSERT_TRUE(engine.getTransferStatus(batch, 0, task_status).ok());
+    EXPECT_EQ(task_status.s, TransferStatusEnum::COMPLETED);
+    EXPECT_EQ(fake_rdma->submit_calls.load(), 2);
+    ASSERT_TRUE(engine.getTransferStatus(batch, 2, task_status).ok());
+    EXPECT_EQ(task_status.s, TransferStatusEnum::COMPLETED);
+
+    EXPECT_TRUE(engine.freeBatch(batch).ok());
+    EXPECT_TRUE(
+        engine.unregisterLocalMemory(buffer.data(), buffer.size()).ok());
 }
 
 TEST(RuntimeQueueDispatch, RejectsOwnerLargerThanDispatchByteWindow) {
@@ -566,6 +635,58 @@ TEST(RuntimeQueueDispatch, GdsWriteBurstRespectsDirectionWindow) {
 
     EXPECT_TRUE(engine.freeBatch(batch).ok());
     EXPECT_TRUE(engine.unregisterLocalMemory(buffer.data(), buffer.size()).ok());
+}
+
+TEST(RuntimeQueueDispatch, StreamsLargeGdsSubmitThroughAdmissionWindow) {
+    constexpr size_t kRequestCount = 20;
+    constexpr size_t kWriteWindow = 4;
+    constexpr size_t kReqLen = 4096;
+    auto cfg = makeRuntimeQueueConfig(kWriteWindow, 1UL << 20);
+    cfg->set("runtime_queue/max_dispatch_read_owners", kWriteWindow);
+    cfg->set("runtime_queue/max_dispatch_write_owners", kWriteWindow);
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+
+    std::atomic<bool> complete{false};
+    auto fake_gds = std::make_shared<FakeTransport>(
+        GDS, [&complete](const Request& request, int) {
+            if (!complete.load()) {
+                return TransferStatus{TransferStatusEnum::PENDING, 0};
+            }
+            return TransferStatus{TransferStatusEnum::COMPLETED,
+                                  request.length};
+        });
+    installFakeGds(engine, fake_gds);
+
+    std::vector<uint8_t> buffer(kReqLen * kRequestCount, 0x4c);
+    ASSERT_TRUE(engine.registerLocalMemory(buffer.data(), buffer.size()).ok());
+    BatchID batch = engine.allocateBatch(kRequestCount);
+    ASSERT_NE(batch, (BatchID)0);
+
+    std::vector<Request> requests;
+    for (size_t index = 0; index < kRequestCount; ++index) {
+        requests.push_back(
+            makeLocalGdsWrite(buffer.data() + index * kReqLen, kReqLen));
+    }
+    ASSERT_TRUE(engine.submitTransfer(batch, requests).ok());
+    EXPECT_EQ(fake_gds->submit_calls.load(), kWriteWindow);
+    EXPECT_EQ(fake_gds->max_requests_per_submit.load(), 1u);
+
+    TransferStatus status{};
+    ASSERT_TRUE(
+        engine.getTransferStatus(batch, kRequestCount - 1, status).ok());
+    EXPECT_EQ(status.s, TransferStatusEnum::PENDING);
+
+    complete.store(true);
+    for (size_t index = 0; index < kRequestCount; ++index) {
+        ASSERT_TRUE(engine.getTransferStatus(batch, index, status).ok());
+        EXPECT_EQ(status.s, TransferStatusEnum::COMPLETED);
+    }
+    EXPECT_EQ(fake_gds->submit_calls.load(), kRequestCount);
+
+    EXPECT_TRUE(engine.freeBatch(batch).ok());
+    EXPECT_TRUE(
+        engine.unregisterLocalMemory(buffer.data(), buffer.size()).ok());
 }
 
 TEST(RuntimeQueueDispatch, GdsAdaptiveLimitClampsRuntimeReadWindow) {
