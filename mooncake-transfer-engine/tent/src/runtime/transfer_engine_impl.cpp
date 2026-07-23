@@ -69,17 +69,6 @@ size_t saturatingAdd(size_t lhs, size_t rhs) {
     return lhs + rhs;
 }
 
-Status checkedDispatchOwnerSum(size_t read_owners, size_t write_owners,
-                               size_t& total) {
-    if (write_owners >
-        std::numeric_limits<size_t>::max() - read_owners) {
-        return Status::InvalidArgument(
-            "runtime queue directional dispatch window overflow" LOC_MARK);
-    }
-    total = read_owners + write_owners;
-    return Status::OK();
-}
-
 double runtimeQueueNearestRankP99(std::vector<double> samples) {
     if (samples.empty()) return 0.0;
     // Samples are capped at 4096, so this integer nearest-rank calculation
@@ -358,15 +347,20 @@ Status TransferEngineImpl::construct() {
     const size_t configured_gds_write_workers =
         conf_->get("transports/gds/write_worker_threads", 4UL);
     const size_t configured_gds_write_inflight =
-        conf_->get("transports/gds/max_inflight_writes", 4UL);
+        conf_->get("transports/gds/max_inflight_writes", 1UL);
     const size_t default_gds_write_inflight =
         std::min(configured_gds_write_workers, configured_gds_write_inflight);
-    size_t default_max_dispatch_owners = 64;
-    if (gds_enabled) {
-        CHECK_STATUS(checkedDispatchOwnerSum(
-            default_gds_read_inflight, default_gds_write_inflight,
-            default_max_dispatch_owners));
+    const auto gds_scheduler_mode_name =
+        conf_->get("runtime_queue/gds_scheduler_mode", "fixed");
+    GdsSchedulerMode gds_scheduler_mode = GdsSchedulerMode::Fixed;
+    if (gds_scheduler_mode_name == "weighted_fair") {
+        gds_scheduler_mode = GdsSchedulerMode::WeightedFair;
+    } else if (gds_scheduler_mode_name != "fixed") {
+        return Status::InvalidArgument(
+            "runtime_queue/gds_scheduler_mode must be fixed or "
+            "weighted_fair" LOC_MARK);
     }
+    const size_t default_max_dispatch_owners = gds_enabled ? 16UL : 64UL;
     runtime_queue_config_.max_dispatch_owners =
         conf_->get("runtime_queue/max_dispatch_owners",
                    default_max_dispatch_owners);
@@ -393,9 +387,46 @@ Status TransferEngineImpl::construct() {
                     : runtime_queue_config_.max_dispatch_owners);
     runtime_queue_config_.max_dispatch_write_owners = conf_->get(
         "runtime_queue/max_dispatch_write_owners",
-        gds_enabled ? std::min(default_gds_write_inflight,
-                              runtime_queue_config_.max_dispatch_owners)
+        gds_enabled ? std::min(
+                          gds_scheduler_mode ==
+                                  GdsSchedulerMode::WeightedFair
+                              ? std::max<size_t>(
+                                    default_gds_write_inflight, 2)
+                              : default_gds_write_inflight,
+                          runtime_queue_config_.max_dispatch_owners)
                     : runtime_queue_config_.max_dispatch_owners);
+    runtime_queue_config_.gds_scheduler.mode = gds_scheduler_mode;
+    runtime_queue_config_.gds_scheduler.shared_tokens = conf_->get(
+        "runtime_queue/gds_shared_physical_tokens",
+        runtime_queue_config_.max_dispatch_owners);
+    runtime_queue_config_.gds_scheduler.read_standalone_tokens = conf_->get(
+        "runtime_queue/gds_read_standalone_tokens",
+        runtime_queue_config_.max_dispatch_read_owners);
+    runtime_queue_config_.gds_scheduler.write_standalone_tokens = conf_->get(
+        "runtime_queue/gds_write_standalone_tokens",
+        runtime_queue_config_.max_dispatch_write_owners);
+    runtime_queue_config_.gds_scheduler.contended_write_tokens = conf_->get(
+        "runtime_queue/gds_contended_write_tokens", 1UL);
+    runtime_queue_config_.gds_scheduler.read_quantum_bytes = conf_->get(
+        "runtime_queue/gds_read_quantum_bytes", 8UL << 20);
+    runtime_queue_config_.gds_scheduler.write_quantum_bytes = conf_->get(
+        "runtime_queue/gds_write_quantum_bytes", 2UL << 20);
+    runtime_queue_config_.gds_scheduler.credit_cap_quanta = conf_->get(
+        "runtime_queue/gds_credit_cap_quanta", 2UL);
+    runtime_queue_config_.gds_scheduler.primary_read_tokens = conf_->get(
+        "runtime_queue/gds_primary_read_tokens",
+        std::min<size_t>(
+            16, runtime_queue_config_.gds_scheduler.shared_tokens));
+    runtime_queue_config_.gds_scheduler.primary_read_bytes = conf_->get(
+        "runtime_queue/gds_primary_read_bytes", 48UL << 20);
+    runtime_queue_config_.gds_scheduler.secondary_segment_requests =
+        conf_->get("runtime_queue/gds_secondary_segment_requests", 8UL);
+    runtime_queue_config_.gds_scheduler.secondary_segment_bytes =
+        conf_->get("runtime_queue/gds_secondary_segment_bytes", 16UL << 20);
+    runtime_queue_config_.gds_segment_max_requests =
+        conf_->get("runtime_queue/gds_segment_max_requests", 8UL);
+    runtime_queue_config_.gds_segment_max_bytes =
+        conf_->get("runtime_queue/gds_segment_max_bytes", 16UL << 20);
     const size_t default_progress_fallback_interval_us =
         gds_enabled ? 1000UL : 50000UL;
     runtime_queue_config_.progress_fallback_interval =
@@ -410,24 +441,18 @@ Status TransferEngineImpl::construct() {
          runtime_queue_config_.max_waiting_owners == 0 ||
          runtime_queue_config_.max_waiting_bytes == 0 ||
          runtime_queue_config_.max_dispatch_read_owners == 0 ||
-         runtime_queue_config_.max_dispatch_write_owners == 0)) {
+         runtime_queue_config_.max_dispatch_write_owners == 0 ||
+         runtime_queue_config_.gds_segment_max_requests == 0 ||
+         runtime_queue_config_.gds_segment_max_bytes == 0)) {
         return Status::InvalidArgument(
             "runtime queue limits, waiting backlog, and dispatch window must "
             "be non-zero"
             LOC_MARK);
     }
     if (runtime_queue_config_.enabled && gds_enabled) {
-        size_t configured_directional_dispatch_owners = 0;
-        CHECK_STATUS(checkedDispatchOwnerSum(
-            runtime_queue_config_.max_dispatch_read_owners,
-            runtime_queue_config_.max_dispatch_write_owners,
-            configured_directional_dispatch_owners));
-        if (runtime_queue_config_.max_dispatch_owners <
-            configured_directional_dispatch_owners) {
-            return Status::InvalidArgument(
-                "runtime queue global dispatch owner window must cover the "
-                "sum of GDS READ and WRITE direction windows" LOC_MARK);
-        }
+        GdsOperationScheduler scheduler(
+            runtime_queue_config_.gds_scheduler);
+        CHECK_STATUS(scheduler.status());
     }
     if (runtime_queue_config_.enabled &&
         (runtime_queue_config_.max_dispatch_owners >
@@ -464,6 +489,17 @@ Status TransferEngineImpl::construct() {
                   << runtime_queue_config_.max_dispatch_read_owners
                   << ", max_dispatch_write_owners="
                   << runtime_queue_config_.max_dispatch_write_owners
+                  << ", gds_scheduler_mode="
+                  << (runtime_queue_config_.gds_scheduler.mode ==
+                              GdsSchedulerMode::Fixed
+                          ? "fixed"
+                          : "weighted_fair")
+                  << ", gds_shared_physical_tokens="
+                  << runtime_queue_config_.gds_scheduler.shared_tokens
+                  << ", gds_segment_max_requests="
+                  << runtime_queue_config_.gds_segment_max_requests
+                  << ", gds_segment_max_bytes="
+                  << runtime_queue_config_.gds_segment_max_bytes
                   << ", max_outstanding_owners="
                   << runtime_queue_config_.limits.max_outstanding_owners
                   << ", max_outstanding_bytes="
@@ -478,7 +514,8 @@ Status TransferEngineImpl::construct() {
                "without an owner/byte admission window.";
     }
     runtime_queue_ = std::make_unique<LocalTransferAdmissionQueue>(
-        runtime_queue_config_.limits);
+        runtime_queue_config_.limits,
+        runtime_queue_config_.gds_scheduler);
     for (auto& summary : runtime_queue_summary_) {
         summary.queue_wait_us.reserve(
             kRuntimeQueueSummarySampleCapacity);
@@ -1726,6 +1763,8 @@ Status TransferEngineImpl::enqueuePreparedSubmit(Batch* batch,
     }
 
     size_t submit_bytes = 0;
+    std::vector<QueuePhysicalPlan> physical_plans;
+    physical_plans.reserve(prepared.owners.size());
     const uint64_t batch_token =
         batch->queue_token != 0 ? batch->queue_token : nextBatchToken();
     for (const auto& owner : prepared.owners) {
@@ -1744,6 +1783,27 @@ Status TransferEngineImpl::enqueuePreparedSubmit(Batch* batch,
                 "runtime queue submit byte charge overflow" LOC_MARK);
         }
         submit_bytes += owner.request.length;
+
+        Transport::RuntimeQueuePlan transport_plan;
+        if (owner.route.transport == GDS) {
+            const auto& transport = transport_list_[GDS];
+            if (!transport) {
+                return Status::InvalidEntry(
+                    "GDS runtime queue planner is unavailable" LOC_MARK);
+            }
+            CHECK_STATUS(transport->planRuntimeQueueRequest(
+                owner.request, transport_plan));
+        } else {
+            transport_plan.physical_ios = 1;
+            transport_plan.physical_bytes = owner.request.length;
+        }
+        if (transport_plan.physical_ios == 0 ||
+            transport_plan.physical_bytes != owner.request.length) {
+            return Status::InvalidEntry(
+                "transport returned an invalid runtime queue plan" LOC_MARK);
+        }
+        physical_plans.push_back(
+            {transport_plan.physical_ios, transport_plan.physical_bytes});
     }
     if (prepared.owners.size() > owner_capacity ||
         submit_bytes > byte_capacity) {
@@ -1796,13 +1856,16 @@ Status TransferEngineImpl::enqueuePreparedSubmit(Batch* batch,
 
     admission_waiting_owners_ += prepared.owners.size();
     admission_waiting_bytes_ += submit_bytes;
-    for (const auto& owner : prepared.owners) {
+    for (size_t owner_index = 0; owner_index < prepared.owners.size();
+         ++owner_index) {
+        const auto& owner = prepared.owners[owner_index];
         AdmissionWaitingOwner waiting;
         waiting.batch = batch;
         waiting.batch_token = batch_token;
         waiting.owner_task_id = owner.owner_task_id;
         waiting.derived_task_ids = owner.derived_task_ids;
         waiting.byte_charge = owner.request.length;
+        waiting.physical_plan = physical_plans[owner_index];
         waiting.enqueue_time = prepared.submit_time;
         waiting.initial_transport = owner.route.transport;
         waiting.kind = owner_kind;
@@ -1890,6 +1953,7 @@ Status TransferEngineImpl::admitWaitingOwners() {
         input.request = request;
         input.transport = waiting.initial_transport;
         input.kind = waiting.kind;
+        input.physical_plan = waiting.physical_plan;
         submit.owners.push_back(std::move(input));
 
         std::vector<QueueOwnerId> admitted_owner_ids;
@@ -1907,6 +1971,7 @@ Status TransferEngineImpl::admitWaitingOwners() {
         queued.batch = waiting.batch;
         queued.owner_task_id = waiting.owner_task_id;
         queued.byte_charge = waiting.byte_charge;
+        queued.physical_plan = waiting.physical_plan;
         queued.enqueue_time = waiting.enqueue_time;
         queued.initial_transport = waiting.initial_transport;
         queued.public_task_ids.push_back(waiting.owner_task_id);
@@ -2126,7 +2191,8 @@ void TransferEngineImpl::maybeLogRuntimeQueueSummary(
 }
 
 Status TransferEngineImpl::finishQueuedOwner(
-    QueueOwnerId owner_id, TransferStatusEnum terminal_status) {
+    QueueOwnerId owner_id, size_t actual_transferred_bytes,
+    TransferStatusEnum terminal_status) {
     auto queued_it = queued_owners_.find(owner_id);
     if (queued_it == queued_owners_.end()) {
         return Status::InvalidEntry("queued owner not found" LOC_MARK);
@@ -2136,14 +2202,17 @@ Status TransferEngineImpl::finishQueuedOwner(
         if (dispatch_inflight_owners_ == 0 ||
             dispatch_inflight_bytes_ < queued.byte_charge ||
             (queued.gds_read_in_dispatch &&
-             dispatch_inflight_read_owners_ == 0) ||
+             dispatch_inflight_read_ios_ <
+                 queued.physical_plan.physical_ios) ||
             (queued.gds_write_in_dispatch &&
-             dispatch_inflight_write_owners_ == 0)) {
+             dispatch_inflight_write_ios_ <
+                 queued.physical_plan.physical_ios)) {
             return Status::InternalError(
                 "runtime dispatch window accounting underflow" LOC_MARK);
         }
     }
-    CHECK_STATUS(runtime_queue_->complete(owner_id, terminal_status));
+    CHECK_STATUS(runtime_queue_->complete(
+        owner_id, actual_transferred_bytes, terminal_status));
     const bool is_read =
         queued.batch->task_list[queued.owner_task_id].request.opcode ==
         Request::READ;
@@ -2154,17 +2223,19 @@ Status TransferEngineImpl::finishQueuedOwner(
     TentMetrics::instance().recordRuntimeQueueTotal(
         is_read, total_latency_seconds);
     recordRuntimeQueueCompletionSummary(
-        is_read, queued.byte_charge, terminal_status,
+        is_read, actual_transferred_bytes, terminal_status,
         total_latency_seconds);
     if (queued.in_dispatch_window) {
         --dispatch_inflight_owners_;
         dispatch_inflight_bytes_ -= queued.byte_charge;
         if (queued.gds_read_in_dispatch) {
-            --dispatch_inflight_read_owners_;
+            dispatch_inflight_read_ios_ -=
+                queued.physical_plan.physical_ios;
             queued.gds_read_in_dispatch = false;
         }
         if (queued.gds_write_in_dispatch) {
-            --dispatch_inflight_write_owners_;
+            dispatch_inflight_write_ios_ -=
+                queued.physical_plan.physical_ios;
             queued.gds_write_in_dispatch = false;
         }
         queued.in_dispatch_window = false;
@@ -2205,10 +2276,12 @@ Status TransferEngineImpl::markQueuedOwnerSubmitted(QueueOwnerId owner_id) {
         dispatch_inflight_bytes_ += queued.byte_charge;
         if (task.type == GDS && task.request.opcode == Request::READ) {
             queued.gds_read_in_dispatch = true;
-            ++dispatch_inflight_read_owners_;
+            dispatch_inflight_read_ios_ +=
+                queued.physical_plan.physical_ios;
         } else if (task.type == GDS) {
             queued.gds_write_in_dispatch = true;
-            ++dispatch_inflight_write_owners_;
+            dispatch_inflight_write_ios_ +=
+                queued.physical_plan.physical_ios;
         }
         updateRuntimeQueueMetrics();
     }
@@ -2240,7 +2313,8 @@ Status TransferEngineImpl::dispatchQueuedOwners(
             // pickForDispatch() already moved the owner to Dispatching. Do
             // not strand it there even if the runtime-side metadata is
             // unexpectedly inconsistent.
-            auto complete_status = runtime_queue_->complete(owner_id, FAILED);
+            auto complete_status =
+                runtime_queue_->complete(owner_id, 0, FAILED);
             remember_error(complete_status);
             if (complete_status.ok()) updateRuntimeQueueMetrics();
             continue;
@@ -2260,7 +2334,7 @@ Status TransferEngineImpl::dispatchQueuedOwners(
         task.type = route.transport;
         task.device_mask = route.device_mask;
         if (task.type == UNSPEC) {
-            remember_error(finishQueuedOwner(owner_id, FAILED));
+            remember_error(finishQueuedOwner(owner_id, 0, FAILED));
             continue;
         }
 
@@ -2272,7 +2346,8 @@ Status TransferEngineImpl::dispatchQueuedOwners(
                 auto status = staging_proxy_->submit(
                     &task, (BatchID)batch, staging_params);
                 if (!status.ok()) {
-                    remember_error(finishQueuedOwner(owner_id, FAILED));
+                    remember_error(
+                        finishQueuedOwner(owner_id, 0, FAILED));
                 } else {
                     remember_error(markQueuedOwnerSubmitted(owner_id));
                 }
@@ -2280,18 +2355,23 @@ Status TransferEngineImpl::dispatchQueuedOwners(
             }
         }
 
-        auto group_it = groups.end();
-        // GDS owns separate READ/WRITE single-IO worker pools. Keep each GDS
-        // owner as its own transport submission so the runtime queue cannot
-        // accidentally recreate a multi-entry cuFile batch. Other transports
-        // retain their existing per-batch grouping behavior.
-        if (task.type != GDS) {
-            group_it = std::find_if(
-                groups.begin(), groups.end(), [&](const DispatchGroup& group) {
-                    return group.batch == batch && group.type == task.type &&
-                           group.device_mask == task.device_mask;
-                });
-        }
+        auto group_it = std::find_if(
+            groups.begin(), groups.end(), [&](const DispatchGroup& group) {
+                if (group.batch != batch || group.type != task.type ||
+                    group.device_mask != task.device_mask) {
+                    return false;
+                }
+                if (task.type != GDS) return true;
+                if (group.requests.empty() ||
+                    group.requests.front().opcode != task.request.opcode) {
+                    return false;
+                }
+                return gdsDispatchSegmentCanAppend(
+                    {group.requests.size(), group.bytes},
+                    task.request.length,
+                    runtime_queue_config_.gds_segment_max_requests,
+                    runtime_queue_config_.gds_segment_max_bytes);
+            });
         if (group_it == groups.end()) {
             groups.push_back(
                 DispatchGroup{batch, task.type, task.device_mask, {}, {}, 0});
@@ -2299,6 +2379,13 @@ Status TransferEngineImpl::dispatchQueuedOwners(
         }
         group_it->owner_ids.push_back(owner_id);
         group_it->requests.push_back(task.request);
+        if (task.request.length >
+            std::numeric_limits<size_t>::max() - group_it->bytes) {
+            remember_error(finishQueuedOwner(owner_id, 0, FAILED));
+            group_it->owner_ids.pop_back();
+            group_it->requests.pop_back();
+            continue;
+        }
         group_it->bytes += task.request.length;
     }
 
@@ -2311,7 +2398,7 @@ Status TransferEngineImpl::dispatchQueuedOwners(
                     remember_error(Status::InternalError(
                         "queued owner metadata disappeared" LOC_MARK));
                     auto complete_status =
-                        runtime_queue_->complete(owner_id, FAILED);
+                        runtime_queue_->complete(owner_id, 0, FAILED);
                     remember_error(complete_status);
                     if (complete_status.ok()) updateRuntimeQueueMetrics();
                     continue;
@@ -2319,7 +2406,7 @@ Status TransferEngineImpl::dispatchQueuedOwners(
                 auto& task = queued_it->second.batch->task_list[
                     queued_it->second.owner_task_id];
                 task.type = UNSPEC;
-                remember_error(finishQueuedOwner(owner_id, FAILED));
+                remember_error(finishQueuedOwner(owner_id, 0, FAILED));
             }
         };
         if (!transport) {
@@ -2392,9 +2479,9 @@ Status TransferEngineImpl::refillDispatchWindow() {
         runtime_queue_config_.max_dispatch_owners - dispatch_inflight_owners_;
     const size_t byte_budget =
         runtime_queue_config_.max_dispatch_bytes - dispatch_inflight_bytes_;
-    size_t read_owner_limit =
+    size_t read_io_limit =
         runtime_queue_config_.max_dispatch_read_owners;
-    size_t write_owner_limit =
+    size_t write_io_limit =
         runtime_queue_config_.max_dispatch_write_owners;
     // GDS owns a second, latency-driven concurrency controller. Clamp the
     // runtime-side owner window to its live limit so a P99-triggered
@@ -2402,20 +2489,20 @@ Status TransferEngineImpl::refillDispatchWindow() {
     // merely moving excess owners into GDS's internal pending deques.
     const auto& gds_transport = transport_list_[GDS];
     if (gds_transport) {
-        read_owner_limit = std::min(
-            read_owner_limit,
+        read_io_limit = std::min(
+            read_io_limit,
             gds_transport->runtimeQueueDispatchLimit(Request::READ));
-        write_owner_limit = std::min(
-            write_owner_limit,
+        write_io_limit = std::min(
+            write_io_limit,
             gds_transport->runtimeQueueDispatchLimit(Request::WRITE));
     }
     const size_t read_budget =
-        read_owner_limit > dispatch_inflight_read_owners_
-            ? read_owner_limit - dispatch_inflight_read_owners_
+        read_io_limit > dispatch_inflight_read_ios_
+            ? read_io_limit - dispatch_inflight_read_ios_
             : 0;
     const size_t write_budget =
-        write_owner_limit > dispatch_inflight_write_owners_
-            ? write_owner_limit - dispatch_inflight_write_owners_
+        write_io_limit > dispatch_inflight_write_ios_
+            ? write_io_limit - dispatch_inflight_write_ios_
             : 0;
     auto picked = runtime_queue_->pickForDispatch(
         owner_budget, byte_budget, read_budget, write_budget);
@@ -2460,7 +2547,8 @@ Status TransferEngineImpl::progressRuntimeQueue() {
 
         if (task_status.s == PENDING) continue;
 
-        CHECK_STATUS(finishQueuedOwner(owner_id, task_status.s));
+        CHECK_STATUS(finishQueuedOwner(
+            owner_id, task_status.transferred_bytes, task_status.s));
         if (task_status.s == COMPLETED)
             CHECK_STATUS(maybeFireSubmitHooks(batch));
         released_window = true;
@@ -2752,7 +2840,8 @@ Status TransferEngineImpl::getTransferStatus(BatchID batch_id, size_t task_id,
         auto resolve_status = runtime_queue_->resolveOwner(
             batch->queue_token, public_task_id, owner_id);
         if (resolve_status.ok()) {
-            CHECK_STATUS(finishQueuedOwner(owner_id, task_status.s));
+            CHECK_STATUS(finishQueuedOwner(
+                owner_id, task_status.transferred_bytes, task_status.s));
             CHECK_STATUS(refillDispatchWindow());
         }
     }
@@ -2857,7 +2946,9 @@ Status TransferEngineImpl::getBatchStatus(BatchID batch_id,
             auto resolve_status = runtime_queue_->resolveOwner(
                 batch->queue_token, task_id, owner_id);
             if (resolve_status.ok()) {
-                CHECK_STATUS(finishQueuedOwner(owner_id, task_status.s));
+                CHECK_STATUS(finishQueuedOwner(
+                    owner_id, task_status.transferred_bytes,
+                    task_status.s));
                 CHECK_STATUS(refillDispatchWindow());
             }
         }

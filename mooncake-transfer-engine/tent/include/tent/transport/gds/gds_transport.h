@@ -128,6 +128,9 @@ class GdsTransport : public Transport {
 
     virtual const char* getName() const { return "gds"; }
 
+    Status planRuntimeQueueRequest(const Request& request,
+                                   RuntimeQueuePlan& plan) override;
+
     size_t runtimeQueueDispatchLimit(Request::OpCode opcode) const override;
 
     void updateRuntimeQueueDepth(size_t queued_reads,
@@ -146,6 +149,8 @@ class GdsTransport : public Transport {
 
     Status resolveIoBuffer(const Request& request, void*& io_base,
                            size_t& io_offset, int& device_id);
+
+    size_t ioChunkSizeForDevice(int device_id) const;
 
     struct IoOperation {
         CUfileHandle_t file_handle;

@@ -278,6 +278,45 @@ void testFixedModeReservesOneContendedWriteToken() {
     EXPECT_EQ(writes, 1u);
 }
 
+void testGdsSegmentStopsAtFirstRequestOrByteLimit() {
+    GdsDispatchSegment segment;
+    constexpr size_t kObjectBytes = 2359296;
+    for (size_t index = 0; index < 7; ++index) {
+        EXPECT_TRUE(gdsDispatchSegmentCanAppend(
+            segment, kObjectBytes, 8, 16 * kMiB));
+        gdsDispatchSegmentAppend(segment, kObjectBytes);
+    }
+    EXPECT_EQ(segment.requests, 7u);
+    EXPECT_TRUE(!gdsDispatchSegmentCanAppend(
+        segment, kObjectBytes, 8, 16 * kMiB));
+
+    GdsDispatchSegment request_limited;
+    for (size_t index = 0; index < 8; ++index) {
+        EXPECT_TRUE(gdsDispatchSegmentCanAppend(
+            request_limited, 4096, 8, 16 * kMiB));
+        gdsDispatchSegmentAppend(request_limited, 4096);
+    }
+    EXPECT_TRUE(!gdsDispatchSegmentCanAppend(
+        request_limited, 4096, 8, 16 * kMiB));
+}
+
+void testRetiredOperationReleasesReservationHistory() {
+    GdsOperationScheduler scheduler(weightedConfig());
+    EXPECT_TRUE(
+        scheduler
+            .enqueue(entry(1, 91, GdsDirection::Read, 2 * kMiB))
+            .ok());
+    auto selected = scheduler.select({16, 64 * kMiB, 16});
+    EXPECT_EQ(selected.size(), 1u);
+    EXPECT_TRUE(
+        scheduler.complete(selected.front().id, 2 * kMiB, COMPLETED).ok());
+    EXPECT_TRUE(scheduler.retireOperation(91).ok());
+    EXPECT_TRUE(
+        scheduler
+            .enqueue(entry(1, 91, GdsDirection::Read, 2 * kMiB))
+            .ok());
+}
+
 }  // namespace
 }  // namespace mooncake::tent
 
@@ -292,6 +331,8 @@ int main() {
     testDrainedOperationCanReceiveNextAdmissionSegment();
     testFixedModeUsesWriteSlotWhenReadWindowIsFull();
     testFixedModeReservesOneContendedWriteToken();
+    testGdsSegmentStopsAtFirstRequestOrByteLimit();
+    testRetiredOperationReleasesReservationHistory();
     std::cout << "gds_operation_scheduler_test: PASS" << std::endl;
     return 0;
 }

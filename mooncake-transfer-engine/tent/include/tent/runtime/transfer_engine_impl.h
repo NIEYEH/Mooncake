@@ -249,6 +249,7 @@ class TransferEngineImpl {
     Status markQueuedOwnerSubmitted(QueueOwnerId owner_id);
 
     Status finishQueuedOwner(QueueOwnerId owner_id,
+                             size_t actual_transferred_bytes,
                              TransferStatusEnum terminal_status);
 
     Status retireQueueForBatch(Batch* batch);
@@ -323,6 +324,9 @@ class TransferEngineImpl {
         // share the global owner/byte window above.
         size_t max_dispatch_read_owners{0};
         size_t max_dispatch_write_owners{0};
+        GdsOperationSchedulerConfig gds_scheduler{};
+        size_t gds_segment_max_requests{8};
+        size_t gds_segment_max_bytes{16UL << 20};
         std::chrono::microseconds progress_fallback_interval{50000};
     };
 
@@ -331,6 +335,7 @@ class TransferEngineImpl {
         size_t owner_task_id{0};
         std::vector<size_t> public_task_ids;
         size_t byte_charge{0};
+        QueuePhysicalPlan physical_plan{};
         std::chrono::steady_clock::time_point enqueue_time{};
         TransportType initial_transport{UNSPEC};
         bool in_dispatch_window{false};
@@ -344,6 +349,7 @@ class TransferEngineImpl {
         size_t owner_task_id{0};
         std::vector<size_t> derived_task_ids;
         size_t byte_charge{0};
+        QueuePhysicalPlan physical_plan{};
         std::chrono::steady_clock::time_point enqueue_time{};
         TransportType initial_transport{UNSPEC};
         QueueOwnerKind kind{QueueOwnerKind::User};
@@ -391,8 +397,8 @@ class TransferEngineImpl {
     std::unordered_map<QueueOwnerId, QueuedOwnerState> queued_owners_;
     size_t dispatch_inflight_owners_{0};
     size_t dispatch_inflight_bytes_{0};
-    size_t dispatch_inflight_read_owners_{0};
-    size_t dispatch_inflight_write_owners_{0};
+    size_t dispatch_inflight_read_ios_{0};
+    size_t dispatch_inflight_write_ios_{0};
     // Owners waiting in a large submit but not yet admitted. They are kept
     // outside LocalTransferAdmissionQueue until capacity is released, so the
     // configured outstanding limits remain hard bounds.

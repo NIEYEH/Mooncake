@@ -47,6 +47,11 @@ struct Capabilities {
 
 class Transport {
    public:
+    struct RuntimeQueuePlan {
+        size_t physical_ios{1};
+        size_t physical_bytes{0};
+    };
+
     struct SubBatch {
         SubBatch() : device_mask(~0ULL) {}
         virtual ~SubBatch() {}
@@ -146,6 +151,17 @@ class Transport {
     }
 
     virtual const char *getName() const { return "<generic>"; }
+
+    // Side-effect-free physical work estimate used by runtime admission.
+    // Transports that split a logical request must override this so the
+    // runtime reserves the same number of physical slots that submit will
+    // consume.
+    virtual Status planRuntimeQueueRequest(const Request &request,
+                                           RuntimeQueuePlan &plan) {
+        plan.physical_ios = 1;
+        plan.physical_bytes = request.length;
+        return Status::OK();
+    }
 
     // Optional transport-side cap for the runtime queue's directional
     // dispatch window. Most transports do not need a second concurrency

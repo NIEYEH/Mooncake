@@ -81,6 +81,21 @@ struct GdsDispatchReservation {
     size_t tokens{0};
 };
 
+struct GdsDispatchSegment {
+    size_t requests{0};
+    size_t bytes{0};
+};
+
+// Returns false as soon as either bounded segment limit would be crossed.
+// Both limits are inclusive, so callers append until the first limit wins.
+bool gdsDispatchSegmentCanAppend(const GdsDispatchSegment& segment,
+                                 size_t request_bytes,
+                                 size_t max_requests,
+                                 size_t max_bytes);
+
+void gdsDispatchSegmentAppend(GdsDispatchSegment& segment,
+                              size_t request_bytes);
+
 struct GdsOperationSchedulerSnapshot {
     std::array<size_t, 2> queued_entries{};
     std::array<size_t, 2> reserved_bytes{};
@@ -111,6 +126,8 @@ class GdsOperationScheduler {
                     TransferStatusEnum terminal_status);
 
     Status cancelOperation(uint64_t operation_owner_id);
+
+    Status retireOperation(uint64_t operation_owner_id);
 
     GdsOperationSchedulerSnapshot snapshot() const;
 

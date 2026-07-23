@@ -721,6 +721,34 @@ Status GdsTransport::resolveIoBuffer(const Request& request, void*& io_base,
         "GDS CUDA request is outside a cuFile-registered buffer" LOC_MARK);
 }
 
+size_t GdsTransport::ioChunkSizeForDevice(int device_id) const {
+    return device_id >= 0
+               ? max_io_size_
+               : std::min(max_io_size_, kSafeUnregisteredIoSize);
+}
+
+Status GdsTransport::planRuntimeQueueRequest(
+    const Request& request, RuntimeQueuePlan& plan) {
+    if (request.length == 0) {
+        return Status::InvalidArgument(
+            "GDS request length must be greater than zero" LOC_MARK);
+    }
+    void* io_base = nullptr;
+    size_t io_offset = 0;
+    int device_id = -1;
+    CHECK_STATUS(resolveIoBuffer(request, io_base, io_offset, device_id));
+    (void)io_base;
+    (void)io_offset;
+    const size_t chunk_size = ioChunkSizeForDevice(device_id);
+    if (chunk_size == 0) {
+        return Status::InvalidEntry(
+            "GDS runtime queue planner has a zero IO chunk size" LOC_MARK);
+    }
+    plan.physical_ios = 1 + (request.length - 1) / chunk_size;
+    plan.physical_bytes = request.length;
+    return Status::OK();
+}
+
 bool GdsTransport::subBatchHasWorkLocked(const GdsSubBatch* batch) const {
     if (!batch) return false;
     if (std::any_of(pending_reads_.begin(), pending_reads_.end(),
@@ -1436,9 +1464,7 @@ Status GdsTransport::submitTransferTasks(
         // Registered CUDA buffers can use the driver's full direct-I/O size.
         // The 960 KiB limit applies only to an unregistered/bounce-buffer path.
         const size_t io_chunk_size =
-            request_device_id >= 0
-                ? max_io_size_
-                : std::min(max_io_size_, kSafeUnregisteredIoSize);
+            ioChunkSizeForDevice(request_device_id);
         const size_t request_ios =
             1 + (request.length - 1) / io_chunk_size;
         if (request_ios > std::numeric_limits<size_t>::max() - num_ios) {

@@ -442,6 +442,14 @@ Status LocalTransferAdmissionQueue::retireBatch(uint64_t batch_token) {
         }
     }
 
+    uint64_t read_operation_id = 0;
+    uint64_t write_operation_id = 0;
+    CHECK_STATUS(schedulerOperationId(
+        batch_token, Request::READ, read_operation_id));
+    CHECK_STATUS(schedulerOperationId(
+        batch_token, Request::WRITE, write_operation_id));
+    CHECK_STATUS(gds_scheduler_.retireOperation(read_operation_id));
+    CHECK_STATUS(gds_scheduler_.retireOperation(write_operation_id));
     for (const auto owner_id : owner_ids) {
         owners_.erase(owner_id);
     }

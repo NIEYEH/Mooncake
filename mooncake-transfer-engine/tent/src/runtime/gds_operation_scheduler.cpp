@@ -33,6 +33,25 @@ bool checkedAdd(size_t lhs, size_t rhs, size_t& result) {
 
 }  // namespace
 
+bool gdsDispatchSegmentCanAppend(const GdsDispatchSegment& segment,
+                                 size_t request_bytes,
+                                 size_t max_requests,
+                                 size_t max_bytes) {
+    if (max_requests == 0 || max_bytes == 0 ||
+        segment.requests >= max_requests ||
+        request_bytes > max_bytes ||
+        segment.bytes > max_bytes - request_bytes) {
+        return false;
+    }
+    return true;
+}
+
+void gdsDispatchSegmentAppend(GdsDispatchSegment& segment,
+                              size_t request_bytes) {
+    ++segment.requests;
+    segment.bytes += request_bytes;
+}
+
 GdsOperationScheduler::GdsOperationScheduler(
     GdsOperationSchedulerConfig config)
     : config_(config), config_status_(validateConfig()) {}
@@ -562,6 +581,41 @@ Status GdsOperationScheduler::cancelOperation(
         }
     }
     resetIdleDirection(operation.direction);
+    cleanupOperationOrder();
+    return Status::OK();
+}
+
+Status GdsOperationScheduler::retireOperation(
+    uint64_t operation_owner_id) {
+    if (operation_owner_id == 0) {
+        return Status::InvalidArgument(
+            "invalid GDS operation owner" LOC_MARK);
+    }
+    auto operation_it = operations_.find(operation_owner_id);
+    if (operation_it == operations_.end()) return Status::OK();
+    if (operation_it->second.queued_entries != 0 ||
+        operation_it->second.reserved_tokens != 0 ||
+        operation_it->second.reserved_bytes != 0) {
+        return Status::InvalidEntry(
+            "cannot retire active GDS operation" LOC_MARK);
+    }
+    for (auto reservation_it = reservations_.begin();
+         reservation_it != reservations_.end();) {
+        if (reservation_it->second.value.operation_owner_id !=
+            operation_owner_id) {
+            ++reservation_it;
+            continue;
+        }
+        if (!reservation_it->second.reconciled) {
+            return Status::InvalidEntry(
+                "cannot retire operation with unreconciled reservation"
+                LOC_MARK);
+        }
+        known_owner_ids_.erase(
+            reservation_it->second.value.owner_id);
+        reservation_it = reservations_.erase(reservation_it);
+    }
+    operations_.erase(operation_it);
     cleanupOperationOrder();
     return Status::OK();
 }
