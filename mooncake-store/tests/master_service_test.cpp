@@ -1596,6 +1596,68 @@ TEST_F(MasterServiceTest, GroupedLeaseRefreshNearExpiryProtectsCurrentMembers) {
 }
 
 TEST_F(MasterServiceTest,
+       RepeatedBatchGetLeaseExpiresAfterLastRefresh) {
+    constexpr uint64_t kLeaseTtlMs = 100;
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(kLeaseTtlMs)
+                              .build();
+    auto service = std::make_unique<MasterService>(service_config);
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service);
+    const UUID client_id = generate_uuid();
+    const std::string key = "batch_get_bounded_lease_key";
+    ReplicateConfig config;
+    config.replica_num = 1;
+    PutCompletedObject(*service, client_id, key, config);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(60));
+    auto refreshed =
+        service->BatchGetReplicaList(client_id, {key}, "default");
+    ASSERT_EQ(refreshed.size(), 1u);
+    ASSERT_TRUE(refreshed.front().has_value());
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(60));
+    auto protected_remove = service->Remove(key, "default");
+    ASSERT_FALSE(protected_remove.has_value());
+    EXPECT_EQ(ErrorCode::OBJECT_HAS_LEASE, protected_remove.error());
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(70));
+    EXPECT_TRUE(service->Remove(key, "default").has_value());
+}
+
+TEST_F(MasterServiceTest,
+       BatchGetGroupedLeaseRefreshAmplifiesToCurrentMembersOnly) {
+    constexpr uint64_t kLeaseTtlMs = 100;
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(kLeaseTtlMs)
+                              .build();
+    auto service = std::make_unique<MasterService>(service_config);
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service);
+    const UUID client_id = generate_uuid();
+    const std::string key_a = "batch_get_group_lease_a";
+    const std::string key_b = "batch_get_group_lease_b";
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.group_ids =
+        std::vector<std::string>{FindGroupIdOnDifferentShard(key_a)};
+    PutCompletedObject(*service, client_id, key_a, config);
+    PutCompletedObject(*service, client_id, key_b, config);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(120));
+    auto refreshed =
+        service->BatchGetReplicaList(client_id, {key_a}, "default");
+    ASSERT_EQ(refreshed.size(), 1u);
+    ASSERT_TRUE(refreshed.front().has_value());
+
+    auto amplified_remove = service->Remove(key_b, "default");
+    ASSERT_FALSE(amplified_remove.has_value());
+    EXPECT_EQ(ErrorCode::OBJECT_HAS_LEASE, amplified_remove.error());
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(120));
+    EXPECT_TRUE(service->Remove(key_a, "default").has_value());
+    EXPECT_TRUE(service->Remove(key_b, "default").has_value());
+}
+
+TEST_F(MasterServiceTest,
        GroupedLeaseRefreshAfterMembershipChangeDoesNotWaitForTriggerExpiry) {
     auto service_config =
         MasterServiceConfig::builder().set_default_kv_lease_ttl(500).build();

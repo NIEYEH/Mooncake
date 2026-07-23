@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cmath>
 #include <csignal>
+#include <numeric>
 #include <thread>
 #include <vector>
 
@@ -668,6 +669,8 @@ TEST_F(MasterMetricsTest, BatchRequestTest) {
     ASSERT_EQ(metrics.get_batch_exist_key_failed_items(), 0);
 
     // Test BatchGetReplicaList again (should all succeed now)
+    const int64_t mem_hit_bytes_before_batch_refresh =
+        metrics.get_mem_cache_hit_bytes();
     auto batch_get_replica_result2 =
         service_.BatchGetReplicaList(client_id, keys, "default");
     ASSERT_EQ(batch_get_replica_result2.size(), 3);
@@ -676,6 +679,14 @@ TEST_F(MasterMetricsTest, BatchRequestTest) {
     ASSERT_EQ(metrics.get_batch_get_replica_list_failures(), 1);
     ASSERT_EQ(metrics.get_batch_get_replica_list_items(), 6);
     ASSERT_EQ(metrics.get_batch_get_replica_list_failed_items(), 3);
+    EXPECT_EQ(
+        metrics.get_mem_cache_hit_bytes() -
+            mem_hit_bytes_before_batch_refresh,
+        static_cast<int64_t>(
+            std::accumulate(value_lengths.begin(), value_lengths.end(),
+                            uint64_t{0})))
+        << "BatchGetReplicaList lease refresh also changes cache-hit "
+           "metrics and must be accounted for by any experiment";
 
     // Test BatchPutRevoke request (should all fail)
     auto batch_put_revoke_result = service_.BatchPutRevoke(client_id, keys);
