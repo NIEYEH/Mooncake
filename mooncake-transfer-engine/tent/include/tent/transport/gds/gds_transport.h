@@ -35,6 +35,7 @@
 #include "tent/common/concurrent/thread_pool.h"
 #include "tent/runtime/control_plane.h"
 #include "tent/runtime/transport.h"
+#include "tent/transport/gds/gds_fifo_dispatch.h"
 
 namespace mooncake {
 namespace tent {
@@ -184,8 +185,6 @@ class GdsTransport : public Transport {
     // No cuFile Batch API handle is created by this transport.
     Status dispatchPendingIoLocked();
 
-    Status dispatchDirectIoLocked(bool write, size_t max_to_schedule);
-
     void executeDirectIo(std::shared_ptr<DirectIo> direct_io);
 
     Status pollInflightIoLocked();
@@ -223,6 +222,7 @@ class GdsTransport : public Transport {
     size_t max_io_size_;
     size_t read_worker_threads_;
     size_t write_worker_threads_;
+    size_t max_inflight_ios_;
     size_t max_inflight_reads_;
     size_t max_inflight_writes_;
     size_t submit_retry_count_;
@@ -232,13 +232,13 @@ class GdsTransport : public Transport {
     double adaptive_degradation_ratio_;
     double adaptive_recovery_ratio_;
     size_t adaptive_recovery_windows_;
-    std::chrono::microseconds write_starvation_timeout_;
 
-    // READ and WRITE have independent pools and inflight windows. Work stays
-    // in these transport queues until a real worker slot is available, so an
-    // item is never counted as inflight while waiting inside ThreadPool.
-    std::deque<PendingIo> pending_reads_;
-    std::deque<PendingIo> pending_writes_;
+    // Runtime owns direction/operation scheduling. Transport preserves that
+    // order in one FIFO and only enforces shared-device plus worker-pool
+    // resource limits.
+    std::deque<PendingIo> pending_ios_;
+    size_t pending_read_ios_{0};
+    size_t pending_write_ios_{0};
     size_t pending_read_bytes_{0};
     size_t pending_write_bytes_{0};
     std::unordered_map<uint64_t, std::shared_ptr<DirectIo>>

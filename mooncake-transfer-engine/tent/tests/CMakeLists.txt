@@ -220,3 +220,9 @@ target_include_directories(tent_runtime_queue_dispatch_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME tent_runtime_queue_dispatch_test
          COMMAND tent_runtime_queue_dispatch_test)
+
+add_executable(tent_gds_fifo_dispatch_test gds_fifo_dispatch_test.cpp)
+target_include_directories(tent_gds_fifo_dispatch_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME tent_gds_fifo_dispatch_test
+         COMMAND tent_gds_fifo_dispatch_test)

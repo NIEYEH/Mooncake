@@ -48,7 +48,8 @@ constexpr size_t kSafeUnregisteredIoSize = 960 * 1024;
 constexpr size_t kDefaultReadWorkerThreads = 16;
 constexpr size_t kDefaultWriteWorkerThreads = 4;
 constexpr size_t kDefaultMaxInflightReads = 16;
-constexpr size_t kDefaultMaxInflightWrites = 4;
+constexpr size_t kDefaultMaxInflightWrites = 1;
+constexpr size_t kDefaultSharedDeviceTokens = 16;
 constexpr size_t kMaxDirectIoWorkerThreads = 64;
 constexpr size_t kDefaultSubmitRetryCount = 0;
 constexpr size_t kDefaultAdaptiveSampleWindow = 128;
@@ -60,7 +61,6 @@ constexpr double kDefaultAdaptiveDegradationRatio = 1.25;
 constexpr double kDefaultAdaptiveRecoveryRatio = 1.05;
 constexpr double kAdaptiveLoadedRecoveryRatio = 1.00;
 constexpr size_t kDefaultWriteP99TargetUs = 10000;
-constexpr size_t kDefaultWriteStarvationTimeoutUs = 100000;
 constexpr size_t kSubmitRetryBackoffUs = 50;
 constexpr size_t kIoSummarySampleCapacity = 4096;
 constexpr auto kIoSummaryInterval = std::chrono::seconds(1);
@@ -287,27 +287,23 @@ GdsTransport::GdsTransport()
       max_io_size_(1ull << 20),
       read_worker_threads_(kDefaultReadWorkerThreads),
       write_worker_threads_(kDefaultWriteWorkerThreads),
+      max_inflight_ios_(kDefaultSharedDeviceTokens),
       max_inflight_reads_(kDefaultMaxInflightReads),
       max_inflight_writes_(kDefaultMaxInflightWrites),
       submit_retry_count_(kDefaultSubmitRetryCount),
-      adaptive_concurrency_enabled_(true),
+      adaptive_concurrency_enabled_(false),
       adaptive_sample_window_(kDefaultAdaptiveSampleWindow),
       adaptive_evaluation_interval_(kDefaultAdaptiveEvaluationInterval),
       adaptive_degradation_ratio_(kDefaultAdaptiveDegradationRatio),
       adaptive_recovery_ratio_(kDefaultAdaptiveRecoveryRatio),
-      adaptive_recovery_windows_(kDefaultAdaptiveRecoveryWindows),
-      write_starvation_timeout_(kDefaultWriteStarvationTimeoutUs) {}
+      adaptive_recovery_windows_(kDefaultAdaptiveRecoveryWindows) {}
 
 GdsTransport::~GdsTransport() { uninstall(); }
 
 size_t GdsTransport::runtimeQueueDispatchLimit(Request::OpCode opcode) const {
     std::lock_guard<std::mutex> scheduler_guard(scheduler_lock_);
     if (opcode == Request::READ) return read_adaptive_.current_limit;
-    const bool reads_active =
-        !pending_reads_.empty() || !inflight_direct_reads_.empty() ||
-        runtime_queued_reads_.load(std::memory_order_relaxed) > 0;
-    return gdsEffectiveWriteLimit(write_adaptive_.current_limit,
-                                  reads_active);
+    return write_adaptive_.current_limit;
 }
 
 void GdsTransport::updateRuntimeQueueDepth(size_t queued_reads,
@@ -352,8 +348,12 @@ Status GdsTransport::install(std::string& local_segment_name,
     const int configured_inflight_writes = conf_->get(
         "transports/gds/max_inflight_writes",
         static_cast<int>(kDefaultMaxInflightWrites));
+    const int configured_shared_device_tokens = conf_->get(
+        "transports/gds/shared_device_tokens",
+        static_cast<int>(kDefaultSharedDeviceTokens));
     if (configured_read_threads <= 0 || configured_write_threads <= 0 ||
-        configured_inflight_reads <= 0 || configured_inflight_writes <= 0) {
+        configured_inflight_reads <= 0 || configured_inflight_writes <= 0 ||
+        configured_shared_device_tokens <= 0) {
         return Status::InvalidArgument(
             "GDS direct IO worker limits must be greater than zero" LOC_MARK);
     }
@@ -368,6 +368,9 @@ Status GdsTransport::install(std::string& local_segment_name,
     max_inflight_writes_ =
         std::min(static_cast<size_t>(configured_inflight_writes),
                  write_worker_threads_);
+    max_inflight_ios_ = std::min(
+        static_cast<size_t>(configured_shared_device_tokens),
+        max_inflight_reads_ + max_inflight_writes_);
     if (static_cast<size_t>(configured_inflight_reads) >
         max_inflight_reads_) {
         LOG(WARNING) << "GDS max_inflight_reads=" << configured_inflight_reads
@@ -408,11 +411,8 @@ Status GdsTransport::install(std::string& local_segment_name,
     const int configured_write_p99_target_us = conf_->get(
         "transports/gds/adaptive_write_p99_target_us",
         static_cast<int>(kDefaultWriteP99TargetUs));
-    const int configured_write_starvation_us = conf_->get(
-        "transports/gds/write_starvation_timeout_us",
-        static_cast<int>(kDefaultWriteStarvationTimeoutUs));
     adaptive_concurrency_enabled_ =
-        conf_->get("transports/gds/adaptive_concurrency", true);
+        conf_->get("transports/gds/adaptive_concurrency", false);
     adaptive_degradation_ratio_ = conf_->get(
         "transports/gds/adaptive_p99_degradation_ratio",
         kDefaultAdaptiveDegradationRatio);
@@ -427,7 +427,6 @@ Status GdsTransport::install(std::string& local_segment_name,
         configured_min_write_inflight <= 0 ||
         configured_read_p99_target_us < 0 ||
         configured_write_p99_target_us < 0 ||
-        configured_write_starvation_us <= 0 ||
         adaptive_degradation_ratio_ <= 1.0 ||
         adaptive_recovery_ratio_ < 1.0 ||
         adaptive_recovery_ratio_ >= adaptive_degradation_ratio_) {
@@ -441,8 +440,6 @@ Status GdsTransport::install(std::string& local_segment_name,
         static_cast<size_t>(configured_evaluation_interval);
     adaptive_recovery_windows_ =
         static_cast<size_t>(configured_recovery_windows);
-    write_starvation_timeout_ =
-        std::chrono::microseconds(configured_write_starvation_us);
     // install() may follow uninstall() on the same object. Discard every
     // rolling sample and recovery counter from the previous driver session.
     read_adaptive_ = GdsAdaptiveState{};
@@ -461,8 +458,9 @@ Status GdsTransport::install(std::string& local_segment_name,
                  max_inflight_writes_);
     write_adaptive_.target_p99_us = configured_write_p99_target_us;
     write_adaptive_.baseline_p99_us = configured_write_p99_target_us;
-    pending_reads_.clear();
-    pending_writes_.clear();
+    pending_ios_.clear();
+    pending_read_ios_ = 0;
+    pending_write_ios_ = 0;
     pending_read_bytes_ = 0;
     pending_write_bytes_ = 0;
     inflight_direct_reads_.clear();
@@ -508,6 +506,7 @@ Status GdsTransport::install(std::string& local_segment_name,
               << ", write_worker_threads=" << write_worker_threads_
               << ", max_inflight_reads=" << max_inflight_reads_
               << ", max_inflight_writes=" << max_inflight_writes_
+              << ", shared_device_tokens=" << max_inflight_ios_
               << ", submit_retry_count=" << submit_retry_count_
               << ", adaptive_concurrency="
               << adaptive_concurrency_enabled_
@@ -525,9 +524,7 @@ Status GdsTransport::install(std::string& local_segment_name,
               << ", adaptive_read_p99_target_us="
               << read_adaptive_.baseline_p99_us
               << ", adaptive_write_p99_target_us="
-              << write_adaptive_.baseline_p99_us
-              << ", write_starvation_timeout_us="
-              << write_starvation_timeout_.count();
+              << write_adaptive_.baseline_p99_us;
     shutting_down_.store(false, std::memory_order_release);
     read_thread_pool_ = std::make_unique<ThreadPool>(read_worker_threads_);
     write_thread_pool_ = std::make_unique<ThreadPool>(write_worker_threads_);
@@ -556,8 +553,9 @@ Status GdsTransport::uninstall() {
         write_pool_to_stop.reset();
         {
             std::lock_guard<std::mutex> scheduler_guard(scheduler_lock_);
-            pending_reads_.clear();
-            pending_writes_.clear();
+            pending_ios_.clear();
+            pending_read_ios_ = 0;
+            pending_write_ios_ = 0;
             pending_read_bytes_ = 0;
             pending_write_bytes_ = 0;
             inflight_direct_reads_.clear();
@@ -751,13 +749,7 @@ Status GdsTransport::planRuntimeQueueRequest(
 
 bool GdsTransport::subBatchHasWorkLocked(const GdsSubBatch* batch) const {
     if (!batch) return false;
-    if (std::any_of(pending_reads_.begin(), pending_reads_.end(),
-                    [batch](const PendingIo& pending) {
-                        return pending.owner == batch;
-                    })) {
-        return true;
-    }
-    if (std::any_of(pending_writes_.begin(), pending_writes_.end(),
+    if (std::any_of(pending_ios_.begin(), pending_ios_.end(),
                     [batch](const PendingIo& pending) {
                         return pending.owner == batch;
                     })) {
@@ -780,87 +772,6 @@ bool GdsTransport::subBatchHasWorkLocked(const GdsSubBatch* batch) const {
         return true;
     }
     return false;
-}
-
-Status GdsTransport::dispatchDirectIoLocked(bool write,
-                                            size_t max_to_schedule) {
-    ThreadPool* const thread_pool =
-        write ? write_thread_pool_.get() : read_thread_pool_.get();
-    auto& inflight_ios =
-        write ? inflight_direct_writes_ : inflight_direct_reads_;
-    auto& pending_ios = write ? pending_writes_ : pending_reads_;
-    auto& pending_bytes = write ? pending_write_bytes_ : pending_read_bytes_;
-    const auto& adaptive = write ? write_adaptive_ : read_adaptive_;
-    const size_t worker_threads =
-        write ? write_worker_threads_ : read_worker_threads_;
-    const char* const operation_name = write ? "cuFileWrite" : "cuFileRead";
-
-    if (!thread_pool) {
-        return Status::InvalidEntry(
-            "GDS parallel IO workers are not available" LOC_MARK);
-    }
-    if (shutting_down_.load(std::memory_order_acquire)) {
-        return Status::InvalidEntry("GDS transport is shutting down" LOC_MARK);
-    }
-
-    const size_t available_slots = gdsAvailableWorkerSlots(
-        adaptive.current_limit, inflight_ios.size());
-    if (available_slots == 0) {
-        markSaturatedIoLocked();
-        return Status::OK();
-    }
-    const size_t schedule_count =
-        std::min({available_slots, max_to_schedule, pending_ios.size()});
-    if (schedule_count == 0) return Status::OK();
-
-    std::vector<std::shared_ptr<DirectIo>> scheduled;
-    scheduled.reserve(schedule_count);
-    size_t scheduled_bytes = 0;
-    while (scheduled.size() < schedule_count) {
-        auto pending = std::move(pending_ios.front());
-        pending_ios.pop_front();
-        auto direct_io = std::make_shared<DirectIo>(DirectIo{
-            next_direct_io_id_++, pending.owner, pending.param_index,
-            pending.device_id, pending.operation, pending.enqueued_at});
-        scheduled_bytes += pending.operation.size;
-        assert(pending_bytes >= pending.operation.size);
-        pending_bytes -= pending.operation.size;
-        inflight_ios.emplace(direct_io->id, direct_io);
-        scheduled.emplace_back(std::move(direct_io));
-    }
-    size_t enqueue_failures = 0;
-    for (const auto& direct_io : scheduled) {
-        try {
-            (void)thread_pool->enqueue(
-                [this, direct_io] { executeDirectIo(direct_io); });
-        } catch (const std::exception& error) {
-            ++enqueue_failures;
-            inflight_ios.erase(direct_io->id);
-            if (direct_io->owner &&
-                direct_io->param_index <
-                    direct_io->owner->io_statuses.size()) {
-                direct_io->owner->io_statuses[direct_io->param_index] = FAILED;
-                direct_io->owner->notifyProgress();
-            }
-            LOG(ERROR) << "Failed to enqueue parallel GDS "
-                       << operation_name << ": " << error.what();
-        }
-    }
-    markSaturatedIoLocked();
-
-    if (!scheduled.empty()) {
-        LOG_EVERY_N(INFO, 64)
-            << "GDS parallel " << operation_name
-            << " dispatch: scheduled_ios="
-            << scheduled.size() - enqueue_failures
-            << ", scheduled_bytes=" << scheduled_bytes
-            << ", inflight_ios=" << inflight_ios.size()
-            << ", worker_threads=" << worker_threads
-            << ", effective_inflight_limit=" << adaptive.current_limit
-            << ", queued_ios_after_dispatch=" << pending_ios.size();
-    }
-    updateIoMetricsLocked();
-    return Status::OK();
 }
 
 void GdsTransport::executeDirectIo(std::shared_ptr<DirectIo> direct_io) {
@@ -1007,81 +918,110 @@ Status GdsTransport::dispatchPendingIoLocked() {
         return Status::OK();
     }
 
-    // Fill the READ window first. Each dequeued entry is submitted separately;
-    // dispatchDirectIoLocked never places more work in ThreadPool than there
-    // are effective worker slots.
-    CHECK_STATUS(dispatchDirectIoLocked(
-        false, std::numeric_limits<size_t>::max()));
+    size_t scheduled_reads = 0;
+    size_t scheduled_writes = 0;
+    size_t scheduled_bytes = 0;
+    size_t enqueue_failures = 0;
+    while (!pending_ios_.empty()) {
+        const bool write = pending_ios_.front().operation.write;
+        GdsFifoDispatchState state{
+            max_inflight_ios_,
+            read_adaptive_.current_limit,
+            write_adaptive_.current_limit,
+            inflight_direct_reads_.size(),
+            inflight_direct_writes_.size()};
+        if (gdsFifoFrontBlocksQueue(state, write)) break;
 
-    const auto now = std::chrono::steady_clock::now();
-    const bool reads_waiting = !pending_reads_.empty();
-    const bool reads_active =
-        reads_waiting || !inflight_direct_reads_.empty();
-    const bool oldest_write_starved =
-        reads_active && !pending_writes_.empty() &&
-        now - pending_writes_.front().enqueued_at >=
-            write_starvation_timeout_;
+        ThreadPool* const thread_pool =
+            write ? write_thread_pool_.get() : read_thread_pool_.get();
+        if (!thread_pool) {
+            return Status::InvalidEntry(
+                "GDS parallel IO workers are not available" LOC_MARK);
+        }
+        auto pending = std::move(pending_ios_.front());
+        pending_ios_.pop_front();
+        auto& pending_count =
+            write ? pending_write_ios_ : pending_read_ios_;
+        auto& pending_bytes =
+            write ? pending_write_bytes_ : pending_read_bytes_;
+        assert(pending_count > 0);
+        assert(pending_bytes >= pending.operation.size);
+        --pending_count;
+        pending_bytes -= pending.operation.size;
 
-    if (!reads_active) {
-        CHECK_STATUS(dispatchDirectIoLocked(
-            true, std::numeric_limits<size_t>::max()));
-    } else if (oldest_write_starved && inflight_direct_writes_.empty()) {
-        // READ remains strict first choice, but one old WRITE may pass after
-        // the starvation timeout so a continuous restore workload cannot
-        // permanently prevent cache persistence.
-        CHECK_STATUS(dispatchDirectIoLocked(true, 1));
+        auto direct_io = std::make_shared<DirectIo>(DirectIo{
+            next_direct_io_id_++, pending.owner, pending.param_index,
+            pending.device_id, pending.operation, pending.enqueued_at});
+        auto& inflight_ios =
+            write ? inflight_direct_writes_ : inflight_direct_reads_;
+        inflight_ios.emplace(direct_io->id, direct_io);
+        scheduled_bytes += pending.operation.size;
+        if (write) {
+            ++scheduled_writes;
+        } else {
+            ++scheduled_reads;
+        }
+        try {
+            (void)thread_pool->enqueue(
+                [this, direct_io] { executeDirectIo(direct_io); });
+        } catch (const std::exception& error) {
+            ++enqueue_failures;
+            inflight_ios.erase(direct_io->id);
+            if (direct_io->owner &&
+                direct_io->param_index <
+                    direct_io->owner->io_statuses.size()) {
+                direct_io->owner->io_statuses[direct_io->param_index] =
+                    FAILED;
+                direct_io->owner->notifyProgress();
+            }
+            LOG(ERROR) << "Failed to enqueue parallel GDS "
+                       << (write ? "cuFileWrite" : "cuFileRead")
+                       << ": " << error.what();
+        }
     }
 
-    const bool read_window_blocked =
-        !pending_reads_.empty() &&
-        inflight_direct_reads_.size() >= read_adaptive_.current_limit;
-    const bool write_window_blocked =
-        !pending_writes_.empty() &&
-        (inflight_direct_writes_.size() >=
-             write_adaptive_.current_limit ||
-         reads_active);
-
-    if (read_window_blocked && !read_window_blocked_) {
+    const bool front_write =
+        !pending_ios_.empty() && pending_ios_.front().operation.write;
+    const bool fifo_blocked = !pending_ios_.empty();
+    if (fifo_blocked &&
+        ((front_write && !write_window_blocked_) ||
+         (!front_write && !read_window_blocked_))) {
         TentMetrics::instance().recordGdsDispatchWindowFull(
-            pending_reads_.size(),
+            pending_ios_.size(),
             inflight_direct_reads_.size() +
                 inflight_direct_writes_.size());
         LOG_EVERY_N(INFO, 256)
-            << "GDS READ dispatch window full: queued_ios="
-            << pending_reads_.size()
+            << "GDS FIFO dispatch window full: front="
+            << (front_write ? "WRITE" : "READ")
+            << ", queued_ios=" << pending_ios_.size()
             << ", inflight_reads=" << inflight_direct_reads_.size()
-            << ", effective_limit=" << read_adaptive_.current_limit;
-    }
-    if (write_window_blocked && !write_window_blocked_) {
-        TentMetrics::instance().recordGdsDispatchWindowFull(
-            pending_writes_.size(),
-            inflight_direct_reads_.size() +
-                inflight_direct_writes_.size());
-        LOG_EVERY_N(INFO, 256)
-            << "GDS WRITE dispatch delayed: queued_ios="
-            << pending_writes_.size()
             << ", inflight_writes=" << inflight_direct_writes_.size()
-            << ", effective_limit=" << write_adaptive_.current_limit
-            << ", reads_active=" << reads_active;
+            << ", shared_inflight_limit=" << max_inflight_ios_
+            << ", read_pool_limit=" << read_adaptive_.current_limit
+            << ", write_pool_limit=" << write_adaptive_.current_limit;
     }
-    read_window_blocked_ = read_window_blocked;
-    write_window_blocked_ = write_window_blocked;
+    read_window_blocked_ = fifo_blocked && !front_write;
+    write_window_blocked_ = fifo_blocked && front_write;
+    markSaturatedIoLocked();
+    if (scheduled_reads + scheduled_writes != 0) {
+        LOG_EVERY_N(INFO, 64)
+            << "GDS FIFO single-IO dispatch: scheduled_reads="
+            << scheduled_reads
+            << ", scheduled_writes=" << scheduled_writes
+            << ", enqueue_failures=" << enqueue_failures
+            << ", scheduled_bytes=" << scheduled_bytes
+            << ", inflight_reads=" << inflight_direct_reads_.size()
+            << ", inflight_writes=" << inflight_direct_writes_.size()
+            << ", queued_ios_after_dispatch=" << pending_ios_.size();
+    }
     updateIoMetricsLocked();
     return Status::OK();
 }
 
 void GdsTransport::markSaturatedIoLocked() {
-    const bool reads_active =
-        !pending_reads_.empty() || !inflight_direct_reads_.empty() ||
-        runtime_queued_reads_.load(std::memory_order_relaxed) > 0;
-    const size_t effective_write_limit = gdsEffectiveWriteLimit(
-        write_adaptive_.current_limit, reads_active);
-
-    if (effective_write_limit > 0 &&
-        inflight_direct_writes_.size() >= effective_write_limit) {
-        // Under READ pressure the scheduler deliberately exposes only one
-        // WRITE slot. Treat that real dispatch ceiling as saturation so slow
-        // mixed WRITE samples can reduce the adaptive limit from 4/2 to 1.
+    if (write_adaptive_.current_limit > 0 &&
+        inflight_direct_writes_.size() >=
+            write_adaptive_.current_limit) {
         for (auto& entry : inflight_direct_writes_) {
             if (entry.second) entry.second->dispatched_at_capacity = true;
         }
@@ -1092,10 +1032,10 @@ void GdsTransport::markSaturatedIoLocked() {
             inflight_direct_reads_.size(),
             inflight_direct_writes_.size(),
             write_adaptive_.current_limit <=
-                write_adaptive_.minimum_limit)) {
-        // Mark every READ sharing the full device window. WRITE pressure is
-        // counted only after WRITE reached its floor, preserving READ-first
-        // adaptation.
+                write_adaptive_.minimum_limit) ||
+        inflight_direct_reads_.size() +
+                inflight_direct_writes_.size() >=
+            max_inflight_ios_) {
         for (auto& entry : inflight_direct_reads_) {
             if (entry.second) entry.second->dispatched_at_capacity = true;
         }
@@ -1166,7 +1106,7 @@ void GdsTransport::maybeLogIoSummaryLocked(
         << ", peak_active_workers="
         << read_io_summary_.peak_active_workers
         << ", inflight=" << inflight_direct_reads_.size()
-        << ", internal_queued=" << pending_reads_.size()
+        << ", internal_queued=" << pending_read_ios_
         << ", runtime_queued_owners="
         << runtime_queued_reads_.load(std::memory_order_relaxed)
         << ", effective_limit=" << read_adaptive_.current_limit
@@ -1186,17 +1126,13 @@ void GdsTransport::maybeLogIoSummaryLocked(
         << ", peak_active_workers="
         << write_io_summary_.peak_active_workers
         << ", inflight=" << inflight_direct_writes_.size()
-        << ", internal_queued=" << pending_writes_.size()
+        << ", internal_queued=" << pending_write_ios_
         << ", runtime_queued_owners="
         << runtime_queued_writes_.load(std::memory_order_relaxed)
         << ", effective_limit=" << write_adaptive_.current_limit
         << ", runtime_dispatch_limit="
-        << gdsEffectiveWriteLimit(
-               write_adaptive_.current_limit,
-               !pending_reads_.empty() ||
-                   !inflight_direct_reads_.empty() ||
-                   runtime_queued_reads_.load(
-                       std::memory_order_relaxed) > 0)
+        << write_adaptive_.current_limit
+        << ", shared_device_tokens=" << max_inflight_ios_
         << "}}";
 
     auto reset_summary = [](IoSummaryDirection& summary,
@@ -1217,8 +1153,8 @@ void GdsTransport::maybeLogIoSummaryLocked(
 
 void GdsTransport::updateIoMetricsLocked() const {
     TentMetrics::instance().updateGdsIoState(
-        pending_reads_.size(), pending_read_bytes_,
-        pending_writes_.size(), pending_write_bytes_,
+        pending_read_ios_, pending_read_bytes_,
+        pending_write_ios_, pending_write_bytes_,
         active_read_workers_, active_write_workers_,
         read_adaptive_.current_limit, write_adaptive_.current_limit);
 }
@@ -1250,14 +1186,16 @@ void GdsTransport::evaluateAdaptiveConcurrencyLocked(bool write) {
     const double p99_us = gdsNearestRankP99(std::vector<double>(
         state.recent_io_latency_us.begin(),
         state.recent_io_latency_us.end()));
-    const auto& pending = write ? pending_writes_ : pending_reads_;
+    const size_t pending_count =
+        write ? pending_write_ios_ : pending_read_ios_;
     const size_t runtime_queued =
         write ? runtime_queued_writes_.load(std::memory_order_relaxed)
               : runtime_queued_reads_.load(std::memory_order_relaxed);
     const size_t queued_ios =
-        pending.size() > std::numeric_limits<size_t>::max() - runtime_queued
+        pending_count >
+                std::numeric_limits<size_t>::max() - runtime_queued
             ? std::numeric_limits<size_t>::max()
-            : pending.size() + runtime_queued;
+            : pending_count + runtime_queued;
     TentMetrics::instance().observeGdsAdaptiveWindow(
         !write, p99_us / 1e6, queued_ios);
     const size_t old_limit = state.current_limit;
@@ -1287,7 +1225,7 @@ void GdsTransport::evaluateAdaptiveConcurrencyLocked(bool write) {
                 << ", target_p99_us=" << state.target_p99_us
                 << ", reached_effective_limit="
                 << reached_effective_limit
-                << ", internal_queued_ios=" << pending.size()
+                << ", internal_queued_ios=" << pending_count
                 << ", runtime_queued_owners=" << runtime_queued;
             last_warning = now;
         }
@@ -1306,7 +1244,7 @@ void GdsTransport::evaluateAdaptiveConcurrencyLocked(bool write) {
                      << ", target_p99_us=" << state.target_p99_us
                      << ", reached_effective_limit="
                      << reached_effective_limit
-                     << ", internal_queued_ios=" << pending.size()
+                     << ", internal_queued_ios=" << pending_count
                      << ", runtime_queued_owners=" << runtime_queued;
     } else {
         LOG(INFO) << "GDS adaptive concurrency cautiously recovered "
@@ -1317,7 +1255,7 @@ void GdsTransport::evaluateAdaptiveConcurrencyLocked(bool write) {
                   << ", target_p99_us=" << state.target_p99_us
                   << ", reached_effective_limit="
                   << reached_effective_limit
-                  << ", internal_queued_ios=" << pending.size()
+                  << ", internal_queued_ios=" << pending_count
                   << ", runtime_queued_owners=" << runtime_queued;
     }
     updateIoMetricsLocked();
@@ -1512,12 +1450,13 @@ Status GdsTransport::submitTransferTasks(
             PendingIo pending{gds_batch, param_index,
                               device_ids[request_index], operation,
                               enqueued_at};
+            pending_ios_.push_back(std::move(pending));
             if (write) {
-                pending_writes_.push_back(std::move(pending));
+                ++pending_write_ios_;
                 pending_write_bytes_ += length;
                 ++write_io_count;
             } else {
-                pending_reads_.push_back(std::move(pending));
+                ++pending_read_ios_;
                 pending_read_bytes_ += length;
                 ++read_io_count;
             }
@@ -1536,8 +1475,8 @@ Status GdsTransport::submitTransferTasks(
         << request_list.size() << ", physical_ios=" << num_ios
         << ", read_ios=" << read_io_count
         << ", write_ios=" << write_io_count
-        << ", queued_reads=" << pending_reads_.size()
-        << ", queued_writes=" << pending_writes_.size()
+        << ", queued_reads=" << pending_read_ios_
+        << ", queued_writes=" << pending_write_ios_
         << ", read_effective_inflight=" << read_adaptive_.current_limit
         << ", write_effective_inflight=" << write_adaptive_.current_limit;
 

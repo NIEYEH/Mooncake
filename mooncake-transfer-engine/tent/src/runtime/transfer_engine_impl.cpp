@@ -2355,8 +2355,8 @@ Status TransferEngineImpl::dispatchQueuedOwners(
             }
         }
 
-        auto group_it = std::find_if(
-            groups.begin(), groups.end(), [&](const DispatchGroup& group) {
+        const auto compatible_group =
+            [&](const DispatchGroup& group) {
                 if (group.batch != batch || group.type != task.type ||
                     group.device_mask != task.device_mask) {
                     return false;
@@ -2371,7 +2371,21 @@ Status TransferEngineImpl::dispatchQueuedOwners(
                     task.request.length,
                     runtime_queue_config_.gds_segment_max_requests,
                     runtime_queue_config_.gds_segment_max_bytes);
-            });
+            };
+        auto group_it = groups.end();
+        if (task.type == GDS) {
+            // Preserve the scheduler's selected order. Reopening an older
+            // direction group would silently reorder READ/WRITE turns before
+            // they reach the transport FIFO.
+            if (!groups.empty() &&
+                compatible_group(groups.back())) {
+                group_it = std::prev(groups.end());
+            }
+        } else {
+            group_it =
+                std::find_if(groups.begin(), groups.end(),
+                             compatible_group);
+        }
         if (group_it == groups.end()) {
             groups.push_back(
                 DispatchGroup{batch, task.type, task.device_mask, {}, {}, 0});
@@ -2483,10 +2497,8 @@ Status TransferEngineImpl::refillDispatchWindow() {
         runtime_queue_config_.max_dispatch_read_owners;
     size_t write_io_limit =
         runtime_queue_config_.max_dispatch_write_owners;
-    // GDS owns a second, latency-driven concurrency controller. Clamp the
-    // runtime-side owner window to its live limit so a P99-triggered
-    // reduction drains all the way back to the runtime queue instead of
-    // merely moving excess owners into GDS's internal pending deques.
+    // GDS publishes only its current worker-pool resource caps. Direction and
+    // operation selection remain exclusively in the runtime scheduler.
     const auto& gds_transport = transport_list_[GDS];
     if (gds_transport) {
         read_io_limit = std::min(
