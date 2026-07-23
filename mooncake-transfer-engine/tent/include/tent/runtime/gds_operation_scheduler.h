@@ -19,6 +19,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <limits>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -59,12 +60,16 @@ struct GdsDispatchEntry {
     GdsDirection direction{GdsDirection::Read};
     size_t physical_bytes{0};
     size_t physical_tokens{0};
+    uint64_t enqueue_sequence{0};
 };
 
 struct GdsDispatchBudget {
     size_t max_tokens{0};
     size_t max_bytes{0};
     size_t max_entries{0};
+    size_t max_read_tokens{std::numeric_limits<size_t>::max()};
+    size_t max_write_tokens{std::numeric_limits<size_t>::max()};
+    uint64_t max_enqueue_sequence{std::numeric_limits<uint64_t>::max()};
 };
 
 struct GdsDispatchReservation {
@@ -94,6 +99,8 @@ struct GdsOperationSchedulerSnapshot {
 class GdsOperationScheduler {
    public:
     explicit GdsOperationScheduler(GdsOperationSchedulerConfig config);
+
+    Status status() const { return config_status_; }
 
     Status enqueue(const GdsDispatchEntry& entry);
 

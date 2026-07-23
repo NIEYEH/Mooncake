@@ -24,6 +24,7 @@
 
 #include "tent/common/status.h"
 #include "tent/common/types.h"
+#include "tent/runtime/gds_operation_scheduler.h"
 
 namespace mooncake {
 namespace tent {
@@ -49,6 +50,11 @@ struct QueueCapacity {
     size_t bytes{0};
 };
 
+struct QueuePhysicalPlan {
+    size_t physical_ios{1};
+    size_t physical_bytes{0};
+};
+
 struct QueueOwnerInput {
     // Absolute task id within the caller's Batch, not relative to this submit.
     size_t owner_task_id{0};
@@ -58,6 +64,7 @@ struct QueueOwnerInput {
     // scoped to GDS so unrelated transports retain FIFO behavior.
     TransportType transport{UNSPEC};
     QueueOwnerKind kind{QueueOwnerKind::User};
+    QueuePhysicalPlan physical_plan{};
 };
 
 struct QueueSubmit {
@@ -71,7 +78,9 @@ struct QueueSubmit {
 // eventual TransferEngineImpl integration owns synchronization.
 class LocalTransferAdmissionQueue {
    public:
-    explicit LocalTransferAdmissionQueue(QueueLimits limits);
+    explicit LocalTransferAdmissionQueue(
+        QueueLimits limits,
+        GdsOperationSchedulerConfig gds_scheduler_config = {});
 
     LocalTransferAdmissionQueue(const LocalTransferAdmissionQueue&) = delete;
     LocalTransferAdmissionQueue& operator=(const LocalTransferAdmissionQueue&) =
@@ -93,6 +102,9 @@ class LocalTransferAdmissionQueue {
 
     Status complete(QueueOwnerId owner_id, TransferStatusEnum terminal_status);
 
+    Status complete(QueueOwnerId owner_id, size_t actual_transferred_bytes,
+                    TransferStatusEnum terminal_status);
+
     Status retireBatch(uint64_t batch_token);
 
     Status resolveOwner(uint64_t batch_token, size_t public_task_id,
@@ -110,6 +122,8 @@ class LocalTransferAdmissionQueue {
     // the bounded queue instead of rejecting the entire public batch.
     QueueCapacity availableCapacity(QueueOwnerKind kind) const;
 
+    GdsOperationSchedulerSnapshot gdsSchedulerSnapshot() const;
+
    private:
     enum class QueueState {
         Queued,
@@ -122,6 +136,8 @@ class LocalTransferAdmissionQueue {
         Request request{};
         TransportType transport{UNSPEC};
         QueueOwnerKind kind{QueueOwnerKind::User};
+        QueuePhysicalPlan physical_plan{};
+        uint64_t gds_reservation_id{0};
         QueueState state{QueueState::Queued};
         TransferStatusEnum terminal_status{TransferStatusEnum::PENDING};
     };
@@ -136,9 +152,7 @@ class LocalTransferAdmissionQueue {
     size_t outstanding_bytes_{0};
     size_t outstanding_user_owners_{0};
     size_t outstanding_user_bytes_{0};
-    // Bound READ preference so sustained restores cannot starve WRITE-back.
-    static constexpr size_t kMaxConsecutiveReadDispatches = 16;
-    size_t consecutive_read_dispatches_{0};
+    GdsOperationScheduler gds_scheduler_;
 };
 
 }  // namespace tent

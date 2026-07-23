@@ -46,6 +46,22 @@ bool isSupportedOpcode(Request::OpCode opcode) {
     return opcode == Request::READ || opcode == Request::WRITE;
 }
 
+GdsDirection toGdsDirection(Request::OpCode opcode) {
+    return opcode == Request::READ ? GdsDirection::Read
+                                   : GdsDirection::Write;
+}
+
+Status schedulerOperationId(uint64_t batch_token, Request::OpCode opcode,
+                            uint64_t& operation_id) {
+    if (batch_token > (std::numeric_limits<uint64_t>::max() >> 1)) {
+        return Status::InvalidArgument(
+            "batch token is too large for GDS direction key" LOC_MARK);
+    }
+    operation_id = (batch_token << 1) |
+                   (opcode == Request::WRITE ? uint64_t{1} : uint64_t{0});
+    return Status::OK();
+}
+
 Status checkedAdd(size_t lhs, size_t rhs, size_t& out) {
     if (rhs > std::numeric_limits<size_t>::max() - lhs) {
         return Status::InvalidArgument(
@@ -69,13 +85,17 @@ Status validateLimits(const QueueLimits& limits) {
 
 }  // namespace
 
-LocalTransferAdmissionQueue::LocalTransferAdmissionQueue(QueueLimits limits)
-    : limits_(limits), limits_status_(validateLimits(limits)) {}
+LocalTransferAdmissionQueue::LocalTransferAdmissionQueue(
+    QueueLimits limits, GdsOperationSchedulerConfig gds_scheduler_config)
+    : limits_(limits),
+      limits_status_(validateLimits(limits)),
+      gds_scheduler_(gds_scheduler_config) {}
 
 Status LocalTransferAdmissionQueue::tryAdmit(
     const QueueSubmit& submit, std::vector<QueueOwnerId>& admitted_owner_ids) {
     admitted_owner_ids.clear();
     CHECK_STATUS(limits_status_);
+    CHECK_STATUS(gds_scheduler_.status());
     if (submit.batch_token == 0) {
         return Status::InvalidArgument("invalid batch token" LOC_MARK);
     }
@@ -101,6 +121,18 @@ Status LocalTransferAdmissionQueue::tryAdmit(
         }
         if (owner.request.length == 0) {
             return Status::InvalidArgument("empty transfer request" LOC_MARK);
+        }
+        if (owner.transport == GDS &&
+            (owner.physical_plan.physical_ios == 0 ||
+             (owner.physical_plan.physical_bytes != 0 &&
+              owner.physical_plan.physical_bytes != owner.request.length))) {
+            return Status::InvalidArgument(
+                "invalid GDS physical plan" LOC_MARK);
+        }
+        if (owner.transport == GDS) {
+            uint64_t operation_id = 0;
+            CHECK_STATUS(schedulerOperationId(
+                submit.batch_token, owner.request.opcode, operation_id));
         }
 
         const PublicTaskKey owner_key{submit.batch_token, owner.owner_task_id};
@@ -182,7 +214,22 @@ Status LocalTransferAdmissionQueue::tryAdmit(
         owner.request = owner_input.request;
         owner.transport = owner_input.transport;
         owner.kind = owner_input.kind;
+        owner.physical_plan = owner_input.physical_plan;
+        if (owner.physical_plan.physical_bytes == 0) {
+            owner.physical_plan.physical_bytes = owner.request.length;
+        }
         owners_.emplace(owner_id, owner);
+
+        if (owner.transport == GDS) {
+            uint64_t operation_id = 0;
+            CHECK_STATUS(schedulerOperationId(
+                submit.batch_token, owner.request.opcode, operation_id));
+            CHECK_STATUS(gds_scheduler_.enqueue(GdsDispatchEntry{
+                owner_id, operation_id,
+                toGdsDirection(owner.request.opcode),
+                owner.physical_plan.physical_bytes,
+                owner.physical_plan.physical_ios, owner_id}));
+        }
 
         public_to_owner_[{submit.batch_token, owner_input.owner_task_id}] =
             owner_id;
@@ -229,76 +276,99 @@ std::vector<QueueOwnerId> LocalTransferAdmissionQueue::pickForDispatch(
             }
         }
         if (fifo_.empty()) {
-            consecutive_read_dispatches_ = 0;
             break;
         }
 
-        const auto find_gds_opcode = [&](Request::OpCode opcode) {
-            return std::find_if(
-                fifo_.begin(), fifo_.end(), [&](QueueOwnerId owner_id) {
-                    const auto& owner = owners_.at(owner_id);
-                    return owner.transport == GDS &&
-                           owner.request.opcode == opcode;
-                });
-        };
         const auto non_gds_it =
             std::find_if(fifo_.begin(), fifo_.end(), [&](QueueOwnerId owner_id) {
                 return owners_.at(owner_id).transport != GDS;
             });
-        auto read_it = used_gds_reads < max_gds_reads
-                           ? find_gds_opcode(Request::READ)
-                           : fifo_.end();
-        auto write_it = used_gds_writes < max_gds_writes
-                            ? find_gds_opcode(Request::WRITE)
-                            : fifo_.end();
-        const bool has_read = read_it != fifo_.end();
-        const bool has_write = write_it != fifo_.end();
-
-        const bool choose_gds_read =
-            has_read &&
-            (!has_write || consecutive_read_dispatches_ <
-                               kMaxConsecutiveReadDispatches);
-        auto gds_it = choose_gds_read ? read_it : write_it;
-        if (gds_it == fifo_.end() && non_gds_it == fifo_.end()) break;
-
-        // A GDS READ may bypass GDS WRITEs, but never an unrelated transport
-        // owner that was admitted before that READ.
-        auto selected_it = gds_it;
-        if (non_gds_it != fifo_.end() &&
-            (selected_it == fifo_.end() ||
-             std::distance(fifo_.begin(), non_gds_it) <
-                 std::distance(fifo_.begin(), selected_it))) {
-            selected_it = non_gds_it;
-        }
-        auto owner_it = owners_.find(*selected_it);
-        const auto& owner = owner_it->second;
+        const auto scheduler_snapshot = gds_scheduler_.snapshot();
+        const size_t remaining_read_tokens =
+            max_gds_reads > used_gds_reads
+                ? max_gds_reads - used_gds_reads
+                : 0;
+        const size_t remaining_write_tokens =
+            max_gds_writes > used_gds_writes
+                ? max_gds_writes - used_gds_writes
+                : 0;
         const size_t remaining_bytes = max_bytes - used_bytes;
-        // Preserve FIFO within the selected operation class. If its oldest
-        // request cannot fit, do not bypass it with a lower-priority request.
-        if (owner.request.length > remaining_bytes) break;
+        const uint64_t sequence_barrier =
+            non_gds_it == fifo_.end()
+                ? std::numeric_limits<uint64_t>::max()
+                : (*non_gds_it == 0 ? 0 : *non_gds_it - 1);
+        const size_t absolute_read_tokens =
+            scheduler_snapshot.reserved_tokens[0] +
+            remaining_read_tokens;
+        const size_t absolute_write_tokens =
+            scheduler_snapshot.reserved_tokens[1] +
+            remaining_write_tokens;
+        const size_t absolute_tokens =
+            scheduler_snapshot.global_reserved_tokens +
+            remaining_read_tokens + remaining_write_tokens;
+        const size_t absolute_bytes =
+            scheduler_snapshot.global_reserved_bytes + remaining_bytes;
+        auto reservations = gds_scheduler_.select(
+            {absolute_tokens, absolute_bytes, max_owners - used_owners,
+             absolute_read_tokens, absolute_write_tokens,
+             sequence_barrier});
+        if (!reservations.empty()) {
+            for (const auto& reservation : reservations) {
+                auto owner_it = owners_.find(reservation.owner_id);
+                if (owner_it == owners_.end() ||
+                    owner_it->second.state != QueueState::Queued) {
+                    return {};
+                }
+                auto fifo_it =
+                    std::find(fifo_.begin(), fifo_.end(),
+                              reservation.owner_id);
+                if (fifo_it == fifo_.end()) return {};
+                fifo_.erase(fifo_it);
+                auto& owner = owner_it->second;
+                owner.state = QueueState::Dispatching;
+                owner.gds_reservation_id = reservation.id;
+                picked.push_back(reservation.owner_id);
+                ++used_owners;
+                used_bytes += owner.request.length;
+                if (owner.request.opcode == Request::READ) {
+                    used_gds_reads += reservation.tokens;
+                } else {
+                    used_gds_writes += reservation.tokens;
+                }
+            }
+            continue;
+        }
 
-        const QueueOwnerId owner_id = *selected_it;
-        fifo_.erase(selected_it);
+        if (non_gds_it == fifo_.end()) break;
+        auto owner_it = owners_.find(*non_gds_it);
+        const auto& owner = owner_it->second;
+        if (owner.request.length > remaining_bytes) break;
+        const QueueOwnerId owner_id = *non_gds_it;
+        fifo_.erase(non_gds_it);
         owner_it->second.state = QueueState::Dispatching;
         picked.push_back(owner_id);
         ++used_owners;
         used_bytes += owner.request.length;
-        if (owner.transport == GDS && owner.request.opcode == Request::READ) {
-            ++used_gds_reads;
-            if (consecutive_read_dispatches_ <
-                kMaxConsecutiveReadDispatches) {
-                ++consecutive_read_dispatches_;
-            }
-        } else if (owner.transport == GDS) {
-            ++used_gds_writes;
-            consecutive_read_dispatches_ = 0;
-        }
     }
     return picked;
 }
 
 Status LocalTransferAdmissionQueue::complete(
     QueueOwnerId owner_id, TransferStatusEnum terminal_status) {
+    auto owner_it = owners_.find(owner_id);
+    if (owner_it == owners_.end()) {
+        return Status::InvalidEntry("queue owner not found" LOC_MARK);
+    }
+    const size_t actual_transferred_bytes =
+        terminal_status == TransferStatusEnum::COMPLETED
+            ? owner_it->second.request.length
+            : 0;
+    return complete(owner_id, actual_transferred_bytes, terminal_status);
+}
+
+Status LocalTransferAdmissionQueue::complete(
+    QueueOwnerId owner_id, size_t actual_transferred_bytes,
+    TransferStatusEnum terminal_status) {
     if (owner_id == 0) {
         return Status::InvalidArgument("invalid queue owner id" LOC_MARK);
     }
@@ -313,6 +383,19 @@ Status LocalTransferAdmissionQueue::complete(
     auto& owner = owner_it->second;
     if (owner.state != QueueState::Dispatching) {
         return Status::InvalidEntry("queue owner is not dispatching" LOC_MARK);
+    }
+    if (owner.transport == GDS) {
+        if (owner.gds_reservation_id == 0) {
+            return Status::InternalError(
+                "dispatching GDS owner has no reservation" LOC_MARK);
+        }
+        CHECK_STATUS(gds_scheduler_.complete(
+            owner.gds_reservation_id, actual_transferred_bytes,
+            terminal_status));
+        owner.gds_reservation_id = 0;
+    } else if (actual_transferred_bytes > owner.request.length) {
+        return Status::InvalidArgument(
+            "completion exceeds queue owner bytes" LOC_MARK);
     }
 
     owner.state = QueueState::Terminal;
@@ -436,6 +519,11 @@ QueueCapacity LocalTransferAdmissionQueue::availableCapacity(
     capacity.owners = std::min(capacity.owners, available_user_owners);
     capacity.bytes = std::min(capacity.bytes, available_user_bytes);
     return capacity;
+}
+
+GdsOperationSchedulerSnapshot
+LocalTransferAdmissionQueue::gdsSchedulerSnapshot() const {
+    return gds_scheduler_.snapshot();
 }
 
 }  // namespace tent

@@ -125,6 +125,12 @@ bool GdsOperationScheduler::hasQueued(GdsDirection direction) const {
 size_t GdsOperationScheduler::directionTokenLimit(
     GdsDirection direction, bool contended) const {
     if (direction == GdsDirection::Read) {
+        if (contended &&
+            config_.shared_tokens > config_.contended_write_tokens) {
+            return std::min(
+                config_.read_standalone_tokens,
+                config_.shared_tokens - config_.contended_write_tokens);
+        }
         return config_.read_standalone_tokens;
     }
     return contended ? config_.contended_write_tokens
@@ -192,10 +198,15 @@ bool GdsOperationScheduler::canReserve(
         hasQueued(GdsDirection::Read) && hasQueued(GdsDirection::Write);
     const auto& direction = directions_[index(entry.direction)];
     size_t next_direction_tokens = 0;
+    const size_t budget_direction_tokens =
+        entry.direction == GdsDirection::Read ? budget.max_read_tokens
+                                              : budget.max_write_tokens;
     if (!checkedAdd(direction.outstanding_reserved_tokens,
                     entry.physical_tokens, next_direction_tokens) ||
         next_direction_tokens >
-            directionTokenLimit(entry.direction, contended)) {
+            directionTokenLimit(entry.direction, contended) ||
+        next_direction_tokens > budget_direction_tokens ||
+        entry.enqueue_sequence > budget.max_enqueue_sequence) {
         return false;
     }
 
@@ -414,11 +425,30 @@ std::vector<GdsDispatchReservation> GdsOperationScheduler::select(
         auto candidate =
             findCandidate(direction, budget, secondary_requests,
                           secondary_bytes);
-        const bool direction_capacity =
+        bool direction_capacity =
             directionHasCapacity(direction, contended);
-        const bool spendable =
+        bool spendable =
             candidate != queued_.end() &&
             (!contended || canSpendWdrr(*candidate));
+        if (!contended &&
+            (candidate == queued_.end() || !direction_capacity) &&
+            read_backlog && write_backlog) {
+            const auto alternate =
+                direction == GdsDirection::Read ? GdsDirection::Write
+                                                : GdsDirection::Read;
+            auto alternate_candidate =
+                findCandidate(alternate, budget, secondary_requests,
+                              secondary_bytes);
+            const bool alternate_capacity =
+                directionHasCapacity(alternate, false);
+            if (alternate_candidate != queued_.end() &&
+                alternate_capacity) {
+                direction = alternate;
+                candidate = alternate_candidate;
+                direction_capacity = true;
+                spendable = true;
+            }
+        }
         if (candidate == queued_.end() || !direction_capacity ||
             !spendable) {
             if (!contended) break;

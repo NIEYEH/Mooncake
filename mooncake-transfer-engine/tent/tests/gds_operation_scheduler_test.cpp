@@ -223,6 +223,61 @@ void testDrainedOperationCanReceiveNextAdmissionSegment() {
     EXPECT_EQ(second.front().operation_owner_id, 71u);
 }
 
+void testFixedModeUsesWriteSlotWhenReadWindowIsFull() {
+    auto config = weightedConfig();
+    config.mode = GdsSchedulerMode::Fixed;
+    GdsOperationScheduler scheduler(config);
+    EXPECT_TRUE(
+        scheduler
+            .enqueue(entry(1, 81, GdsDirection::Read, 2 * kMiB))
+            .ok());
+    EXPECT_TRUE(
+        scheduler
+            .enqueue(entry(2, 81, GdsDirection::Read, 2 * kMiB))
+            .ok());
+    EXPECT_TRUE(
+        scheduler
+            .enqueue(entry(3, 82, GdsDirection::Write, 2 * kMiB))
+            .ok());
+
+    auto selected = scheduler.select(
+        {16, 64 * kMiB, 2, 1, 1});
+    EXPECT_EQ(selected.size(), 2u);
+    EXPECT_EQ(selected[0].direction, GdsDirection::Read);
+    EXPECT_EQ(selected[1].direction, GdsDirection::Write);
+}
+
+void testFixedModeReservesOneContendedWriteToken() {
+    auto config = weightedConfig();
+    config.mode = GdsSchedulerMode::Fixed;
+    GdsOperationScheduler scheduler(config);
+    for (uint64_t index = 0; index < 32; ++index) {
+        EXPECT_TRUE(scheduler
+                        .enqueue(entry(100 + index, 83, GdsDirection::Read,
+                                       2 * kMiB))
+                        .ok());
+    }
+    EXPECT_TRUE(
+        scheduler
+            .enqueue(entry(200, 84, GdsDirection::Write, 2 * kMiB))
+            .ok());
+
+    auto selected = scheduler.select(
+        {16, 64 * kMiB, 16, 16, 1});
+    EXPECT_EQ(selected.size(), 16u);
+    size_t reads = 0;
+    size_t writes = 0;
+    for (const auto& reservation : selected) {
+        if (reservation.direction == GdsDirection::Read) {
+            ++reads;
+        } else {
+            ++writes;
+        }
+    }
+    EXPECT_EQ(reads, 15u);
+    EXPECT_EQ(writes, 1u);
+}
+
 }  // namespace
 }  // namespace mooncake::tent
 
@@ -235,6 +290,8 @@ int main() {
     testIdleDirectionCannotBankCredit();
     testDispatcherWakeupDoesNotGrantAnotherQuantum();
     testDrainedOperationCanReceiveNextAdmissionSegment();
+    testFixedModeUsesWriteSlotWhenReadWindowIsFull();
+    testFixedModeReservesOneContendedWriteToken();
     std::cout << "gds_operation_scheduler_test: PASS" << std::endl;
     return 0;
 }
