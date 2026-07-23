@@ -212,3 +212,6 @@ core_*
 # MacOS
 .DS_Store
 .envrc
+
+# Local isolated feature worktrees
+.worktrees/
