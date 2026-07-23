@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sys
+import tempfile
 import threading
 import time
 import unittest
@@ -232,6 +233,47 @@ class VllmWarmupTest(unittest.TestCase):
         self.assertEqual(args.concurrency, 16)
         self.assertEqual(args.min_duration_seconds, 60)
         self.assertEqual(args.settle_seconds, 15)
+
+    def test_required_slot_mapping_kernel_manifest_gate(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            manifest = Path(temp_dir) / "triton-kernels.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "compiled_kernels": [
+                            "_compute_slot_mapping_kernel",
+                            "attention_kernel",
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            summary = vllm_warmup.run_warmup(
+                replace(
+                    self._config(),
+                    requests=0,
+                    kernel_manifest_path=str(manifest),
+                )
+            )
+            self.assertTrue(summary["kernel_coverage"]["available"])
+            self.assertEqual(
+                summary["kernel_coverage"]["missing_required_kernels"], []
+            )
+
+            manifest.write_text(
+                json.dumps({"compiled_kernels": ["attention_kernel"]}),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(
+                RuntimeError, "_compute_slot_mapping_kernel"
+            ):
+                vllm_warmup.run_warmup(
+                    replace(
+                        self._config(),
+                        requests=0,
+                        kernel_manifest_path=str(manifest),
+                    )
+                )
 
 
 if __name__ == "__main__":

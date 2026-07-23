@@ -52,6 +52,7 @@ constexpr size_t kDefaultMaxInflightWrites = 1;
 constexpr size_t kDefaultSharedDeviceTokens = 16;
 constexpr size_t kMaxDirectIoWorkerThreads = 64;
 constexpr size_t kDefaultSubmitRetryCount = 0;
+constexpr size_t kShadowMaxMergeSize = 16UL << 20;
 constexpr size_t kDefaultAdaptiveSampleWindow = 128;
 constexpr size_t kDefaultAdaptiveEvaluationInterval = 32;
 constexpr size_t kDefaultAdaptiveRecoveryWindows = 3;
@@ -291,6 +292,7 @@ GdsTransport::GdsTransport()
       max_inflight_reads_(kDefaultMaxInflightReads),
       max_inflight_writes_(kDefaultMaxInflightWrites),
       submit_retry_count_(kDefaultSubmitRetryCount),
+      merge_shadow_enabled_(true),
       adaptive_concurrency_enabled_(false),
       adaptive_sample_window_(kDefaultAdaptiveSampleWindow),
       adaptive_evaluation_interval_(kDefaultAdaptiveEvaluationInterval),
@@ -391,6 +393,14 @@ Status GdsTransport::install(std::string& local_segment_name,
     const int configured_submit_retries =
         conf_->get("transports/gds/submit_retry_count",
                    static_cast<int>(kDefaultSubmitRetryCount));
+    const auto merge_mode =
+        conf_->get("transports/gds/merge_mode", "shadow");
+    if (merge_mode != "shadow" && merge_mode != "disabled") {
+        return Status::InvalidArgument(
+            "transports/gds/merge_mode must be shadow or disabled"
+            LOC_MARK);
+    }
+    merge_shadow_enabled_ = merge_mode == "shadow";
     const int configured_sample_window = conf_->get(
         "transports/gds/adaptive_sample_window",
         static_cast<int>(kDefaultAdaptiveSampleWindow));
@@ -508,6 +518,8 @@ Status GdsTransport::install(std::string& local_segment_name,
               << ", max_inflight_writes=" << max_inflight_writes_
               << ", shared_device_tokens=" << max_inflight_ios_
               << ", submit_retry_count=" << submit_retry_count_
+              << ", merge_mode="
+              << (merge_shadow_enabled_ ? "shadow" : "disabled")
               << ", adaptive_concurrency="
               << adaptive_concurrency_enabled_
               << ", adaptive_min_read_inflight="
@@ -1425,6 +1437,15 @@ Status GdsTransport::submitTransferTasks(
     const auto enqueued_at = std::chrono::steady_clock::now();
     size_t read_io_count = 0;
     size_t write_io_count = 0;
+    size_t shadow_input_ios = 0;
+    size_t shadow_candidate_ios = 0;
+    size_t shadow_candidate_bytes = 0;
+    size_t shadow_run_bytes = 0;
+    int shadow_previous_device = -2;
+    bool shadow_has_previous = false;
+    IoOperation shadow_previous{};
+    const size_t shadow_max_merge_size =
+        std::min(kShadowMaxMergeSize, max_io_size_);
     for (size_t request_index = 0; request_index < request_list.size();
          ++request_index) {
         const auto& request = request_list[request_index];
@@ -1445,6 +1466,46 @@ Status GdsTransport::submitTransferTasks(
                 static_cast<off_t>(io_offsets[request_index] + offset),
                 write,
             };
+            if (merge_shadow_enabled_) {
+                ++shadow_input_ios;
+                shadow_candidate_bytes += length;
+                const bool contiguous =
+                    shadow_has_previous &&
+                    shadow_previous.write == operation.write &&
+                    shadow_previous.file_handle ==
+                        operation.file_handle &&
+                    shadow_previous.dev_ptr_base ==
+                        operation.dev_ptr_base &&
+                    shadow_previous_device ==
+                        device_ids[request_index] &&
+                    shadow_previous.file_offset >= 0 &&
+                    operation.file_offset >= 0 &&
+                    static_cast<uint64_t>(
+                        shadow_previous.file_offset) +
+                            shadow_previous.size ==
+                        static_cast<uint64_t>(
+                            operation.file_offset) &&
+                    shadow_previous.dev_ptr_offset >= 0 &&
+                    operation.dev_ptr_offset >= 0 &&
+                    static_cast<uint64_t>(
+                        shadow_previous.dev_ptr_offset) +
+                            shadow_previous.size ==
+                        static_cast<uint64_t>(
+                            operation.dev_ptr_offset) &&
+                    length <= shadow_max_merge_size &&
+                    shadow_run_bytes <=
+                        shadow_max_merge_size - length;
+                if (contiguous) {
+                    shadow_run_bytes += length;
+                } else {
+                    ++shadow_candidate_ios;
+                    shadow_run_bytes = length;
+                }
+                shadow_previous = operation;
+                shadow_previous_device =
+                    device_ids[request_index];
+                shadow_has_previous = true;
+            }
             gds_batch->io_statuses.push_back(PENDING);
             gds_batch->io_transferred_bytes.push_back(0);
             PendingIo pending{gds_batch, param_index,
@@ -1470,6 +1531,17 @@ Status GdsTransport::submitTransferTasks(
         [](const Request& request) { return request.length <= 64 * 1024; }));
     TentMetrics::instance().recordGdsTransportSubmission(
         request_list.size(), num_ios, num_ios, small_request_count);
+    if (merge_shadow_enabled_) {
+        LOG_EVERY_N(INFO, 256)
+            << "GDS physical merge shadow: input_ios="
+            << shadow_input_ios
+            << ", candidate_ios=" << shadow_candidate_ios
+            << ", candidate_reduction="
+            << (shadow_input_ios - shadow_candidate_ios)
+            << ", candidate_bytes=" << shadow_candidate_bytes
+            << ", max_candidate_bytes=" << shadow_max_merge_size
+            << ", execution_enabled=false";
+    }
     LOG_EVERY_N(INFO, 256)
         << "GDS single-IO submission: logical_requests="
         << request_list.size() << ", physical_ios=" << num_ios

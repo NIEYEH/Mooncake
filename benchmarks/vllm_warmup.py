@@ -34,6 +34,7 @@ from typing import Any, Iterable, Sequence
 
 DEFAULT_PROMPT_TOKEN_COUNTS = (1024, 4096)
 DEFAULT_OUTPUT_TOKEN_COUNTS = (6, 256)
+DEFAULT_REQUIRED_KERNELS = ("_compute_slot_mapping_kernel",)
 
 
 def _open_direct(request: urllib.request.Request, timeout: float):
@@ -64,6 +65,8 @@ class WarmupConfig:
     namespace: str
     output_token_counts: tuple[int, ...] = DEFAULT_OUTPUT_TOKEN_COUNTS
     compile_probe_repetitions: int = 1
+    kernel_manifest_path: str | None = None
+    required_kernels: tuple[str, ...] = DEFAULT_REQUIRED_KERNELS
 
 
 def _positive_int(value: str) -> int:
@@ -219,6 +222,37 @@ def _percentile(values: Sequence[float], percentile: float) -> float | None:
     return ordered[index]
 
 
+def validate_kernel_manifest(config: WarmupConfig) -> dict[str, Any]:
+    if not config.kernel_manifest_path:
+        return {
+            "available": False,
+            "reason": "connector did not expose a kernel manifest",
+            "required_kernels": list(config.required_kernels),
+            "missing_required_kernels": [],
+        }
+    manifest_path = Path(config.kernel_manifest_path)
+    if not manifest_path.is_file():
+        raise RuntimeError(
+            f"required kernel manifest does not exist: {manifest_path}"
+        )
+    manifest_text = manifest_path.read_text(encoding="utf-8")
+    missing = [
+        kernel for kernel in config.required_kernels
+        if kernel not in manifest_text
+    ]
+    if missing:
+        raise RuntimeError(
+            "warmup did not cover required Triton kernels: "
+            + ", ".join(missing)
+        )
+    return {
+        "available": True,
+        "manifest_path": str(manifest_path.resolve()),
+        "required_kernels": list(config.required_kernels),
+        "missing_required_kernels": [],
+    }
+
+
 def _run_batch(
     config: WarmupConfig,
     api_url: str,
@@ -324,6 +358,7 @@ def run_warmup(config: WarmupConfig) -> dict[str, Any]:
     load_duration = time.monotonic() - load_started
     if config.settle_seconds:
         time.sleep(config.settle_seconds)
+    kernel_coverage = validate_kernel_manifest(config)
     total_duration = time.monotonic() - total_started
     latencies = [float(item["latency_seconds"]) for item in results]
     return {
@@ -348,6 +383,7 @@ def run_warmup(config: WarmupConfig) -> dict[str, Any]:
         "load_duration_seconds": load_duration,
         "total_duration_seconds": total_duration,
         "settle_seconds": config.settle_seconds,
+        "kernel_coverage": kernel_coverage,
         "latency_avg_seconds": statistics.fmean(latencies),
         "latency_p50_seconds": _percentile(latencies, 0.50),
         "latency_p99_seconds": _percentile(latencies, 0.99),
@@ -447,6 +483,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="quiet period after successful inference warmup (default: %(default)s)",
     )
     parser.add_argument(
+        "--kernel-manifest",
+        default=os.environ.get("VLLM_TRITON_KERNEL_MANIFEST"),
+        help=(
+            "optional connector-produced kernel manifest; when exposed, "
+            "missing required kernels fail warmup"
+        ),
+    )
+    parser.add_argument(
+        "--required-kernels",
+        type=str,
+        default=",".join(DEFAULT_REQUIRED_KERNELS),
+        help="comma-separated required Triton kernel names",
+    )
+    parser.add_argument(
         "--namespace",
         default=None,
         help=(
@@ -480,6 +530,11 @@ def config_from_args(args: argparse.Namespace) -> WarmupConfig:
         namespace=namespace,
         output_token_counts=tuple(args.output_token_counts),
         compile_probe_repetitions=args.compile_probe_repetitions,
+        kernel_manifest_path=args.kernel_manifest,
+        required_kernels=tuple(
+            kernel.strip() for kernel in args.required_kernels.split(",")
+            if kernel.strip()
+        ),
     )
 
 
