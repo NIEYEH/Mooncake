@@ -226,3 +226,11 @@ target_include_directories(tent_gds_fifo_dispatch_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME tent_gds_fifo_dispatch_test
          COMMAND tent_gds_fifo_dispatch_test)
+
+add_executable(tent_runtime_operation_timeline_test
+               runtime_operation_timeline_test.cpp)
+target_include_directories(
+  tent_runtime_operation_timeline_test
+  PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME tent_runtime_operation_timeline_test
+         COMMAND tent_runtime_operation_timeline_test)

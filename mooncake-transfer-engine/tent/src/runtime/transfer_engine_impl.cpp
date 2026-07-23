@@ -17,6 +17,7 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <filesystem>
 #include <fstream>
 #include <iterator>
 #include <limits>
@@ -67,6 +68,17 @@ size_t saturatingAdd(size_t lhs, size_t rhs) {
         return std::numeric_limits<size_t>::max();
     }
     return lhs + rhs;
+}
+
+uint64_t runtimeOperationKey(uint64_t batch_token,
+                             Request::OpCode opcode) {
+    return (batch_token << 1) |
+           (opcode == Request::WRITE ? uint64_t{1} : uint64_t{0});
+}
+
+GdsDirection runtimeOperationDirection(Request::OpCode opcode) {
+    return opcode == Request::READ ? GdsDirection::Read
+                                   : GdsDirection::Write;
 }
 
 double runtimeQueueNearestRankP99(std::vector<double> samples) {
@@ -477,6 +489,12 @@ Status TransferEngineImpl::construct() {
             LOC_MARK);
     }
     if (runtime_queue_config_.enabled) {
+        std::error_code executable_error;
+        const auto executable_path =
+            std::filesystem::read_symlink("/proc/self/exe",
+                                          executable_error);
+        const char* cufile_config =
+            std::getenv("CUFILE_ENV_PATH_JSON");
         LOG(INFO) << "Runtime queue config: max_dispatch_owners="
                   << runtime_queue_config_.max_dispatch_owners
                   << ", max_dispatch_bytes="
@@ -506,7 +524,19 @@ Status TransferEngineImpl::construct() {
                   << runtime_queue_config_.limits.max_outstanding_bytes
                   << ", progress_fallback_interval_us="
                   << runtime_queue_config_.progress_fallback_interval.count()
-                  << ", gds_enabled=" << gds_enabled;
+                  << ", gds_enabled=" << gds_enabled
+                  << ", gds_adaptive_concurrency="
+                  << conf_->get(
+                         "transports/gds/adaptive_concurrency", false)
+                  << ", cufile_batch_api=disabled"
+                  << ", cufile_async_api=disabled"
+                  << ", source_config_path="
+                  << conf_->get("runtime/source_config_path", "unknown")
+                  << ", executable_path="
+                  << (executable_error ? "unknown"
+                                       : executable_path.string())
+                  << ", env_CUFILE_ENV_PATH_JSON="
+                  << (cufile_config ? cufile_config : "unset");
     } else if (gds_enabled) {
         LOG(WARNING)
             << "GDS transport is enabled while the TENT runtime queue is "
@@ -1835,6 +1865,64 @@ Status TransferEngineImpl::enqueuePreparedSubmit(Batch* batch,
             LOC_MARK);
     }
 
+    std::array<size_t, 2> operation_requests{};
+    std::array<size_t, 2> operation_bytes{};
+    std::array<size_t, 2> operation_physical_ios{};
+    for (size_t owner_index = 0; owner_index < prepared.owners.size();
+         ++owner_index) {
+        const auto& owner = prepared.owners[owner_index];
+        if (owner.route.transport != GDS) continue;
+        const size_t direction_index =
+            owner.request.opcode == Request::READ ? 0 : 1;
+        if (operation_requests[direction_index] ==
+                std::numeric_limits<size_t>::max() ||
+            owner.request.length >
+                std::numeric_limits<size_t>::max() -
+                    operation_bytes[direction_index] ||
+            physical_plans[owner_index].physical_ios >
+                std::numeric_limits<size_t>::max() -
+                    operation_physical_ios[direction_index]) {
+            return Status::InvalidArgument(
+                "GDS operation timeline accounting overflow" LOC_MARK);
+        }
+        ++operation_requests[direction_index];
+        operation_bytes[direction_index] += owner.request.length;
+        operation_physical_ios[direction_index] +=
+            physical_plans[owner_index].physical_ios;
+    }
+    for (size_t direction_index = 0; direction_index < 2;
+         ++direction_index) {
+        if (operation_requests[direction_index] == 0) continue;
+        const auto opcode = direction_index == 0 ? Request::READ
+                                                 : Request::WRITE;
+        const uint64_t key = runtimeOperationKey(batch_token, opcode);
+        auto [timeline_it, inserted] =
+            runtime_operation_timelines_.try_emplace(
+                key, batch_token, runtimeOperationDirection(opcode),
+                prepared.submit_time);
+        if (!timeline_it->second.addPlannedBatch(
+                operation_requests[direction_index],
+                operation_bytes[direction_index],
+                operation_physical_ios[direction_index])) {
+            return Status::InternalError(
+                "failed to extend GDS operation timeline" LOC_MARK);
+        }
+        LOG(INFO)
+            << "GDS operation timeline "
+            << (inserted ? "start" : "extend")
+            << ": operation_token=" << batch_token
+            << ", direction="
+            << (opcode == Request::READ ? "READ" : "WRITE")
+            << ", added_logical_requests="
+            << operation_requests[direction_index]
+            << ", added_logical_bytes="
+            << operation_bytes[direction_index]
+            << ", added_planned_physical_ios="
+            << operation_physical_ios[direction_index]
+            << ", distinct_request_count=unknown"
+            << ", distinct_conversation_count=unknown";
+    }
+
     batch->queue_token = batch_token;
     batch->task_list.insert(batch->task_list.end(), prepared.tasks.size(),
                             TaskInfo{});
@@ -2144,6 +2232,10 @@ void TransferEngineImpl::maybeLogRuntimeQueueSummary(
 
     const auto& read = runtime_queue_summary_[0];
     const auto& write = runtime_queue_summary_[1];
+    GdsOperationSchedulerSnapshot scheduler_snapshot;
+    if (runtime_queue_) {
+        scheduler_snapshot = runtime_queue_->gdsSchedulerSnapshot();
+    }
     const double elapsed_seconds =
         std::chrono::duration<double>(elapsed).count();
     LOG(INFO)
@@ -2153,6 +2245,20 @@ void TransferEngineImpl::maybeLogRuntimeQueueSummary(
         << ", queued_bytes=" << queued_bytes
         << ", dispatch_inflight_owners=" << dispatch_inflight_owners_
         << ", dispatch_inflight_bytes=" << dispatch_inflight_bytes_
+        << ", active_gds_operations="
+        << runtime_operation_timelines_.size()
+        << ", gds_reserved_read_tokens="
+        << scheduler_snapshot.reserved_tokens[0]
+        << ", gds_reserved_write_tokens="
+        << scheduler_snapshot.reserved_tokens[1]
+        << ", gds_reserved_read_bytes="
+        << scheduler_snapshot.reserved_bytes[0]
+        << ", gds_reserved_write_bytes="
+        << scheduler_snapshot.reserved_bytes[1]
+        << ", gds_completed_read_bytes="
+        << scheduler_snapshot.completed_bytes[0]
+        << ", gds_completed_write_bytes="
+        << scheduler_snapshot.completed_bytes[1]
         << ", READ{dispatches=" << read.dispatches
         << ", completions=" << read.completions
         << ", failures=" << read.failures
@@ -2216,6 +2322,61 @@ Status TransferEngineImpl::finishQueuedOwner(
     const bool is_read =
         queued.batch->task_list[queued.owner_task_id].request.opcode ==
         Request::READ;
+    if (queued.initial_transport == GDS) {
+        const uint64_t operation_key = runtimeOperationKey(
+            queued.batch->queue_token,
+            queued.batch->task_list[queued.owner_task_id]
+                .request.opcode);
+        auto timeline_it =
+            runtime_operation_timelines_.find(operation_key);
+        if (timeline_it == runtime_operation_timelines_.end() ||
+            !timeline_it->second.recordCompletion(
+                actual_transferred_bytes,
+                queued.physical_plan.physical_ios,
+                terminal_status)) {
+            LOG(ERROR)
+                << "GDS operation completion timeline is inconsistent: "
+                << "operation_token=" << queued.batch->queue_token
+                << ", owner_id=" << owner_id
+                << ", actual_bytes=" << actual_transferred_bytes
+                << ", physical_ios="
+                << queued.physical_plan.physical_ios;
+        } else {
+            RuntimeOperationTerminal terminal;
+            if (timeline_it->second.takeTerminal(terminal)) {
+                LOG(INFO)
+                    << "GDS operation timeline terminal: operation_token="
+                    << terminal.batch_token
+                    << ", direction="
+                    << (terminal.direction == GdsDirection::Read
+                            ? "READ"
+                            : "WRITE")
+                    << ", logical_requests="
+                    << terminal.logical_requests
+                    << ", logical_bytes=" << terminal.logical_bytes
+                    << ", planned_physical_ios="
+                    << terminal.planned_physical_ios
+                    << ", dispatch_segments="
+                    << terminal.dispatch_segments
+                    << ", dispatched_requests="
+                    << terminal.dispatched_requests
+                    << ", completed_requests="
+                    << terminal.completed_requests
+                    << ", failed_requests="
+                    << terminal.failed_requests
+                    << ", settled_physical_ios="
+                    << terminal.settled_physical_ios
+                    << ", actual_completed_bytes="
+                    << terminal.actual_completed_bytes
+                    << ", queue_wait_us=" << terminal.queue_wait_us
+                    << ", execution_us=" << terminal.execution_us
+                    << ", total_us=" << terminal.total_us
+                    << ", distinct_request_count=unknown"
+                    << ", distinct_conversation_count=unknown";
+                runtime_operation_timelines_.erase(timeline_it);
+            }
+        }
+    }
     const double total_latency_seconds = std::chrono::duration<double>(
                                              std::chrono::steady_clock::now() -
                                              queued.enqueue_time)
@@ -2456,6 +2617,30 @@ Status TransferEngineImpl::dispatchQueuedOwners(
         if (!group_metadata_valid) {
             fail_group();
             continue;
+        }
+
+        if (group.type == GDS) {
+            const auto opcode = group.requests.front().opcode;
+            const uint64_t operation_key = runtimeOperationKey(
+                group.batch->queue_token, opcode);
+            auto timeline_it =
+                runtime_operation_timelines_.find(operation_key);
+            if (timeline_it == runtime_operation_timelines_.end() ||
+                !timeline_it->second.recordDispatchSegment(
+                    group.requests.size(), group.bytes)) {
+                remember_error(Status::InternalError(
+                    "GDS operation dispatch timeline is inconsistent"
+                    LOC_MARK));
+                fail_group();
+                continue;
+            }
+            LOG_EVERY_N(INFO, 64)
+                << "GDS operation segment dispatch: operation_token="
+                << group.batch->queue_token
+                << ", direction="
+                << (opcode == Request::READ ? "READ" : "WRITE")
+                << ", original_requests=" << group.requests.size()
+                << ", logical_bytes=" << group.bytes;
         }
 
         auto status = transport->submitTransferTasks(sub_batch, group.requests);

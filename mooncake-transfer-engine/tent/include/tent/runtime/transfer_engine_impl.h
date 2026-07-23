@@ -32,6 +32,7 @@
 #include "tent/common/status.h"
 #include "tent/common/types.h"
 #include "tent/runtime/admission_queue.h"
+#include "tent/runtime/runtime_operation_timeline.h"
 #include "tent/runtime/transport.h"
 #include "tent/runtime/transport_selector.h"
 
@@ -411,6 +412,8 @@ class TransferEngineImpl {
     size_t consecutive_admission_read_owners_{0};
     uint64_t next_batch_token_{1};
     std::array<RuntimeQueueSummaryDirection, 2> runtime_queue_summary_;
+    std::unordered_map<uint64_t, RuntimeOperationTimeline>
+        runtime_operation_timelines_;
     std::chrono::steady_clock::time_point
         runtime_queue_summary_started_at_{};
 

@@ -17,6 +17,8 @@
 #include "tent/runtime/transfer_engine_impl.h"
 #include <glog/logging.h>
 
+#include <filesystem>
+
 namespace mooncake {
 namespace tent {
 
@@ -29,6 +31,11 @@ TransferEngine::TransferEngine(const std::string config_path) {
     if (!status.ok()) {
         LOG(WARNING) << "Failed to read config file " << config_path;
     }
+    std::error_code canonical_error;
+    const auto canonical_path =
+        std::filesystem::weakly_canonical(config_path, canonical_error);
+    conf->set("runtime/source_config_path",
+              canonical_error ? config_path : canonical_path.string());
     impl_ = std::make_unique<TransferEngineImpl>(conf);
 }
 
