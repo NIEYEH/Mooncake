@@ -100,7 +100,9 @@ Two checked-in example configurations define reproducible modes.
 | target active READ operations | 1 |
 | hard active READ operation maximum | 2 |
 | hard active WRITE operation maximum | 1 |
-| maximum inflight segments per operation | 1 |
+| primary READ operation physical-token window | 16 |
+| primary READ operation byte window | 48 MiB |
+| secondary READ operation inflight segments | 1 |
 | segment request maximum | 8 original requests |
 | segment byte maximum | 16 MiB |
 | merge mode | `shadow` |
@@ -119,17 +121,26 @@ request is split into safe physical IOs; it does not bypass physical limits.
 4. Runtime chooses a direction using completed-byte WDRR when both directions
    have backlog.
 5. Runtime chooses an eligible active operation in that direction.
-6. Runtime builds one bounded operation segment and submits the group to GDS.
-7. GDS expands the selected group into safe physical IOs, consumes shared
+6. GDS produces an immutable, side-effect-free physical plan summary for the
+   candidate segment. Runtime reserves its physical bytes and tokens.
+7. Runtime builds one bounded operation segment and submits the selected plan
+   to GDS. A primary READ operation may have multiple bounded segments inflight
+   while it remains inside its operation token and byte windows.
+8. GDS expands the selected group into safe physical IOs, consumes shared
    tokens, and executes synchronous single-entry cuFile calls.
-8. GDS reports physical completion bytes and per-subrange status.
-9. Runtime releases reservations, updates completed-byte service debt, advances
+9. GDS reports physical completion bytes and per-subrange status.
+10. Runtime releases reservations, updates completed-byte service debt, advances
    request/key state, and selects the next segment.
-10. Store resolves individual key results and the operation result.
+11. Store resolves individual key results and the operation result.
+
+The physical plan summary is not a second scheduling decision. It contains the
+plan identifier, physical IO count, planned bytes, split boundaries, and
+subrange mapping only. GDS must consume that exact plan or reject it before any
+IO starts; it may not silently expand beyond the runtime reservation.
 
 The runtime must never submit all 192 keys merely because they share an
-operation. Global tokens, segment limits, and one-inflight-segment-per-operation
-are independent hard bounds.
+operation. Global tokens, bounded segments, and per-operation byte/token
+windows are independent hard bounds.
 
 ## Completed-byte WDRR
 
@@ -139,22 +150,47 @@ configured standalone maximum.
 
 - Service accounting uses actual physical `transferred_bytes`, not request
   count, logical key count, or submitted bytes.
-- Dispatch creates a bounded byte/token reservation but does not finalize the
-  service debit.
-- Completion releases the full reservation and debits service using actual
-  completed physical bytes.
+- Runtime maintains `outstanding_reserved_bytes` and
+  `outstanding_reserved_tokens` per direction as well as globally.
+- A direction's dispatch-time spendable deficit is
+  `deficit_bytes - outstanding_reserved_bytes`. Runtime must use this value,
+  not completed service alone, for every scheduling decision.
+- Dispatch creates a bounded byte/token reservation before handing work to GDS.
+  The reservation immediately reduces spendable deficit but does not finalize
+  the completed-byte service debit.
+- Completion releases the full reservation and subtracts actual completed
+  physical bytes from `deficit_bytes`. Algebraically this refunds
+  `reserved_bytes - actual_completed_bytes`.
 - Partial completion debits only the completed prefix.
 - A terminal failed IO with zero completed bytes has zero completed-byte
   service; it cannot loop because failed physical IOs are not retried
   implicitly.
-- A direction with no backlog has its credit reset to zero.
+- A direction with neither queued work nor outstanding reservations has its
+  credit reset to zero.
 - Credit is not accrued during idle periods.
 - The empty-to-active transition grants at most one initial quantum.
-- Credit is capped at two quanta.
-- Outstanding segment and physical-token limits bound overshoot while service
-  is awaiting completion.
+- Positive spendable credit, defined as
+  `deficit_bytes - outstanding_reserved_bytes`, is capped at two quanta.
+- A global WDRR round grants at most one quantum to each backlogged direction.
+  A round advances only after every backlogged direction has consumed a
+  scheduling opportunity, reached a physical limit, or cannot dispatch its
+  head IO. A timer tick or dispatcher wakeup alone never advances a round.
+- Active rounds may add credit while IO is outstanding, but the outstanding
+  reservation remains subtracted. This permits work-conserving filling of
+  shared tokens without treating unfinished IO as free service.
+- Global and per-direction outstanding reservations, rather than submitted
+  request count, bound overshoot while service is awaiting completion.
 - The default base quantum is 2 MiB. The 4:1 weights therefore grant an 8 MiB
   READ quantum and a 2 MiB WRITE quantum.
+
+To prevent head-of-line starvation when one physical IO is larger than the
+two-quantum credit cap, a direction may reserve exactly one oversized head IO
+only when it has no existing outstanding reservation and positive deficit.
+The reservation makes its spendable deficit negative. No additional contended
+IO for that direction may dispatch until active WDRR rounds repay the debt.
+The negative debt is bounded by the configured maximum physical IO size.
+Single-direction traffic still bypasses WDRR but remains bounded by shared,
+direction, and operation reservations.
 
 When both directions have backlog and WRITE is physically capped at one slot,
 the 4:1 ratio controls successive scheduling opportunities rather than an
@@ -186,17 +222,37 @@ The first implementation uses local WRITE backlog age and bytes. GPU KV release
 pressure is not inferred. It becomes a separate controller input only when
 vLLM supplies an explicit signal.
 
-## Active-operation focus
+## Active-operation focus and operation dispatch window
 
-The runtime prefers one primary READ operation. A second READ operation may be
-activated only when shared tokens remain idle and the primary operation:
+The runtime prefers one primary READ operation. A segment is a bounded
+transport submission unit, not the operation's concurrency limit. Runtime
+continues constructing segments for the same primary operation until the first
+of these conditions holds:
+
+- shared or READ physical-token reservations are full;
+- the primary operation's 16-token reservation window is full;
+- the primary operation's 48 MiB byte reservation window is full;
+- the operation has no immediately dispatchable physical IO;
+- cancellation, failure, or lease safety blocks further dispatch.
+
+This allows the usual 2.25 MiB KV operation to fill 16 tokens through multiple
+segments even though each segment stops at 8 requests or 16 MiB. It does not
+allow one 192-key operation to publish all work: only the bounded reservations
+are visible to GDS, and undispatched requests remain inside the operation.
+
+A second READ operation may be activated only when shared tokens remain idle
+after the scheduler has attempted to fill the primary operation window and the
+primary:
 
 - has no immediately dispatchable physical IO; or
-- already has its one allowed segment inflight.
+- is blocked by its operation byte/token window while shared capacity is still
+  usable by another operation.
 
-An instantaneous READ inflight count below 16 is not sufficient to activate a
-second operation. The hard active READ operation maximum is two. The hard
-active WRITE operation maximum is one.
+The secondary operation receives one bounded inflight segment initially. It
+cannot displace reservations already granted to the primary. An instantaneous
+READ inflight count below 16, or merely having one primary segment inflight, is
+not sufficient to activate it. The hard active READ operation maximum is two.
+The hard active WRITE operation maximum is one.
 
 When an operation becomes terminal, runtime activates the next waiting
 operation. This policy is work-conserving only under the explicit conditions
@@ -254,27 +310,60 @@ For every terminal IO:
 `actual > reserved`, duplicate completion, reservation underflow, or missing
 mapping is a fatal error for the affected operation, not for the transport.
 
-## Lease coverage
+## Lease safety and indirect-renewal validation gate
 
-Current Store leases are granted by `BatchGetReplicaList` and have no separate
-renew RPC. Operation scheduling can therefore outlive the original lease.
+Current Store leases are granted by `BatchGetReplicaList`. Code inspection
+shows that this RPC is not a pure renewal operation:
 
-The first implementation renews unfinished READ keys by issuing a low-frequency
-`BatchGetReplicaList` before the remaining lease falls below a configured
-safety margin.
+- it increments Get and cache-hit counters;
+- it evaluates promotion-on-hit;
+- `GrantLeaseForGroup` may extend every member of a grouped key;
+- Master stores one hard `lease_timeout=max(old, now+TTL)` per object, with no
+  per-client reference count and no explicit read-lease release RPC;
+- checked-in Master configurations use a 5-second default TTL.
 
-- `WAITING`, `ACTIVE`, and `DRAINING` are covered.
-- The default safety margin is the greater of one second and one third of the
-  granted lease duration.
-- Renewal is attempted at most once per key per second. A renewal transaction
-  has at most three attempts with 100 ms and 200 ms backoffs, all within the
-  current lease deadline.
-- An unchanged replica identity updates the local deadline.
-- A missing key, renewal error, or changed replica identity stops new segments
-  for affected keys.
-- Inflight work drains; affected keys finish as failed.
-- Renewal stops immediately after operation terminal state.
-- Renewal frequency is bounded to prevent excessive Master traffic.
+Consequently, periodic `BatchGetReplicaList` renewal is disabled in baseline
+and weighted-fair modes. The first implementation uses a lease budget:
+
+1. Track the absolute lease deadline returned by the initial query for every
+   unfinished READ key.
+2. Before admitting or dispatching a segment, estimate queue time plus
+   reserved-byte service time from conservative completed-throughput EWMA.
+3. Require the estimate plus a one-second safety margin to fit inside the
+   shortest lease remaining in the segment.
+4. If it does not fit, do not dispatch the unsafe segment. Mark it for a
+   one-shot refresh decision rather than repeatedly querying Master.
+5. After dispatch, if the deadline becomes unsafe, stop new segments and drain
+   inflight IO. Do not create an unbounded renewal loop.
+
+A one-shot operation refresh through `BatchGetReplicaList` remains behind the
+disabled-by-default `gds_indirect_lease_refresh` experiment. It queries all
+unfinished keys in one batch, validates unchanged replica identities, and may
+run at most once per operation. Missing keys, changed identities, RPC failure,
+or insufficient renewed budget fail only the affected keys. Terminal or
+canceling operations never launch it; an already-returning RPC is reconciled
+without scheduling new work.
+
+The experiment may be enabled by default only after all validation gates pass:
+
+- ungrouped and grouped objects become removable no later than one TTL plus
+  test jitter after the last refresh, proving there is no persistent lease
+  leak;
+- group-wide pin amplification is measured and bounded, including the number
+  of indirectly extended members and bytes;
+- no refresh begins after the operation terminal latch, including cancel/RPC
+  races;
+- an 80-operation benchmark with 126/192-key batches adds less than 5% Master
+  CPU, less than 10% BatchGetReplicaList P99, and bounded shard-lock hold time;
+- refresh QPS, keys, bytes, group fanout, Master latency, and promotion side
+  effects are emitted separately;
+- ordinary Get/cache-hit metrics used for workload evaluation are not silently
+  treated as user Get traffic. If they cannot be separated, the experiment
+  fails and a dedicated renewal RPC is required.
+
+Until this gate passes, the scheduler must meet the five-second lease budget by
+strict backpressure and operation-focused completion, or fail affected keys
+before using expired metadata.
 
 ## Merge planner and completion mapping
 
@@ -389,16 +478,26 @@ Testing follows red-green-refactor and includes:
 - idle credit reset and two-quantum cap;
 - completed-byte WDRR with unequal 2.25 MiB and 15 MiB IOs;
 - bounded reservation before completion;
+- outstanding reservations prevent repeated dispatch before completion;
+- oversized-head reservation creates bounded debt and blocks further
+  contended dispatch until repayment;
 - full, partial, zero-byte error, duplicate completion, and reconciliation
   underflow;
 - WRITE promotion, demotion, READ-P99 protection, and cooldown;
+- one primary READ operation fills all 16 tokens through multiple bounded
+  segments;
 - primary READ operation focus and exact second-operation activation rules;
 - segment limits where request count wins and where bytes win;
 - proof that a 192-key operation cannot enter one dispatch segment;
 - cancel in WAITING, ACTIVE, and DRAINING;
 - exactly-once terminal callback;
 - key-isolated failures;
-- lease renewal success, identity change, missing key, and renewal failure;
+- lease-budget admission and unsafe-segment refusal;
+- indirect-refresh disabled-by-default behavior;
+- one-shot refresh identity change, missing key, terminal/cancel race, and RPC
+  failure;
+- ungrouped expiry, grouped pin amplification, post-terminal expiry, Master
+  load, and metric-side-effect validation;
 - shadow merge decisions and every rejection reason;
 - enabled merge complete/partial mapping across original requests;
 - registered buffer, device, segment, and physical-boundary enforcement;
