@@ -55,10 +55,12 @@ constexpr size_t kDefaultAdaptiveSampleWindow = 128;
 constexpr size_t kDefaultAdaptiveEvaluationInterval = 32;
 constexpr size_t kDefaultAdaptiveRecoveryWindows = 3;
 constexpr size_t kDefaultMinReadInflight = 4;
-constexpr size_t kDefaultMinWriteInflight = 1;
+constexpr size_t kDefaultMinWriteInflight = 2;
 constexpr double kDefaultAdaptiveDegradationRatio = 1.25;
 constexpr double kDefaultAdaptiveRecoveryRatio = 1.05;
-constexpr size_t kDefaultWriteStarvationTimeoutUs = 500000;
+constexpr double kAdaptiveLoadedRecoveryRatio = 1.00;
+constexpr size_t kDefaultWriteP99TargetUs = 10000;
+constexpr size_t kDefaultWriteStarvationTimeoutUs = 100000;
 constexpr size_t kSubmitRetryBackoffUs = 50;
 
 class CudaDeviceGuard {
@@ -118,24 +120,33 @@ size_t gdsAvailableWorkerSlots(size_t effective_limit,
                : 0;
 }
 
+bool gdsAdaptiveEvaluationReady(const GdsAdaptiveState& state,
+                                size_t sample_window,
+                                size_t evaluation_interval) {
+    return sample_window > 0 && evaluation_interval > 0 &&
+           state.recent_io_latency_us.size() >= sample_window &&
+           state.completions_since_evaluation >= evaluation_interval;
+}
+
 GdsAdaptiveAction adjustGdsAdaptiveConcurrency(
     GdsAdaptiveState& state, double p99_us, size_t queued_ios,
     double degradation_ratio, double recovery_ratio,
     size_t recovery_windows) {
-    // Saturation is accumulated over the whole evaluation interval. A burst
-    // may have drained by the completion that triggers evaluation, while its
-    // P99 still reflects the overloaded window. Any internal or runtime-side
-    // backlog is also direct evidence that the current window is saturated.
-    const bool saturated =
-        state.saturation_since_evaluation || queued_ios > 0;
+    // Only an effective window that was actually full is a device saturation
+    // signal. Runtime backlog alone can be caused by READ priority or strict
+    // dispatch backpressure and must not ratchet WRITE from 4 down to 1.
+    const bool saturated = state.saturation_since_evaluation;
     state.saturation_since_evaluation = false;
     if (state.baseline_p99_us <= 0.0) {
-        state.baseline_p99_us = p99_us;
+        state.baseline_p99_us =
+            std::max(state.target_p99_us, p99_us);
         return GdsAdaptiveAction::NONE;
     }
 
+    const double reference_p99_us =
+        std::max(state.target_p99_us, state.baseline_p99_us);
     const bool degraded =
-        saturated && p99_us > state.baseline_p99_us * degradation_ratio;
+        saturated && p99_us > reference_p99_us * degradation_ratio;
     if (degraded) {
         state.healthy_windows = 0;
         if (state.current_limit > state.minimum_limit) {
@@ -150,20 +161,34 @@ GdsAdaptiveAction adjustGdsAdaptiveConcurrency(
         return GdsAdaptiveAction::NONE;
     }
 
-    if (!saturated) {
+    if (!saturated && queued_ios == 0) {
         const double baseline_weight =
-            p99_us < state.baseline_p99_us ? 0.20 : 0.02;
-        state.baseline_p99_us =
-            state.baseline_p99_us * (1.0 - baseline_weight) +
-            p99_us * baseline_weight;
+            p99_us < reference_p99_us ? 0.20 : 0.02;
+        state.baseline_p99_us = std::max(
+            state.target_p99_us,
+            reference_p99_us * (1.0 - baseline_weight) +
+                p99_us * baseline_weight);
     }
 
-    const bool healthy =
-        p99_us <= state.baseline_p99_us * recovery_ratio;
-    if (healthy && queued_ios == 0 &&
+    const double recovery_reference_p99_us =
+        std::max(state.target_p99_us, state.baseline_p99_us);
+    const bool idle_healthy =
+        queued_ios == 0 &&
+        p99_us <= recovery_reference_p99_us * recovery_ratio;
+    const bool loaded_with_headroom =
+        queued_ios > 0 &&
+        p99_us <= recovery_reference_p99_us *
+                      kAdaptiveLoadedRecoveryRatio;
+    if ((idle_healthy || loaded_with_headroom) &&
         state.current_limit < state.configured_limit) {
         ++state.healthy_windows;
-        if (state.healthy_windows >= recovery_windows) {
+        const size_t required_windows =
+            loaded_with_headroom &&
+                    recovery_windows <=
+                        std::numeric_limits<size_t>::max() / 2
+                ? recovery_windows * 2
+                : recovery_windows;
+        if (state.healthy_windows >= required_windows) {
             ++state.current_limit;
             state.healthy_windows = 0;
             return GdsAdaptiveAction::RECOVER;
@@ -336,7 +361,8 @@ Status GdsTransport::install(std::string& local_segment_name,
     const int configured_read_p99_target_us = conf_->get(
         "transports/gds/adaptive_read_p99_target_us", 0);
     const int configured_write_p99_target_us = conf_->get(
-        "transports/gds/adaptive_write_p99_target_us", 0);
+        "transports/gds/adaptive_write_p99_target_us",
+        static_cast<int>(kDefaultWriteP99TargetUs));
     const int configured_write_starvation_us = conf_->get(
         "transports/gds/write_starvation_timeout_us",
         static_cast<int>(kDefaultWriteStarvationTimeoutUs));
@@ -381,12 +407,14 @@ Status GdsTransport::install(std::string& local_segment_name,
     read_adaptive_.minimum_limit =
         std::min(static_cast<size_t>(configured_min_read_inflight),
                  max_inflight_reads_);
+    read_adaptive_.target_p99_us = configured_read_p99_target_us;
     read_adaptive_.baseline_p99_us = configured_read_p99_target_us;
     write_adaptive_.configured_limit = max_inflight_writes_;
     write_adaptive_.current_limit = max_inflight_writes_;
     write_adaptive_.minimum_limit =
         std::min(static_cast<size_t>(configured_min_write_inflight),
                  max_inflight_writes_);
+    write_adaptive_.target_p99_us = configured_write_p99_target_us;
     write_adaptive_.baseline_p99_us = configured_write_p99_target_us;
     pending_reads_.clear();
     pending_writes_.clear();
@@ -974,10 +1002,9 @@ void GdsTransport::recordAdaptiveSampleLocked(
     ++state.completions_since_evaluation;
 
     if (!adaptive_concurrency_enabled_ ||
-        state.recent_io_latency_us.size() <
-            adaptive_evaluation_interval_ ||
-        state.completions_since_evaluation <
-            adaptive_evaluation_interval_) {
+        !gdsAdaptiveEvaluationReady(
+            state, adaptive_sample_window_,
+            adaptive_evaluation_interval_)) {
         return;
     }
     state.completions_since_evaluation = 0;
@@ -1006,6 +1033,8 @@ void GdsTransport::evaluateAdaptiveConcurrencyLocked(bool write) {
     TentMetrics::instance().observeGdsAdaptiveWindow(
         !write, p99_us / 1e6, queued_ios);
     const size_t old_limit = state.current_limit;
+    const bool reached_effective_limit =
+        state.saturation_since_evaluation;
     const auto action = adjustGdsAdaptiveConcurrency(
         state, p99_us, queued_ios, adaptive_degradation_ratio_,
         adaptive_recovery_ratio_, adaptive_recovery_windows_);
@@ -1022,6 +1051,9 @@ void GdsTransport::evaluateAdaptiveConcurrencyLocked(bool write) {
                      << state.current_limit
                      << ", rolling_p99_us=" << p99_us
                      << ", baseline_p99_us=" << state.baseline_p99_us
+                     << ", target_p99_us=" << state.target_p99_us
+                     << ", reached_effective_limit="
+                     << reached_effective_limit
                      << ", internal_queued_ios=" << pending.size()
                      << ", runtime_queued_owners=" << runtime_queued;
     } else {
@@ -1030,6 +1062,9 @@ void GdsTransport::evaluateAdaptiveConcurrencyLocked(bool write) {
                   << " effective inflight: " << old_limit << " -> "
                   << state.current_limit << ", rolling_p99_us=" << p99_us
                   << ", baseline_p99_us=" << state.baseline_p99_us
+                  << ", target_p99_us=" << state.target_p99_us
+                  << ", reached_effective_limit="
+                  << reached_effective_limit
                   << ", internal_queued_ios=" << pending.size()
                   << ", runtime_queued_owners=" << runtime_queued;
     }

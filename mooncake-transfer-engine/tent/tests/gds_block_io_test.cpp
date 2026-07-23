@@ -147,17 +147,17 @@ std::shared_ptr<Config> makeGdsConfig() {
     config->set("transports/gds/max_inflight_reads", 16);
     config->set("transports/gds/max_inflight_writes", 4);
     config->set("transports/gds/submit_retry_count", 0);
-    config->set("transports/gds/write_starvation_timeout_us", 500000);
+    config->set("transports/gds/write_starvation_timeout_us", 100000);
     config->set("transports/gds/adaptive_concurrency", true);
     config->set("transports/gds/adaptive_sample_window", 128);
     config->set("transports/gds/adaptive_evaluation_interval", 32);
     config->set("transports/gds/adaptive_recovery_windows", 3);
     config->set("transports/gds/adaptive_min_read_inflight", 4);
-    config->set("transports/gds/adaptive_min_write_inflight", 1);
+    config->set("transports/gds/adaptive_min_write_inflight", 2);
     config->set("transports/gds/adaptive_p99_degradation_ratio", 1.25);
     config->set("transports/gds/adaptive_p99_recovery_ratio", 1.05);
     config->set("transports/gds/adaptive_read_p99_target_us", 60000);
-    config->set("transports/gds/adaptive_write_p99_target_us", 0);
+    config->set("transports/gds/adaptive_write_p99_target_us", 10000);
     return config;
 }
 
@@ -314,27 +314,32 @@ Request makeRequest(Request::OpCode opcode, void* buffer, SegmentID segment,
 }
 
 TEST(GdsAdaptiveConcurrencyTest,
-     ReducesUnderOverloadAndRecoversOnlyWithoutBacklog) {
+     ReducesOnRealSaturationAndRecoversWithLoadedHeadroom) {
     GdsAdaptiveState state;
     state.configured_limit = 16;
     state.current_limit = 16;
     state.minimum_limit = 4;
     state.baseline_p99_us = 100.0;
 
+    state.saturation_since_evaluation = true;
     EXPECT_EQ(adjustGdsAdaptiveConcurrency(state, 150.0, 64, 1.25, 1.05,
                                            3),
               GdsAdaptiveAction::REDUCE);
     EXPECT_EQ(state.current_limit, 12u);
     EXPECT_DOUBLE_EQ(state.baseline_p99_us, 100.0);
 
-    // Even a healthy-looking P99 cannot raise concurrency while a direction
-    // remains saturated and backlogged.
-    for (int window = 0; window < 8; ++window) {
-        EXPECT_EQ(adjustGdsAdaptiveConcurrency(state, 90.0, 64, 1.25,
+    // Backlogged recovery requires twice as many stable windows at or below
+    // the reference P99, so it probes upward without remaining stuck at a
+    // reduced limit for the lifetime of a sustained benchmark.
+    for (int window = 0; window < 5; ++window) {
+        EXPECT_EQ(adjustGdsAdaptiveConcurrency(state, 100.0, 64, 1.25,
                                                1.05, 3),
                   GdsAdaptiveAction::NONE);
     }
-    EXPECT_EQ(state.current_limit, 12u);
+    EXPECT_EQ(adjustGdsAdaptiveConcurrency(state, 100.0, 64, 1.25, 1.05,
+                                           3),
+              GdsAdaptiveAction::RECOVER);
+    EXPECT_EQ(state.current_limit, 13u);
 
     EXPECT_EQ(adjustGdsAdaptiveConcurrency(state, 90.0, 0, 1.25, 1.05, 3),
               GdsAdaptiveAction::NONE);
@@ -342,7 +347,7 @@ TEST(GdsAdaptiveConcurrencyTest,
               GdsAdaptiveAction::NONE);
     EXPECT_EQ(adjustGdsAdaptiveConcurrency(state, 90.0, 0, 1.25, 1.05, 3),
               GdsAdaptiveAction::RECOVER);
-    EXPECT_EQ(state.current_limit, 13u);
+    EXPECT_EQ(state.current_limit, 14u);
 
     for (int window = 0; window < 30; ++window) {
         (void)adjustGdsAdaptiveConcurrency(state, 90.0, 0, 1.25, 1.05, 3);
@@ -367,6 +372,49 @@ TEST(GdsAdaptiveConcurrencyTest,
     EXPECT_FALSE(state.saturation_since_evaluation);
 }
 
+TEST(GdsAdaptiveConcurrencyTest,
+     SchedulerBacklogWithoutFullWindowDoesNotReduce) {
+    GdsAdaptiveState state;
+    state.configured_limit = 4;
+    state.current_limit = 4;
+    state.minimum_limit = 2;
+    state.target_p99_us = 100.0;
+    state.baseline_p99_us = 100.0;
+
+    EXPECT_EQ(adjustGdsAdaptiveConcurrency(state, 200.0, 64, 1.25, 1.05,
+                                           3),
+              GdsAdaptiveAction::NONE);
+    EXPECT_EQ(state.current_limit, 4u);
+    EXPECT_DOUBLE_EQ(state.baseline_p99_us, 100.0);
+}
+
+TEST(GdsAdaptiveConcurrencyTest, ConfiguredTargetIsABaselineFloor) {
+    GdsAdaptiveState state;
+    state.configured_limit = 4;
+    state.current_limit = 4;
+    state.minimum_limit = 2;
+    state.target_p99_us = 100.0;
+    state.baseline_p99_us = 100.0;
+
+    EXPECT_EQ(adjustGdsAdaptiveConcurrency(state, 50.0, 0, 1.25, 1.05, 3),
+              GdsAdaptiveAction::NONE);
+    EXPECT_DOUBLE_EQ(state.baseline_p99_us, 100.0);
+}
+
+TEST(GdsAdaptiveConcurrencyTest,
+     RequiresFullRollingWindowBeforeEvaluation) {
+    GdsAdaptiveState state;
+    state.completions_since_evaluation = 32;
+    state.recent_io_latency_us.assign(127, 100.0);
+    EXPECT_FALSE(gdsAdaptiveEvaluationReady(state, 128, 32));
+
+    state.recent_io_latency_us.push_back(100.0);
+    EXPECT_TRUE(gdsAdaptiveEvaluationReady(state, 128, 32));
+
+    state.completions_since_evaluation = 31;
+    EXPECT_FALSE(gdsAdaptiveEvaluationReady(state, 128, 32));
+}
+
 TEST(GdsAdaptiveConcurrencyTest, MinimumAndExistingInflightAreUnderflowSafe) {
     GdsAdaptiveState state;
     state.configured_limit = 16;
@@ -374,6 +422,7 @@ TEST(GdsAdaptiveConcurrencyTest, MinimumAndExistingInflightAreUnderflowSafe) {
     state.minimum_limit = 4;
     state.baseline_p99_us = 100.0;
 
+    state.saturation_since_evaluation = true;
     EXPECT_EQ(adjustGdsAdaptiveConcurrency(state, 200.0, 64, 1.25, 1.05,
                                            3),
               GdsAdaptiveAction::NONE);

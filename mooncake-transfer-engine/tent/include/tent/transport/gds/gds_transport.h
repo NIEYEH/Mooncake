@@ -64,6 +64,7 @@ struct GdsAdaptiveState {
     size_t minimum_limit{1};
     size_t completions_since_evaluation{0};
     size_t healthy_windows{0};
+    double target_p99_us{0.0};
     double baseline_p99_us{0.0};
     bool saturation_since_evaluation{false};
     std::deque<double> recent_io_latency_us;
@@ -73,6 +74,10 @@ GdsAdaptiveAction adjustGdsAdaptiveConcurrency(
     GdsAdaptiveState& state, double p99_us, size_t queued_ios,
     double degradation_ratio, double recovery_ratio,
     size_t recovery_windows);
+
+bool gdsAdaptiveEvaluationReady(const GdsAdaptiveState& state,
+                                size_t sample_window,
+                                size_t evaluation_interval);
 
 size_t gdsAvailableWorkerSlots(size_t effective_limit,
                                size_t inflight_ios);

@@ -34,17 +34,17 @@
       "max_inflight_reads": 16,
       "max_inflight_writes": 4,
       "submit_retry_count": 0,
-      "write_starvation_timeout_us": 500000,
+      "write_starvation_timeout_us": 100000,
       "adaptive_concurrency": true,
       "adaptive_sample_window": 128,
       "adaptive_evaluation_interval": 32,
       "adaptive_recovery_windows": 3,
       "adaptive_min_read_inflight": 4,
-      "adaptive_min_write_inflight": 1,
+      "adaptive_min_write_inflight": 2,
       "adaptive_p99_degradation_ratio": 1.25,
       "adaptive_p99_recovery_ratio": 1.05,
       "adaptive_read_p99_target_us": 60000,
-      "adaptive_write_p99_target_us": 0
+      "adaptive_write_p99_target_us": 10000
     },
 
     "io_uring": {
