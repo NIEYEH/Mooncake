@@ -10,6 +10,7 @@
 #define TENT_TRANSPORT_GDS_FIFO_DISPATCH_H_
 
 #include <cstddef>
+#include <cstdint>
 #include <limits>
 
 namespace mooncake::tent {
@@ -21,6 +22,25 @@ struct GdsFifoDispatchState {
     size_t inflight_reads{0};
     size_t inflight_writes{0};
 };
+
+struct GdsDirectIoOutcome {
+    size_t transferred_bytes{0};
+    bool completed{false};
+};
+
+// cuFile returns the transferred byte count or a negative error. Preserve a
+// positive short result for reservation/WDRR reconciliation while keeping the
+// request terminal status failed. A defensive cap prevents a malformed driver
+// result from exceeding the request's reservation.
+inline GdsDirectIoOutcome gdsDirectIoOutcome(
+    int64_t direct_result, size_t requested_bytes) {
+    if (direct_result <= 0 || requested_bytes == 0) return {};
+    const uint64_t result = static_cast<uint64_t>(direct_result);
+    const size_t transferred =
+        result > requested_bytes ? requested_bytes
+                                 : static_cast<size_t>(result);
+    return {transferred, result == requested_bytes};
+}
 
 inline size_t gdsFifoSharedInflight(
     const GdsFifoDispatchState& state) {

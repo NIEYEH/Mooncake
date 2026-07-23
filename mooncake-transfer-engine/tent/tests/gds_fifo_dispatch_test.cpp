@@ -62,6 +62,20 @@ void testReservationUpdatesPhysicalCounts() {
     EXPECT_EQ(gdsFifoSharedInflight(state), 2u);
 }
 
+void testPartialDirectIoReportsActualBytesWithoutCompleting() {
+    const auto partial = gdsDirectIoOutcome(1024, 4096);
+    EXPECT_EQ(partial.transferred_bytes, 1024u);
+    EXPECT_TRUE(!partial.completed);
+
+    const auto complete = gdsDirectIoOutcome(4096, 4096);
+    EXPECT_EQ(complete.transferred_bytes, 4096u);
+    EXPECT_TRUE(complete.completed);
+
+    const auto failed = gdsDirectIoOutcome(-1, 4096);
+    EXPECT_EQ(failed.transferred_bytes, 0u);
+    EXPECT_TRUE(!failed.completed);
+}
+
 }  // namespace
 }  // namespace mooncake::tent
 
@@ -70,6 +84,7 @@ int main() {
     testSharedBudgetBoundsBothPools();
     testDirectionPoolBoundsFifoFront();
     testReservationUpdatesPhysicalCounts();
+    testPartialDirectIoReportsActualBytesWithoutCompleting();
     std::cout << "gds_fifo_dispatch_test: PASS" << std::endl;
     return 0;
 }

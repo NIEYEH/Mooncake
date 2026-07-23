@@ -831,9 +831,12 @@ void GdsTransport::executeDirectIo(std::shared_ptr<DirectIo> direct_io) {
                                    operation.file_offset,
                                    operation.dev_ptr_offset);
             direct_errno = errno;
-            if (direct_result == static_cast<ssize_t>(operation.size)) {
+            const auto outcome = gdsDirectIoOutcome(
+                static_cast<int64_t>(direct_result), operation.size);
+            transferred_bytes =
+                std::max(transferred_bytes, outcome.transferred_bytes);
+            if (outcome.completed) {
                 final_status = COMPLETED;
-                transferred_bytes = operation.size;
                 break;
             }
             if (attempt < submit_retry_count_) {
