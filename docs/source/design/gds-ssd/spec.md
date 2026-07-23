@@ -16,10 +16,16 @@ counts as `unknown` until explicit correlation identifiers are available.
 
 - cuFile Batch and Async APIs are disabled. Production requests use only
   synchronous, single-entry `cuFileRead` and `cuFileWrite` calls.
+- Runtime logical request merging defaults to disabled when GDS is enabled.
+  Original keys remain separate owners until an executable physical merge
+  path carries exact subrange completion maps.
 - READ and WRITE use separate pre-created worker pools.
 - The runtime queue is the only direction and operation policy scheduler.
-  GDS consumes runtime-selected work in FIFO order and enforces worker,
-  direction, and shared-device token limits.
+  GDS consumes runtime-selected work FIFO within each direction and enforces
+  worker, direction, and shared-device token limits. If the global queue head
+  is blocked only by its direction cap, already-selected work from the other
+  direction may bypass it; this prevents multi-chunk WRITE head-of-line
+  blocking without adding a second WDRR/owner policy.
 - Admission records the total planned physical IO count, but reserves only
   the bounded concurrent token charge that the owner can use under the active
   shared/direction window. It reserves the owner's full physical byte range.
@@ -38,8 +44,9 @@ counts as `unknown` until explicit correlation identifiers are available.
   not sufficient to activate another operation.
 
 The GDS execution queue does not repeat WDRR, READ priority, or operation
-selection. This prevents the runtime and transport layers from applying
-conflicting policies.
+selection. Its only cross-direction reorder is the capacity-blocked-head
+escape above. This prevents the runtime and transport layers from applying
+conflicting policies while keeping both reserved direction pools usable.
 
 ## Checked-in operating modes
 
@@ -103,7 +110,9 @@ fail. The scheduler's cancellation state prevents new dispatch and lets
 already-running synchronous cuFile calls drain. The current public
 TransferEngine API does not expose operation cancellation; `freeBatch` remains
 a post-completion release API. Each physical result maps back to its original
-request, and a request failure does not disable the GDS transport.
+request. If validation rejects a multi-owner dequeue segment, runtime retries
+that segment once as individual owners so only the invalid key fails. A
+request failure does not disable the GDS transport.
 
 Reservations are reconciled exactly once:
 

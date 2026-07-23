@@ -1,5 +1,6 @@
 {
   "verbose": true,
+  "merge_requests": false,
   "enable_runtime_queue": true,
   "runtime_queue": {
     "max_outstanding_owners": 64,

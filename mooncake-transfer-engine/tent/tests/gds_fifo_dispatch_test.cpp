@@ -45,12 +45,19 @@ void testSharedBudgetBoundsBothPools() {
     EXPECT_TRUE(gdsFifoFrontCanDispatch(state, true));
 }
 
-void testDirectionPoolBoundsFifoFront() {
+void testDirectionPoolLetsOppositeDirectionBypassBlockedFront() {
     GdsFifoDispatchState state{16, 16, 1, 8, 1};
     EXPECT_TRUE(!gdsFifoFrontCanDispatch(state, true));
-    // FIFO semantics do not skip this blocked WRITE to schedule a later READ.
     EXPECT_TRUE(gdsFifoFrontBlocksQueue(state, true));
     EXPECT_TRUE(gdsFifoFrontCanDispatch(state, false));
+    EXPECT_TRUE(gdsFifoCanBypassBlockedFront(
+        state, true, false));
+    EXPECT_TRUE(!gdsFifoCanBypassBlockedFront(
+        state, true, true));
+
+    state.inflight_reads = 15;
+    EXPECT_TRUE(!gdsFifoCanBypassBlockedFront(
+        state, true, false));
 }
 
 void testReservationUpdatesPhysicalCounts() {
@@ -88,7 +95,7 @@ void testWriteExecutionLimitTracksReadContention() {
 int main() {
     using namespace mooncake::tent;
     testSharedBudgetBoundsBothPools();
-    testDirectionPoolBoundsFifoFront();
+    testDirectionPoolLetsOppositeDirectionBypassBlockedFront();
     testReservationUpdatesPhysicalCounts();
     testPartialDirectIoReportsActualBytesWithoutCompleting();
     testWriteExecutionLimitTracksReadContention();

@@ -32,12 +32,16 @@ that the distinction is necessary.
 ### Phase 2: operation-focused weighted-fair scheduling
 
 - The runtime queue is the only policy scheduler.
-- GDS consumes runtime-selected physical work in order. It enforces physical
-  tokens, worker availability, and safety limits, but does not run a second
-  READ-first or WDRR policy.
+- GDS consumes runtime-selected physical work FIFO within each direction. It
+  enforces physical tokens, worker availability, and safety limits, but does
+  not run a second READ-first or WDRR policy. An entry blocked solely by its
+  direction cap may yield to already-selected work from the other direction,
+  avoiding cross-direction head-of-line blocking.
 - Restore grouped transport submission only for a bounded segment belonging
   to one operation. cuFile Batch remains disabled; GDS executes individual
   `cuFileRead` and `cuFileWrite` calls.
+- Keep generic runtime logical merging disabled for GDS until partial/error
+  completion can map exact byte subranges back to every original key.
 - Limit active operations and prefer completing the primary READ operation
   before spreading work across more operations.
 

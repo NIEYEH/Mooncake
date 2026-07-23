@@ -14,6 +14,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
@@ -75,6 +76,7 @@ class FakeTransport : public Transport {
     std::atomic<size_t> runtime_queued_reads{0};
     std::atomic<size_t> runtime_queued_writes{0};
     std::atomic<size_t> planned_physical_ios{1};
+    std::function<bool(const Request&)> reject_request;
 
     Status install(std::string&, std::shared_ptr<ControlService>,
                    std::shared_ptr<Topology>,
@@ -121,6 +123,14 @@ class FakeTransport : public Transport {
             } else if (request.opcode == Request::WRITE) {
                 ++submitted_writes;
             }
+        }
+        if (reject_request &&
+            std::any_of(requests.begin(), requests.end(),
+                        [&](const Request& request) {
+                            return reject_request(request);
+                        })) {
+            return Status::InvalidArgument(
+                "injected request-specific failure" LOC_MARK);
         }
         if (fail_on_submit_) {
             return Status::InternalError("injected submit failure" LOC_MARK);
@@ -814,6 +824,46 @@ TEST(RuntimeQueueDispatch, FailedGdsSubmitDoesNotStrandBulkPickedOwners) {
         TransferStatus status{};
         ASSERT_TRUE(engine.getTransferStatus(batch, index, status).ok());
         EXPECT_EQ(status.s, TransferStatusEnum::FAILED);
+    }
+
+    EXPECT_TRUE(engine.freeBatch(batch).ok());
+    EXPECT_TRUE(engine.unregisterLocalMemory(buffer.data(), buffer.size()).ok());
+}
+
+TEST(RuntimeQueueDispatch, RejectedGdsSegmentFailsOnlyInvalidOwner) {
+    constexpr size_t kRequestCount = 3;
+    constexpr size_t kReqLen = 4096;
+    auto cfg = makeRuntimeQueueConfig(kRequestCount, 1UL << 20);
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+
+    auto fake_gds = std::make_shared<FakeTransport>(GDS);
+    std::vector<uint8_t> buffer(kReqLen * kRequestCount, 0x4a);
+    const void* const rejected_source = buffer.data() + kReqLen;
+    fake_gds->reject_request =
+        [rejected_source](const Request& request) {
+            return request.source == rejected_source;
+        };
+    installFakeGds(engine, fake_gds);
+
+    ASSERT_TRUE(engine.registerLocalMemory(buffer.data(), buffer.size()).ok());
+    BatchID batch = engine.allocateBatch(kRequestCount);
+    ASSERT_NE(batch, (BatchID)0);
+    std::vector<Request> requests;
+    for (size_t index = 0; index < kRequestCount; ++index) {
+        requests.push_back(
+            makeLocalGdsRead(buffer.data() + index * kReqLen, kReqLen));
+    }
+
+    ASSERT_TRUE(engine.submitTransfer(batch, requests).ok());
+    EXPECT_EQ(fake_gds->submit_calls.load(), 4);
+    EXPECT_EQ(fake_gds->max_requests_per_submit.load(), kRequestCount);
+
+    for (size_t index = 0; index < kRequestCount; ++index) {
+        TransferStatus status{};
+        ASSERT_TRUE(engine.getTransferStatus(batch, index, status).ok());
+        EXPECT_EQ(status.s, index == 1 ? TransferStatusEnum::FAILED
+                                      : TransferStatusEnum::COMPLETED);
     }
 
     EXPECT_TRUE(engine.freeBatch(batch).ok());

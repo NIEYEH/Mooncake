@@ -27,6 +27,7 @@
 #include <cstring>
 #include <deque>
 #include <exception>
+#include <iterator>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -964,8 +965,10 @@ Status GdsTransport::dispatchPendingIoLocked() {
     size_t scheduled_writes = 0;
     size_t scheduled_bytes = 0;
     size_t enqueue_failures = 0;
+    size_t direction_capacity_bypasses = 0;
     while (!pending_ios_.empty()) {
-        const bool write = pending_ios_.front().operation.write;
+        auto pending_it = pending_ios_.begin();
+        bool write = pending_it->operation.write;
         const bool read_pressure =
             pending_read_ios_ != 0 || !inflight_direct_reads_.empty() ||
             runtime_queued_reads_.load(std::memory_order_relaxed) != 0;
@@ -977,7 +980,18 @@ Status GdsTransport::dispatchPendingIoLocked() {
                 runtime_contended_write_limit_, read_pressure),
             inflight_direct_reads_.size(),
             inflight_direct_writes_.size()};
-        if (gdsFifoFrontBlocksQueue(state, write)) break;
+        if (gdsFifoFrontBlocksQueue(state, write)) {
+            const bool front_write = write;
+            pending_it = std::find_if(
+                std::next(pending_ios_.begin()), pending_ios_.end(),
+                [&](const PendingIo& pending) {
+                    return gdsFifoCanBypassBlockedFront(
+                        state, front_write, pending.operation.write);
+                });
+            if (pending_it == pending_ios_.end()) break;
+            write = pending_it->operation.write;
+            ++direction_capacity_bypasses;
+        }
 
         ThreadPool* const thread_pool =
             write ? write_thread_pool_.get() : read_thread_pool_.get();
@@ -985,8 +999,8 @@ Status GdsTransport::dispatchPendingIoLocked() {
             return Status::InvalidEntry(
                 "GDS parallel IO workers are not available" LOC_MARK);
         }
-        auto pending = std::move(pending_ios_.front());
-        pending_ios_.pop_front();
+        auto pending = std::move(*pending_it);
+        pending_ios_.erase(pending_it);
         auto& pending_count =
             write ? pending_write_ios_ : pending_read_ios_;
         auto& pending_bytes =
@@ -1055,6 +1069,8 @@ Status GdsTransport::dispatchPendingIoLocked() {
             << "GDS FIFO single-IO dispatch: scheduled_reads="
             << scheduled_reads
             << ", scheduled_writes=" << scheduled_writes
+            << ", direction_capacity_bypasses="
+            << direction_capacity_bypasses
             << ", enqueue_failures=" << enqueue_failures
             << ", scheduled_bytes=" << scheduled_bytes
             << ", inflight_reads=" << inflight_direct_reads_.size()

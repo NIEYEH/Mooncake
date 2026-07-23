@@ -74,6 +74,17 @@ inline bool gdsFifoFrontBlocksQueue(
     return !gdsFifoFrontCanDispatch(state, write);
 }
 
+// Preserve FIFO within each direction, but do not let a direction-saturated
+// front entry hide already runtime-selected work for the other direction.
+// This is a token-enforcement escape hatch, not a second priority scheduler.
+inline bool gdsFifoCanBypassBlockedFront(
+    const GdsFifoDispatchState& state, bool front_write,
+    bool candidate_write) {
+    return front_write != candidate_write &&
+           !gdsFifoFrontCanDispatch(state, front_write) &&
+           gdsFifoFrontCanDispatch(state, candidate_write);
+}
+
 inline bool gdsFifoReserve(GdsFifoDispatchState& state, bool write) {
     if (!gdsFifoFrontCanDispatch(state, write)) return false;
     if (write) {

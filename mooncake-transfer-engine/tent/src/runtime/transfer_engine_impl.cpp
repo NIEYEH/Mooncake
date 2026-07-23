@@ -333,14 +333,23 @@ Status TransferEngineImpl::construct() {
     hostname_ = conf_->get("rpc_server_hostname", "");
     local_segment_name_ = conf_->get("local_segment_name", "");
     CHECK_STATUS(getRpcServerPortFromConfig(*conf_, 0, port_));
-    merge_requests_ = conf_->get("merge_requests", true);
+    const bool gds_enabled = conf_->get("transports/gds/enable", false);
+    // GDS partial/error completion is currently mapped at logical-owner
+    // granularity. Keep original keys as owners until executable physical
+    // merge carries an exact subrange completion map.
+    merge_requests_ = conf_->get("merge_requests", !gds_enabled);
+    if (gds_enabled && merge_requests_) {
+        LOG(WARNING)
+            << "Disabling generic request merging for GDS because exact "
+               "partial/error subrange mapping is not available";
+        merge_requests_ = false;
+    }
     max_failover_attempts_ = conf_->get("max_failover_attempts", 3);
     enable_auto_failover_on_poll_ =
         conf_->get("enable_auto_failover_on_poll", true);
     enable_progress_worker_ = conf_->get("enable_progress_worker", false);
     runtime_queue_config_.enabled = conf_->get("enable_runtime_queue", false);
     if (runtime_queue_config_.enabled) enable_progress_worker_ = true;
-    const bool gds_enabled = conf_->get("transports/gds/enable", false);
     const size_t default_max_outstanding_owners = gds_enabled ? 64UL : 1024UL;
     const size_t default_max_outstanding_bytes =
         gds_enabled ? (256UL << 20) : (1UL << 30);
@@ -591,6 +600,7 @@ Status TransferEngineImpl::construct() {
                   << runtime_queue_config_.limits.max_outstanding_bytes
                   << ", progress_fallback_interval_us="
                   << runtime_queue_config_.progress_fallback_interval.count()
+                  << ", merge_requests=" << merge_requests_
                   << ", gds_enabled=" << gds_enabled
                   << ", gds_adaptive_concurrency="
                   << conf_->get(
@@ -2772,7 +2782,54 @@ Status TransferEngineImpl::dispatchQueuedOwners(
         }
 
         auto status = transport->submitTransferTasks(sub_batch, group.requests);
+        const bool request_specific_gds_error =
+            status.IsInvalidArgument() ||
+            status.IsAddressNotRegistered() ||
+            status.IsDeviceNotFound() ||
+            status.IsNeedsRefreshCache();
+        if (!status.ok() && group.type == GDS &&
+            request_specific_gds_error &&
+            group.requests.size() > 1) {
+            // GDS validates every request before mutating its sub-batch. Retry
+            // a rejected dequeue segment one owner at a time so a stale
+            // mapping or registration affects only the corresponding key.
+            // This is error isolation, not a fast-path retry policy.
+            remember_error(status);
+            LOG(WARNING)
+                << "GDS operation segment rejected; isolating "
+                   "request-specific failure across "
+                << group.requests.size() << " owners: "
+                << status.ToString();
+            for (size_t index = 0; index < group.owner_ids.size(); ++index) {
+                const auto owner_id = group.owner_ids[index];
+                auto queued_it = queued_owners_.find(owner_id);
+                if (queued_it == queued_owners_.end()) {
+                    remember_error(Status::InternalError(
+                        "queued owner disappeared during GDS isolation"
+                        LOC_MARK));
+                    auto complete_status =
+                        runtime_queue_->complete(owner_id, 0, FAILED);
+                    remember_error(complete_status);
+                    if (complete_status.ok()) updateRuntimeQueueMetrics();
+                    continue;
+                }
+                auto& task = queued_it->second.batch->task_list[
+                    queued_it->second.owner_task_id];
+                task.sub_task_id = sub_batch->size();
+                auto owner_status = transport->submitTransferTasks(
+                    sub_batch, {group.requests[index]});
+                if (!owner_status.ok()) {
+                    remember_error(owner_status);
+                    task.type = UNSPEC;
+                    remember_error(finishQueuedOwner(owner_id, 0, FAILED));
+                    continue;
+                }
+                remember_error(markQueuedOwnerSubmitted(owner_id));
+            }
+            continue;
+        }
         if (!status.ok()) {
+            remember_error(status);
             fail_group();
             continue;
         }
