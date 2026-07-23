@@ -68,7 +68,6 @@ struct GdsIoBatch {
     std::vector<CUfileIOEvents_t> events;
     size_t consecutive_poll_errors{0};
     bool capacity_filled{false};
-    size_t split_retry_limit{0};
 };
 
 struct GdsSubBatch : public Transport::SubBatch {
@@ -124,8 +123,7 @@ class GdsTransport : public Transport {
     Status resolveIoBuffer(const Request& request, void*& io_base,
                            size_t& io_offset, int& device_id);
 
-    Status acquireBatchHandle(int device_id, size_t required_depth,
-                              BatchHandle*& handle);
+    Status acquireBatchHandle(int device_id, BatchHandle*& handle);
 
     void releaseBatchHandle(BatchHandle* handle);
 

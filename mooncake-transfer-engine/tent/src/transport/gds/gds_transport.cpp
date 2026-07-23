@@ -510,19 +510,14 @@ Status GdsTransport::resolveIoBuffer(const Request& request, void*& io_base,
         "GDS CUDA request is outside a cuFile-registered buffer" LOC_MARK);
 }
 
-Status GdsTransport::acquireBatchHandle(int device_id, size_t required_depth,
-                                        BatchHandle*& handle) {
+Status GdsTransport::acquireBatchHandle(int device_id, BatchHandle*& handle) {
     handle = nullptr;
-    if (required_depth == 0 || required_depth > io_batch_depth_) {
-        return Status::InvalidArgument(
-            "Invalid GDS batch handle depth" LOC_MARK);
-    }
     {
         std::lock_guard<std::mutex> lock(handle_pool_lock_);
         auto it = std::find_if(
             handle_pool_.begin(), handle_pool_.end(),
-            [required_depth, device_id](const BatchHandle* handle) {
-                return handle->max_nr == static_cast<int>(required_depth) &&
+            [this, device_id](const BatchHandle* handle) {
+                return handle->max_nr == static_cast<int>(io_batch_depth_) &&
                        handle->device_id == device_id;
             });
         if (it != handle_pool_.end()) {
@@ -534,7 +529,7 @@ Status GdsTransport::acquireBatchHandle(int device_id, size_t required_depth,
 
     handle = new BatchHandle{
         .handle = nullptr,
-        .max_nr = static_cast<int>(required_depth),
+        .max_nr = static_cast<int>(io_batch_depth_),
         .device_id = device_id,
     };
     auto setup_result =
@@ -544,7 +539,7 @@ Status GdsTransport::acquireBatchHandle(int device_id, size_t required_depth,
         LOG(ERROR) << "Failed to setup GDS batch IO: code="
                    << setup_result.err << ", cuda_error="
                    << setup_result.cu_err << ", device_id=" << device_id
-                   << ", batch_depth=" << required_depth;
+                   << ", batch_depth=" << io_batch_depth_;
         delete handle;
         handle = nullptr;
         return Status::InternalError(
@@ -645,7 +640,6 @@ Status GdsTransport::dispatchPendingIoLocked() {
         io_batch->batch_handle = nullptr;
         io_batch->device_id = device_id;
         io_batch->capacity_filled = capacity_filled;
-        io_batch->split_retry_limit = split_depth;
         io_batch->params.reserve(io_count);
         io_batch->refs.reserve(io_count);
         io_batch->events.resize(io_count);
@@ -685,15 +679,8 @@ Status GdsTransport::dispatchPendingIoLocked() {
         // leaf where no further split is possible.
         const size_t submit_attempts =
             io_batch->params.size() > 1 ? 1 : submit_retry_count_ + 1;
-        // Keep the handle allocation proportional to the physical batch. In
-        // particular, a WRITE batch capped at 32 entries should not continue
-        // setting up a 64-entry driver queue. Power-of-two capacities retain
-        // useful handle reuse for underfilled batches and split retries.
-        size_t handle_depth = 1;
-        while (handle_depth < io_batch->params.size()) handle_depth <<= 1;
         for (size_t attempt = 0; attempt < submit_attempts; ++attempt) {
-            status = acquireBatchHandle(device_id, handle_depth,
-                                        io_batch->batch_handle);
+            status = acquireBatchHandle(device_id, io_batch->batch_handle);
             if (!status.ok()) {
                 LOG(ERROR) << "Failed to acquire GDS batch handle: "
                            << status.ToString();
@@ -716,24 +703,6 @@ Status GdsTransport::dispatchPendingIoLocked() {
                 size_t physical_bytes = 0;
                 for (const auto& param : io_batch->params)
                     physical_bytes += param.u.batch.size;
-                // Once a split retry succeeds at its full retry depth, retain
-                // the proven-safe entry limit for later batches. Otherwise a
-                // sustained kv_both write stream would rediscover the same
-                // driver limit and pay for one rejected submission per group.
-                if (io_batch->split_retry_limit != 0 &&
-                    io_batch->params.size() ==
-                        io_batch->split_retry_limit) {
-                    auto& adaptive_depth =
-                        opcode == CUFILE_WRITE ? write_batch_depth_
-                                               : read_batch_depth_;
-                    if (io_batch->params.size() < adaptive_depth) {
-                        adaptive_depth = io_batch->params.size();
-                        LOG(WARNING)
-                            << "GDS learned a smaller safe batch depth: opcode="
-                            << (opcode == CUFILE_WRITE ? "WRITE" : "READ")
-                            << ", effective_depth=" << adaptive_depth;
-                    }
-                }
                 TentMetrics::instance().recordGdsPhysicalBatch(
                     io_batch->params.size(), physical_bytes, submit_seconds,
                     !io_batch->capacity_filled);
@@ -743,6 +712,7 @@ Status GdsTransport::dispatchPendingIoLocked() {
                     << ", physical_bytes=" << physical_bytes
                     << ", opcode="
                     << (opcode == CUFILE_WRITE ? "WRITE" : "READ")
+                    << ", handle_capacity=" << io_batch_depth_
                     << ", queued_ios_after_dispatch=" << pending_ios_.size()
                     << ", inflight_batches_after_dispatch="
                     << (inflight_io_batches_.size() + 1);
@@ -761,6 +731,7 @@ Status GdsTransport::dispatchPendingIoLocked() {
                          << ", io_bytes=" << io_bytes
                          << ", opcode="
                          << (opcode == CUFILE_WRITE ? "WRITE" : "READ")
+                         << ", handle_capacity=" << io_batch_depth_
                          << ", cuFile_error=" << last_submit_result.err
                          << ", cuda_error=" << last_submit_result.cu_err;
             if (attempt + 1 < submit_attempts) {
