@@ -317,6 +317,31 @@ void testRetiredOperationReleasesReservationHistory() {
             .ok());
 }
 
+void testWriteBoostUsesPromotionDemotionAndCooldownHysteresis() {
+    GdsWriteBoostController controller({1, 2, 3, 5, 10});
+    EXPECT_EQ(controller.update(true, false),
+              GdsWriteBoostAction::None);
+    EXPECT_EQ(controller.update(true, false),
+              GdsWriteBoostAction::None);
+    EXPECT_EQ(controller.update(true, false),
+              GdsWriteBoostAction::Promote);
+    EXPECT_EQ(controller.currentTokens(), 2u);
+
+    EXPECT_EQ(controller.update(false, true),
+              GdsWriteBoostAction::Demote);
+    EXPECT_EQ(controller.currentTokens(), 1u);
+    for (size_t window = 0; window < 10; ++window) {
+        EXPECT_EQ(controller.update(true, false),
+                  GdsWriteBoostAction::None);
+    }
+    EXPECT_EQ(controller.update(true, false),
+              GdsWriteBoostAction::None);
+    EXPECT_EQ(controller.update(true, false),
+              GdsWriteBoostAction::None);
+    EXPECT_EQ(controller.update(true, false),
+              GdsWriteBoostAction::Promote);
+}
+
 }  // namespace
 }  // namespace mooncake::tent
 
@@ -333,6 +358,7 @@ int main() {
     testFixedModeReservesOneContendedWriteToken();
     testGdsSegmentStopsAtFirstRequestOrByteLimit();
     testRetiredOperationReleasesReservationHistory();
+    testWriteBoostUsesPromotionDemotionAndCooldownHysteresis();
     std::cout << "gds_operation_scheduler_test: PASS" << std::endl;
     return 0;
 }

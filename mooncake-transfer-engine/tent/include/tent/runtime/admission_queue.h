@@ -124,6 +124,8 @@ class LocalTransferAdmissionQueue {
 
     GdsOperationSchedulerSnapshot gdsSchedulerSnapshot() const;
 
+    Status setGdsContendedWriteTokens(size_t tokens);
+
    private:
     enum class QueueState {
         Queued,

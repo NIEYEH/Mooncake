@@ -326,6 +326,11 @@ class TransferEngineImpl {
         size_t max_dispatch_read_owners{0};
         size_t max_dispatch_write_owners{0};
         GdsOperationSchedulerConfig gds_scheduler{};
+        bool gds_write_boost_enabled{false};
+        GdsWriteBoostConfig gds_write_boost{};
+        size_t gds_write_boost_backlog_threshold{16};
+        double gds_write_boost_queue_p99_us{50000.0};
+        double gds_write_boost_read_p99_us{75000.0};
         size_t gds_segment_max_requests{8};
         size_t gds_segment_max_bytes{16UL << 20};
         std::chrono::microseconds progress_fallback_interval{50000};
@@ -414,6 +419,7 @@ class TransferEngineImpl {
     std::array<RuntimeQueueSummaryDirection, 2> runtime_queue_summary_;
     std::unordered_map<uint64_t, RuntimeOperationTimeline>
         runtime_operation_timelines_;
+    GdsWriteBoostController gds_write_boost_controller_;
     std::chrono::steady_clock::time_point
         runtime_queue_summary_started_at_{};
 

@@ -39,6 +39,81 @@ enum class GdsSchedulerMode : uint8_t {
     WeightedFair = 1,
 };
 
+enum class GdsWriteBoostAction : uint8_t {
+    None = 0,
+    Promote = 1,
+    Demote = 2,
+};
+
+struct GdsWriteBoostConfig {
+    size_t normal_tokens{1};
+    size_t boosted_tokens{2};
+    size_t promote_windows{3};
+    size_t demote_windows{5};
+    size_t cooldown_windows{10};
+};
+
+class GdsWriteBoostController {
+   public:
+    explicit GdsWriteBoostController(
+        GdsWriteBoostConfig config = {})
+        : config_(config), current_tokens_(config.normal_tokens) {}
+
+    GdsWriteBoostAction update(bool sustained_write_pressure,
+                               bool read_latency_degraded) {
+        if (cooldown_remaining_ != 0) {
+            --cooldown_remaining_;
+            pressure_windows_ = 0;
+            healthy_windows_ = 0;
+            return GdsWriteBoostAction::None;
+        }
+        if (current_tokens_ == config_.normal_tokens) {
+            healthy_windows_ = 0;
+            if (!sustained_write_pressure) {
+                pressure_windows_ = 0;
+                return GdsWriteBoostAction::None;
+            }
+            ++pressure_windows_;
+            if (pressure_windows_ < config_.promote_windows) {
+                return GdsWriteBoostAction::None;
+            }
+            pressure_windows_ = 0;
+            current_tokens_ = config_.boosted_tokens;
+            return GdsWriteBoostAction::Promote;
+        }
+        pressure_windows_ = 0;
+        if (read_latency_degraded) {
+            return demote();
+        }
+        if (sustained_write_pressure) {
+            healthy_windows_ = 0;
+            return GdsWriteBoostAction::None;
+        }
+        ++healthy_windows_;
+        if (healthy_windows_ < config_.demote_windows) {
+            return GdsWriteBoostAction::None;
+        }
+        return demote();
+    }
+
+    size_t currentTokens() const { return current_tokens_; }
+
+   private:
+    GdsWriteBoostAction demote() {
+        current_tokens_ = config_.normal_tokens;
+        pressure_windows_ = 0;
+        healthy_windows_ = 0;
+        cooldown_remaining_ = config_.cooldown_windows;
+        return GdsWriteBoostAction::Demote;
+    }
+
+    GdsWriteBoostConfig config_;
+    size_t current_tokens_{1};
+    size_t pressure_windows_{0};
+    size_t healthy_windows_{0};
+    size_t cooldown_remaining_{0};
+};
+
 struct GdsOperationSchedulerConfig {
     GdsSchedulerMode mode{GdsSchedulerMode::Fixed};
     size_t shared_tokens{16};
@@ -129,6 +204,8 @@ class GdsOperationScheduler {
 
     Status retireOperation(uint64_t operation_owner_id);
 
+    Status setContendedWriteTokens(size_t tokens);
+
     GdsOperationSchedulerSnapshot snapshot() const;
 
    private:
@@ -194,6 +271,7 @@ class GdsOperationScheduler {
     void resetIdleDirection(GdsDirection direction);
 
     GdsOperationSchedulerConfig config_;
+    size_t contended_write_tokens_{1};
     Status config_status_;
     std::deque<GdsDispatchEntry> queued_;
     std::unordered_set<uint64_t> known_owner_ids_;

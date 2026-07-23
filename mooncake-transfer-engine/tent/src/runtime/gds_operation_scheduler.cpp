@@ -54,7 +54,9 @@ void gdsDispatchSegmentAppend(GdsDispatchSegment& segment,
 
 GdsOperationScheduler::GdsOperationScheduler(
     GdsOperationSchedulerConfig config)
-    : config_(config), config_status_(validateConfig()) {}
+    : config_(config),
+      contended_write_tokens_(config.contended_write_tokens),
+      config_status_(validateConfig()) {}
 
 size_t GdsOperationScheduler::index(GdsDirection direction) {
     return direction == GdsDirection::Read ? 0 : 1;
@@ -152,7 +154,7 @@ size_t GdsOperationScheduler::directionTokenLimit(
         }
         return config_.read_standalone_tokens;
     }
-    return contended ? config_.contended_write_tokens
+    return contended ? contended_write_tokens_
                      : config_.write_standalone_tokens;
 }
 
@@ -617,6 +619,18 @@ Status GdsOperationScheduler::retireOperation(
     }
     operations_.erase(operation_it);
     cleanupOperationOrder();
+    return Status::OK();
+}
+
+Status GdsOperationScheduler::setContendedWriteTokens(size_t tokens) {
+    if (tokens == 0 ||
+        tokens > config_.write_standalone_tokens ||
+        tokens > config_.shared_tokens) {
+        return Status::InvalidArgument(
+            "GDS contended WRITE tokens exceed configured limits"
+            LOC_MARK);
+    }
+    contended_write_tokens_ = tokens;
     return Status::OK();
 }
 

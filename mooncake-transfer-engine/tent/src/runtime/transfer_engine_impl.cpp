@@ -435,6 +435,46 @@ Status TransferEngineImpl::construct() {
         conf_->get("runtime_queue/gds_secondary_segment_requests", 8UL);
     runtime_queue_config_.gds_scheduler.secondary_segment_bytes =
         conf_->get("runtime_queue/gds_secondary_segment_bytes", 16UL << 20);
+    runtime_queue_config_.gds_write_boost_enabled = conf_->get(
+        "runtime_queue/gds_write_boost_enabled",
+        gds_scheduler_mode == GdsSchedulerMode::WeightedFair);
+    runtime_queue_config_.gds_write_boost.normal_tokens =
+        runtime_queue_config_.gds_scheduler.contended_write_tokens;
+    runtime_queue_config_.gds_write_boost.boosted_tokens = conf_->get(
+        "runtime_queue/gds_write_boost_tokens",
+        std::min<size_t>(
+            2,
+            runtime_queue_config_.gds_scheduler.write_standalone_tokens));
+    runtime_queue_config_.gds_write_boost.promote_windows = conf_->get(
+        "runtime_queue/gds_write_boost_promote_windows", 3UL);
+    runtime_queue_config_.gds_write_boost.demote_windows = conf_->get(
+        "runtime_queue/gds_write_boost_demote_windows", 5UL);
+    runtime_queue_config_.gds_write_boost.cooldown_windows = conf_->get(
+        "runtime_queue/gds_write_boost_cooldown_windows", 10UL);
+    runtime_queue_config_.gds_write_boost_backlog_threshold = conf_->get(
+        "runtime_queue/gds_write_boost_backlog_threshold", 16UL);
+    runtime_queue_config_.gds_write_boost_queue_p99_us =
+        static_cast<double>(conf_->get(
+            "runtime_queue/gds_write_boost_queue_p99_us", 50000UL));
+    runtime_queue_config_.gds_write_boost_read_p99_us =
+        static_cast<double>(conf_->get(
+            "runtime_queue/gds_write_boost_read_p99_us", 75000UL));
+    if (runtime_queue_config_.gds_write_boost_enabled &&
+        (runtime_queue_config_.gds_write_boost.boosted_tokens <=
+             runtime_queue_config_.gds_write_boost.normal_tokens ||
+         runtime_queue_config_.gds_write_boost.boosted_tokens >
+             runtime_queue_config_.gds_scheduler
+                 .write_standalone_tokens ||
+         runtime_queue_config_.gds_write_boost.promote_windows == 0 ||
+         runtime_queue_config_.gds_write_boost.demote_windows == 0 ||
+         runtime_queue_config_.gds_write_boost.cooldown_windows == 0 ||
+         runtime_queue_config_.gds_write_boost_backlog_threshold == 0)) {
+        return Status::InvalidArgument(
+            "invalid GDS WRITE boost hysteresis configuration"
+            LOC_MARK);
+    }
+    gds_write_boost_controller_ = GdsWriteBoostController(
+        runtime_queue_config_.gds_write_boost);
     runtime_queue_config_.gds_segment_max_requests =
         conf_->get("runtime_queue/gds_segment_max_requests", 8UL);
     runtime_queue_config_.gds_segment_max_bytes =
@@ -518,6 +558,10 @@ Status TransferEngineImpl::construct() {
                   << runtime_queue_config_.gds_segment_max_requests
                   << ", gds_segment_max_bytes="
                   << runtime_queue_config_.gds_segment_max_bytes
+                  << ", gds_write_boost_enabled="
+                  << runtime_queue_config_.gds_write_boost_enabled
+                  << ", gds_write_boost_tokens="
+                  << runtime_queue_config_.gds_write_boost.boosted_tokens
                   << ", max_outstanding_owners="
                   << runtime_queue_config_.limits.max_outstanding_owners
                   << ", max_outstanding_bytes="
@@ -2236,6 +2280,50 @@ void TransferEngineImpl::maybeLogRuntimeQueueSummary(
     if (runtime_queue_) {
         scheduler_snapshot = runtime_queue_->gdsSchedulerSnapshot();
     }
+    const double read_total_p99_us =
+        runtimeQueueNearestRankP99(read.total_latency_us);
+    const double write_queue_p99_us =
+        runtimeQueueNearestRankP99(write.queue_wait_us);
+    if (runtime_queue_config_.gds_write_boost_enabled) {
+        const size_t queued_write_owners = saturatingAdd(
+            admission_waiting_gds_writes_,
+            scheduler_snapshot.queued_entries[1]);
+        const bool sustained_write_pressure =
+            queued_write_owners >=
+                runtime_queue_config_
+                    .gds_write_boost_backlog_threshold ||
+            write_queue_p99_us >=
+                runtime_queue_config_
+                    .gds_write_boost_queue_p99_us;
+        const bool read_latency_degraded =
+            read_total_p99_us >=
+            runtime_queue_config_.gds_write_boost_read_p99_us;
+        const auto boost_action = gds_write_boost_controller_.update(
+            sustained_write_pressure, read_latency_degraded);
+        if (boost_action != GdsWriteBoostAction::None) {
+            auto update_status =
+                runtime_queue_->setGdsContendedWriteTokens(
+                    gds_write_boost_controller_.currentTokens());
+            if (!update_status.ok()) {
+                LOG(ERROR) << "Failed to apply GDS WRITE boost: "
+                           << update_status.ToString();
+            } else {
+                LOG(INFO)
+                    << "GDS WRITE boost hysteresis "
+                    << (boost_action == GdsWriteBoostAction::Promote
+                            ? "promoted"
+                            : "demoted")
+                    << ": contended_write_tokens="
+                    << gds_write_boost_controller_.currentTokens()
+                    << ", queued_write_owners="
+                    << queued_write_owners
+                    << ", write_queue_p99_us="
+                    << write_queue_p99_us
+                    << ", read_total_p99_us="
+                    << read_total_p99_us;
+            }
+        }
+    }
     const double elapsed_seconds =
         std::chrono::duration<double>(elapsed).count();
     LOG(INFO)
@@ -2269,7 +2357,7 @@ void TransferEngineImpl::maybeLogRuntimeQueueSummary(
         << ", queue_wait_p99_us="
         << runtimeQueueNearestRankP99(read.queue_wait_us)
         << ", total_p99_us="
-        << runtimeQueueNearestRankP99(read.total_latency_us)
+        << read_total_p99_us
         << "}, WRITE{dispatches=" << write.dispatches
         << ", completions=" << write.completions
         << ", failures=" << write.failures
@@ -2278,7 +2366,7 @@ void TransferEngineImpl::maybeLogRuntimeQueueSummary(
         << static_cast<double>(write.bytes) /
                (1024.0 * 1024.0 * elapsed_seconds)
         << ", queue_wait_p99_us="
-        << runtimeQueueNearestRankP99(write.queue_wait_us)
+        << write_queue_p99_us
         << ", total_p99_us="
         << runtimeQueueNearestRankP99(write.total_latency_us)
         << "}}";

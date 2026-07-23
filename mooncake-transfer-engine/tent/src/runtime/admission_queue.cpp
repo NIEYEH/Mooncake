@@ -534,5 +534,10 @@ LocalTransferAdmissionQueue::gdsSchedulerSnapshot() const {
     return gds_scheduler_.snapshot();
 }
 
+Status LocalTransferAdmissionQueue::setGdsContendedWriteTokens(
+    size_t tokens) {
+    return gds_scheduler_.setContendedWriteTokens(tokens);
+}
+
 }  // namespace tent
 }  // namespace mooncake
