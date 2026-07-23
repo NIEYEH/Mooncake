@@ -77,6 +77,7 @@ Two checked-in example configurations define reproducible modes.
 | READ physical inflight | 16 |
 | WRITE worker threads | 4 |
 | WRITE physical inflight | 1 |
+| waiting high-watermark | 1024 owners / 2 GiB |
 | cuFile Batch | disabled |
 | Async | disabled |
 | merge mode | `shadow` (statistics only) |
@@ -121,22 +122,28 @@ request is split into safe physical IOs; it does not bypass physical limits.
 4. Runtime chooses a direction using completed-byte WDRR when both directions
    have backlog.
 5. Runtime chooses an eligible active operation in that direction.
-6. GDS produces an immutable, side-effect-free physical plan summary for the
-   candidate segment. Runtime reserves its physical bytes and tokens.
+6. GDS produces a side-effect-free physical plan summary for the candidate
+   owner. Runtime records total physical IOs, reserves the full byte range,
+   and charges only the maximum concurrent physical tokens allowed by the
+   active direction/shared window.
 7. Runtime builds one bounded operation segment and submits the selected plan
    to GDS. A primary READ operation may have multiple bounded segments inflight
    while it remains inside its operation token and byte windows.
 8. GDS expands the selected group into safe physical IOs, consumes shared
    tokens, and executes synchronous single-entry cuFile calls.
 9. GDS reports physical completion bytes and per-subrange status.
-10. Runtime releases reservations, updates completed-byte service debt, advances
-   request/key state, and selects the next segment.
+10. Runtime releases reservations, updates completed-byte service debt,
+    advances request/key state, and selects the next segment. A failed
+    runtime-queued GDS attempt terminates without automatic cross-transport
+    failover until fallback can build a new route-specific reservation.
 11. Store resolves individual key results and the operation result.
 
-The physical plan summary is not a second scheduling decision. It contains the
-plan identifier, physical IO count, planned bytes, split boundaries, and
-subrange mapping only. GDS must consume that exact plan or reject it before any
-IO starts; it may not silently expand beyond the runtime reservation.
+The physical plan summary is not a second scheduling decision. The current
+implementation carries deterministic physical IO count and byte totals, pins
+the route chosen during admission, and revalidates the same request/buffer
+properties before GDS expands it. A future executable merge path must add an
+immutable plan identifier, split boundaries, and subrange mapping and must
+consume that exact plan or reject it before any IO starts.
 
 The runtime must never submit all 192 keys merely because they share an
 operation. Global tokens, bounded segments, and per-operation byte/token
@@ -150,8 +157,11 @@ configured standalone maximum.
 
 - Service accounting uses actual physical `transferred_bytes`, not request
   count, logical key count, or submitted bytes.
-- Runtime maintains `outstanding_reserved_bytes` and
-  `outstanding_reserved_tokens` per direction as well as globally.
+- Runtime maintains `outstanding_reserved_bytes` and concurrent
+  `outstanding_reserved_tokens` per direction as well as globally. An owner
+  with more physical sub-IOs than the active token window reserves the window,
+  not every sub-IO atomically; GDS streams its remaining sub-IOs through that
+  window.
 - A direction's dispatch-time spendable deficit is
   `deficit_bytes - outstanding_reserved_bytes`. Runtime must use this value,
   not completed service alone, for every scheduling decision.
@@ -323,7 +333,10 @@ shows that this RPC is not a pure renewal operation:
 - checked-in Master configurations use a 5-second default TTL.
 
 Consequently, periodic `BatchGetReplicaList` renewal is disabled in baseline
-and weighted-fair modes. The first implementation uses a lease budget:
+and weighted-fair modes. TENT does not currently receive the absolute lease
+deadline in each transfer request. Before enabling a deadline-aware production
+mode, the upstream contract must provide that deadline and implement this
+lease-budget gate:
 
 1. Track the absolute lease deadline returned by the initial query for every
    unfinished READ key.
@@ -361,9 +374,11 @@ The experiment may be enabled by default only after all validation gates pass:
   treated as user Get traffic. If they cannot be separated, the experiment
   fails and a dedicated renewal RPC is required.
 
-Until this gate passes, the scheduler must meet the five-second lease budget by
-strict backpressure and operation-focused completion, or fail affected keys
-before using expired metadata.
+Until this gate passes, the 1024-owner / 2-GiB waiting high-watermark and
+operation focus limit exposure, but they are not proof of lease safety. The
+target workload must complete within the five-second lease budget; otherwise
+the upstream integration must propagate lease deadlines so affected keys can
+be refused before expired metadata is used.
 
 ## Merge planner and completion mapping
 
@@ -527,9 +542,11 @@ together.
 ## Implementation status (2026-07-23)
 
 The fixed baseline and opt-in weighted-fair scheduler are implemented. Runtime
-admission reserves planned physical tokens and bytes, actual completed bytes
-settle WDRR service debt, idle credit is bounded, and the primary READ
-operation can fill its window through multiple bounded segments before a
+admission records total planned physical IOs and reserves a bounded concurrent
+token charge plus bytes. This lets a multi-physical-IO owner progress through a
+one-token WRITE baseline without over-admitting the device. Actual completed
+bytes settle WDRR service debt, idle credit is bounded, and the primary READ
+operation can fill its window through multiple bounded segments before one
 secondary operation is considered. WRITE pressure promotion uses explicit
 promotion, demotion, READ-P99 protection, and cooldown windows.
 
@@ -543,8 +560,12 @@ config/executable identity.
 
 Indirect lease refresh is intentionally not implemented in the production
 path. Master expiry/group behavior tests and the external load-probe evaluator
-define the acceptance gate. Async likewise remains disabled until a
-startup-only independent probe is implemented and validated.
+define the acceptance gate. Absolute lease deadlines are not present in the
+TENT request contract, so deadline-aware refusal remains an upstream
+integration requirement. Scheduler cancellation is tested internally, but the
+public TransferEngine API does not expose operation cancellation. Async
+likewise remains disabled until a startup-only independent probe is
+implemented and validated.
 
 Host-independent scheduler, admission, FIFO, operation-timeline, collector,
 lease-probe, and warmup tests are available. CUDA/cuFile, NVMe-oF, Master load,

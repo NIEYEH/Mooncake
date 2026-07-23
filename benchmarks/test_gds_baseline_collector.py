@@ -50,12 +50,23 @@ def test_missing_gpu_and_block_tools_are_explicitly_unavailable(tmp_path):
             block_device="nvme9n9",
             endpoints={},
         )
-    assert sample["gpu"] == {
-        "available": False,
-        "reason": "nvidia-smi not found",
-    }
+    assert sample["gpu"]["available"] is False
+    assert sample["gpu"]["reason"] == "nvidia-smi not found"
     assert sample["nvme"]["available"] is False
     assert "zero" not in sample["nvme"].get("reason", "").lower()
+    assert sample["finished_monotonic_ns"] >= sample["monotonic_ns"]
+    for source in (
+        "gpu",
+        "nvme",
+        "vllm",
+        "runtime",
+        "kv_restore",
+        "inference",
+    ):
+        assert (
+            sample[source]["source_finished_monotonic_ns"]
+            >= sample[source]["source_started_monotonic_ns"]
+        )
 
 
 def test_header_fingerprints_exact_config_and_binary(tmp_path):

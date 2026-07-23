@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import hashlib
 import json
 import shutil
@@ -11,7 +12,7 @@ import subprocess
 import time
 import urllib.request
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 
 def _sha256(path: Path) -> str:
@@ -113,6 +114,16 @@ def _collect_endpoint(url: str | None) -> dict[str, Any]:
         return {"available": False, "reason": f"endpoint failed: {exc}"}
 
 
+def _timed_collect(
+    collector: Callable[[], dict[str, Any]],
+) -> dict[str, Any]:
+    started_ns = time.monotonic_ns()
+    result = collector()
+    result["source_started_monotonic_ns"] = started_ns
+    result["source_finished_monotonic_ns"] = time.monotonic_ns()
+    return result
+
+
 def collect_sample(
     block_device: str | None,
     endpoints: dict[str, str],
@@ -123,11 +134,24 @@ def collect_sample(
         "type": "sample",
         "wall_time_ns": time.time_ns(),
         "monotonic_ns": time.monotonic_ns(),
-        "gpu": _collect_gpu(),
-        "nvme": _collect_nvme(block_device),
+    }
+    collectors: dict[str, Callable[[], dict[str, Any]]] = {
+        "gpu": _collect_gpu,
+        "nvme": lambda: _collect_nvme(block_device),
     }
     for source in ("vllm", "runtime", "kv_restore", "inference"):
-        sample[source] = _collect_endpoint(endpoints.get(source))
+        url = endpoints.get(source)
+        collectors[source] = lambda url=url: _collect_endpoint(url)
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=len(collectors)
+    ) as executor:
+        futures = {
+            source: executor.submit(_timed_collect, collector)
+            for source, collector in collectors.items()
+        }
+        for source, future in futures.items():
+            sample[source] = future.result()
+    sample["finished_monotonic_ns"] = time.monotonic_ns()
     return sample
 
 

@@ -697,6 +697,95 @@ TEST(RuntimeQueueDispatch, GdsWindowReservesPhysicalIosNotLogicalOwners) {
     EXPECT_TRUE(engine.unregisterLocalMemory(buffer.data(), buffer.size()).ok());
 }
 
+TEST(RuntimeQueueDispatch,
+     MultiPhysicalGdsWriteMakesProgressThroughOneTokenWindow) {
+    constexpr size_t kPhysicalIos = 3;
+    constexpr size_t kReqLen = 3 * 4096;
+    auto cfg = makeRuntimeQueueConfig(1, 1UL << 20);
+    cfg->set("runtime_queue/max_dispatch_read_owners", 1UL);
+    cfg->set("runtime_queue/max_dispatch_write_owners", 1UL);
+    cfg->set("runtime_queue/gds_shared_physical_tokens", 1UL);
+    cfg->set("runtime_queue/gds_read_standalone_tokens", 1UL);
+    cfg->set("runtime_queue/gds_write_standalone_tokens", 1UL);
+    cfg->set("runtime_queue/gds_primary_read_tokens", 1UL);
+    cfg->set("runtime_queue/progress_fallback_interval_us", 60000000UL);
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+
+    std::atomic<bool> complete{false};
+    auto fake_gds = std::make_shared<FakeTransport>(
+        GDS, [&complete](const Request& request, int) {
+            if (!complete.load()) {
+                return TransferStatus{TransferStatusEnum::PENDING, 0};
+            }
+            return TransferStatus{TransferStatusEnum::COMPLETED,
+                                  request.length};
+        });
+    fake_gds->planned_physical_ios.store(kPhysicalIos);
+    installFakeGds(engine, fake_gds);
+
+    std::vector<uint8_t> buffer(kReqLen, 0x47);
+    ASSERT_TRUE(engine.registerLocalMemory(buffer.data(), buffer.size()).ok());
+    BatchID batch = engine.allocateBatch(1);
+    ASSERT_NE(batch, (BatchID)0);
+
+    ASSERT_TRUE(
+        engine.submitTransfer(
+                  batch, {makeLocalGdsWrite(buffer.data(), kReqLen)})
+            .ok());
+    EXPECT_EQ(fake_gds->submit_calls.load(), 1);
+    EXPECT_EQ(fake_gds->submitted_writes.load(), 1u);
+
+    complete.store(true);
+    TransferStatus status{};
+    ASSERT_TRUE(engine.getTransferStatus(batch, 0, status).ok());
+    EXPECT_EQ(status.s, TransferStatusEnum::COMPLETED);
+    EXPECT_EQ(status.transferred_bytes, kReqLen);
+
+    EXPECT_TRUE(engine.freeBatch(batch).ok());
+    EXPECT_TRUE(engine.unregisterLocalMemory(buffer.data(), buffer.size()).ok());
+}
+
+TEST(RuntimeQueueDispatch,
+     FailedRuntimeQueuedGdsAttemptPreservesPartialBytes) {
+    constexpr size_t kReqLen = 3 * 4096;
+    constexpr size_t kPartialBytes = 4096;
+    auto cfg = makeRuntimeQueueConfig(1, 1UL << 20);
+    cfg->set("enable_auto_failover_on_poll", true);
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+
+    auto fake_gds = std::make_shared<FakeTransport>(
+        GDS, [](const Request&, int) {
+            return TransferStatus{TransferStatusEnum::FAILED,
+                                  kPartialBytes};
+        });
+    installFakeGds(engine, fake_gds);
+
+    std::vector<uint8_t> buffer(kReqLen, 0x48);
+    ASSERT_TRUE(engine.registerLocalMemory(buffer.data(), buffer.size()).ok());
+    BatchID batch = engine.allocateBatch(1);
+    ASSERT_NE(batch, (BatchID)0);
+
+    ASSERT_TRUE(
+        engine.submitTransfer(
+                  batch, {makeLocalGdsRead(buffer.data(), kReqLen)})
+            .ok());
+
+    TransferStatus status{};
+    ASSERT_TRUE(engine.getTransferStatus(batch, 0, status).ok());
+    EXPECT_EQ(status.s, TransferStatusEnum::FAILED);
+    EXPECT_EQ(status.transferred_bytes, kPartialBytes);
+    EXPECT_EQ(fake_gds->submit_calls.load(), 1);
+    status = {};
+    ASSERT_TRUE(engine.getTransferStatus(batch, 0, status).ok());
+    EXPECT_EQ(status.s, TransferStatusEnum::FAILED);
+    EXPECT_EQ(status.transferred_bytes, kPartialBytes);
+
+    EXPECT_TRUE(engine.freeBatch(batch).ok());
+    EXPECT_TRUE(engine.unregisterLocalMemory(buffer.data(), buffer.size()).ok());
+}
+
 TEST(RuntimeQueueDispatch, FailedGdsSubmitDoesNotStrandBulkPickedOwners) {
     constexpr size_t kRequestCount = 4;
     constexpr size_t kReqLen = 4096;

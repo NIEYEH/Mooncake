@@ -327,6 +327,7 @@ std::vector<QueueOwnerId> LocalTransferAdmissionQueue::pickForDispatch(
                 auto& owner = owner_it->second;
                 owner.state = QueueState::Dispatching;
                 owner.gds_reservation_id = reservation.id;
+                owner.gds_reservation_tokens = reservation.tokens;
                 picked.push_back(reservation.owner_id);
                 ++used_owners;
                 used_bytes += owner.request.length;
@@ -384,6 +385,11 @@ Status LocalTransferAdmissionQueue::complete(
     if (owner.state != QueueState::Dispatching) {
         return Status::InvalidEntry("queue owner is not dispatching" LOC_MARK);
     }
+    if (terminal_status == TransferStatusEnum::COMPLETED &&
+        actual_transferred_bytes != owner.request.length) {
+        return Status::InvalidArgument(
+            "completed queue owner has incomplete byte count" LOC_MARK);
+    }
     if (owner.transport == GDS) {
         if (owner.gds_reservation_id == 0) {
             return Status::InternalError(
@@ -393,6 +399,7 @@ Status LocalTransferAdmissionQueue::complete(
             owner.gds_reservation_id, actual_transferred_bytes,
             terminal_status));
         owner.gds_reservation_id = 0;
+        owner.gds_reservation_tokens = 0;
     } else if (actual_transferred_bytes > owner.request.length) {
         return Status::InvalidArgument(
             "completion exceeds queue owner bytes" LOC_MARK);
@@ -400,6 +407,7 @@ Status LocalTransferAdmissionQueue::complete(
 
     owner.state = QueueState::Terminal;
     owner.terminal_status = terminal_status;
+    owner.actual_transferred_bytes = actual_transferred_bytes;
     --outstanding_owners_;
     outstanding_bytes_ -= owner.request.length;
     if (owner.kind == QueueOwnerKind::User) {
@@ -473,7 +481,7 @@ Status LocalTransferAdmissionQueue::resolveOwner(uint64_t batch_token,
 
 Status LocalTransferAdmissionQueue::getPublicStatus(
     uint64_t batch_token, size_t public_task_id,
-    TransferStatusEnum& status) const {
+    TransferStatusEnum& status, size_t* actual_transferred_bytes) const {
     QueueOwnerId owner_id = 0;
     CHECK_STATUS(resolveOwner(batch_token, public_task_id, owner_id));
     auto owner_it = owners_.find(owner_id);
@@ -484,11 +492,34 @@ Status LocalTransferAdmissionQueue::getPublicStatus(
         case QueueState::Queued:
         case QueueState::Dispatching:
             status = TransferStatusEnum::PENDING;
+            if (actual_transferred_bytes) *actual_transferred_bytes = 0;
             break;
         case QueueState::Terminal:
             status = owner_it->second.terminal_status;
+            if (actual_transferred_bytes) {
+                *actual_transferred_bytes =
+                    owner_it->second.actual_transferred_bytes;
+            }
             break;
     }
+    return Status::OK();
+}
+
+Status LocalTransferAdmissionQueue::getGdsReservationTokens(
+    QueueOwnerId owner_id, size_t& tokens) const {
+    auto owner_it = owners_.find(owner_id);
+    if (owner_it == owners_.end()) {
+        return Status::InvalidEntry("queue owner not found" LOC_MARK);
+    }
+    const auto& owner = owner_it->second;
+    if (owner.transport != GDS ||
+        owner.state != QueueState::Dispatching ||
+        owner.gds_reservation_id == 0 ||
+        owner.gds_reservation_tokens == 0) {
+        return Status::InvalidEntry(
+            "GDS owner has no active dispatch reservation" LOC_MARK);
+    }
+    tokens = owner.gds_reservation_tokens;
     return Status::OK();
 }
 

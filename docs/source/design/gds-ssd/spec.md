@@ -20,12 +20,17 @@ counts as `unknown` until explicit correlation identifiers are available.
 - The runtime queue is the only direction and operation policy scheduler.
   GDS consumes runtime-selected work in FIFO order and enforces worker,
   direction, and shared-device token limits.
-- Admission reserves planned physical IO tokens and bytes before dispatch.
-  Completion releases the full reservation and charges WDRR using actual
-  completed physical bytes, including partial and failed completion handling.
+- Admission records the total planned physical IO count, but reserves only
+  the bounded concurrent token charge that the owner can use under the active
+  shared/direction window. It reserves the owner's full physical byte range.
+  Completion releases that reservation and charges WDRR using actual completed
+  physical bytes, including partial and failed completion handling.
 - One runtime segment contains at most 8 original requests or 16 MiB,
-  whichever limit would be reached first. A large operation remains grouped
-  by `batch_token`, but undispatched keys do not occupy the device window.
+  whichever limit would be reached first. A single logical request larger
+  than 16 MiB is submitted alone and split by GDS into bounded physical IOs;
+  no other request is appended to that segment. A large operation remains
+  grouped by `batch_token`, but undispatched keys do not occupy the device
+  window.
 - The scheduler focuses one primary READ operation. It activates a secondary
   READ operation only when the primary has no immediately dispatchable
   physical IO or has reached its 16-token/48-MiB operation window while a
@@ -48,6 +53,7 @@ Use `mooncake-transfer-engine/tent/config/tent-gds-baseline.json`:
 | shared physical tokens | 16 |
 | READ workers / inflight | 16 / 16 |
 | WRITE workers / inflight | 4 / 1 |
+| waiting high-watermark | 1024 owners / 2 GiB |
 | adaptive concurrency | disabled |
 | cuFile Batch / Async | disabled / disabled |
 | physical merge | shadow statistics only |
@@ -85,23 +91,33 @@ path.
 ## Backpressure and operation lifecycle
 
 The runtime admission queue bounds outstanding owners and bytes, then streams
-large 126/192-key operations through bounded segments. It must not reject an
-otherwise valid operation merely because all of its keys cannot enter the
-dispatch window at once.
+large 126/192-key operations through bounded segments. The checked-in waiting
+high-watermark is 1024 owners / 2 GiB: enough for three overlapping
+192-key, 2.25-MiB operations, but not an unbounded lease-holding queue. An
+operation is not rejected merely because all of its keys cannot enter the
+dispatch window at once; a submit beyond the waiting high-watermark receives
+explicit backpressure.
 
 An operation can wait, dispatch bounded work, drain inflight IO, and finish or
-fail. Cancellation prevents new dispatch. Already-running synchronous cuFile
-calls drain normally. Each physical result maps back to its original request;
-a key failure affects only mapped keys, and the operation terminal event is
-latched exactly once. A request failure does not disable the GDS transport.
+fail. The scheduler's cancellation state prevents new dispatch and lets
+already-running synchronous cuFile calls drain. The current public
+TransferEngine API does not expose operation cancellation; `freeBatch` remains
+a post-completion release API. Each physical result maps back to its original
+request, and a request failure does not disable the GDS transport.
 
 Reservations are reconciled exactly once:
 
-1. Reserve planned physical tokens and bytes before transport submission.
+1. Record total planned physical IOs, then reserve the concurrent physical
+   token charge and the full owner byte range before transport submission.
 2. On submission failure, release the reservation with zero completed bytes.
 3. On completion, release the entire reservation and record actual transferred
    bytes, even for a partial or error result.
 4. Reject duplicate or unknown completion instead of underflowing accounting.
+
+Runtime-queued GDS attempts do not automatically fail over to another
+transport. A fallback attempt would require a new route-specific physical plan
+and reservation; reusing the GDS reservation would mischarge partial bytes.
+Non-GDS runtime-queued transfers retain their existing failover behavior.
 
 ## Observability
 
@@ -144,6 +160,14 @@ loop. The RPC changes lease and metric state and can amplify group pinning.
 - zero refresh calls after operation terminal;
 - expiry no later than 1.25 lease TTL after the final refresh;
 - grouped refresh amplification no greater than 1.10.
+
+TENT currently does not receive an absolute Store lease deadline with each
+request, so it cannot truthfully implement a deadline-aware admission estimate.
+The smaller waiting high-watermark and operation focus reduce exposure but do
+not prove the five-second lease budget. Target-host acceptance must therefore
+show operation completion inside the configured Store lease TTL, or the
+upstream integration must propagate lease deadlines before this mode is
+enabled.
 
 ## Target-host acceptance
 

@@ -9,6 +9,7 @@
 #ifndef TENT_TRANSPORT_GDS_FIFO_DISPATCH_H_
 #define TENT_TRANSPORT_GDS_FIFO_DISPATCH_H_
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -40,6 +41,13 @@ inline GdsDirectIoOutcome gdsDirectIoOutcome(
         result > requested_bytes ? requested_bytes
                                  : static_cast<size_t>(result);
     return {transferred, result == requested_bytes};
+}
+
+inline size_t gdsFifoEffectiveWriteLimit(
+    size_t configured_limit, size_t contended_limit,
+    bool read_pressure) {
+    return read_pressure ? std::min(configured_limit, contended_limit)
+                         : configured_limit;
 }
 
 inline size_t gdsFifoSharedInflight(

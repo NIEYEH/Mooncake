@@ -76,6 +76,12 @@ void testPartialDirectIoReportsActualBytesWithoutCompleting() {
     EXPECT_TRUE(!failed.completed);
 }
 
+void testWriteExecutionLimitTracksReadContention() {
+    EXPECT_EQ(gdsFifoEffectiveWriteLimit(4, 1, false), 4u);
+    EXPECT_EQ(gdsFifoEffectiveWriteLimit(4, 1, true), 1u);
+    EXPECT_EQ(gdsFifoEffectiveWriteLimit(4, 2, true), 2u);
+}
+
 }  // namespace
 }  // namespace mooncake::tent
 
@@ -85,6 +91,7 @@ int main() {
     testDirectionPoolBoundsFifoFront();
     testReservationUpdatesPhysicalCounts();
     testPartialDirectIoReportsActualBytesWithoutCompleting();
+    testWriteExecutionLimitTracksReadContention();
     std::cout << "gds_fifo_dispatch_test: PASS" << std::endl;
     return 0;
 }

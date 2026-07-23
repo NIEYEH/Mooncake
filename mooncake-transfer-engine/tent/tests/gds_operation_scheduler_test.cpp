@@ -160,6 +160,118 @@ void testPrimaryReadOperationFillsSharedTokens() {
     }
 }
 
+void testOnlyOneSecondaryReadOperationCanBeActive() {
+    GdsOperationScheduler scheduler(weightedConfig());
+    EXPECT_TRUE(
+        scheduler
+            .enqueue(entry(1, 77, GdsDirection::Read, 12 * kMiB, 12))
+            .ok());
+    EXPECT_TRUE(
+        scheduler
+            .enqueue(entry(2, 88, GdsDirection::Read, 1 * kMiB))
+            .ok());
+    EXPECT_TRUE(
+        scheduler
+            .enqueue(entry(3, 99, GdsDirection::Read, 1 * kMiB))
+            .ok());
+
+    const auto selected = scheduler.select({16, 48 * kMiB, 16});
+    EXPECT_EQ(selected.size(), 2u);
+    EXPECT_EQ(selected[0].operation_owner_id, 77u);
+    EXPECT_EQ(selected[1].operation_owner_id, 88u);
+    const auto snapshot = scheduler.snapshot();
+    EXPECT_EQ(snapshot.operation_reserved_tokens.at(99), 0u);
+}
+
+void testSecondaryWindowCountsLogicalEntriesNotPhysicalIos() {
+    auto config = weightedConfig();
+    GdsOperationScheduler scheduler(config);
+    EXPECT_TRUE(
+        scheduler
+            .enqueue(entry(1, 77, GdsDirection::Read, 1 * kMiB))
+            .ok());
+    for (uint64_t index = 0; index < 8; ++index) {
+        EXPECT_TRUE(
+            scheduler
+                .enqueue(entry(10 + index, 88, GdsDirection::Read,
+                               1 * kMiB, 3))
+                .ok());
+    }
+
+    const auto selected = scheduler.select({16, 48 * kMiB, 16});
+    EXPECT_EQ(selected.size(), 6u);
+    EXPECT_EQ(selected.front().operation_owner_id, 77u);
+    for (size_t index = 1; index < selected.size(); ++index) {
+        EXPECT_EQ(selected[index].operation_owner_id, 88u);
+    }
+}
+
+void testSecondaryByteWindowIncludesOutstandingReservations() {
+    GdsOperationScheduler scheduler(weightedConfig());
+    EXPECT_TRUE(
+        scheduler
+            .enqueue(entry(1, 77, GdsDirection::Read, 12 * kMiB, 12))
+            .ok());
+    EXPECT_TRUE(
+        scheduler
+            .enqueue(entry(2, 88, GdsDirection::Read, 15 * kMiB))
+            .ok());
+    EXPECT_TRUE(
+        scheduler
+            .enqueue(entry(3, 88, GdsDirection::Read, 2 * kMiB))
+            .ok());
+
+    const auto first = scheduler.select({16, 48 * kMiB, 2});
+    EXPECT_EQ(first.size(), 2u);
+    EXPECT_EQ(first[1].operation_owner_id, 88u);
+    const auto second = scheduler.select({16, 48 * kMiB, 16});
+    EXPECT_TRUE(second.empty());
+}
+
+void testMultiPhysicalWriteMakesProgressAtOneTokenBaseline() {
+    auto config = weightedConfig();
+    config.mode = GdsSchedulerMode::Fixed;
+    config.write_standalone_tokens = 1;
+    config.contended_write_tokens = 1;
+    GdsOperationScheduler scheduler(config);
+    EXPECT_TRUE(
+        scheduler
+            .enqueue(entry(1, 90, GdsDirection::Write,
+                           2359296, 3))
+            .ok());
+
+    const auto selected = scheduler.select({16, 48 * kMiB, 16});
+    EXPECT_EQ(selected.size(), 1u);
+    EXPECT_EQ(selected.front().tokens, 1u);
+}
+
+void testBoostDoesNotActivateSecondWriteOperation() {
+    auto config = weightedConfig();
+    config.contended_write_tokens = 2;
+    GdsOperationScheduler scheduler(config);
+    EXPECT_TRUE(
+        scheduler
+            .enqueue(entry(1, 101, GdsDirection::Read, 1 * kMiB))
+            .ok());
+    EXPECT_TRUE(
+        scheduler
+            .enqueue(entry(2, 102, GdsDirection::Write, 1 * kMiB))
+            .ok());
+    EXPECT_TRUE(
+        scheduler
+            .enqueue(entry(3, 103, GdsDirection::Write, 1 * kMiB))
+            .ok());
+
+    const auto selected = scheduler.select({16, 48 * kMiB, 16});
+    size_t write_reservations = 0;
+    for (const auto& reservation : selected) {
+        if (reservation.direction != GdsDirection::Write) continue;
+        ++write_reservations;
+        EXPECT_EQ(reservation.operation_owner_id, 102u);
+    }
+    EXPECT_EQ(write_reservations, 1u);
+}
+
 void testIdleDirectionCannotBankCredit() {
     auto config = weightedConfig();
     GdsOperationScheduler scheduler(config);
@@ -317,6 +429,29 @@ void testRetiredOperationReleasesReservationHistory() {
             .ok());
 }
 
+void testCanceledOperationStopsNewDispatchAndDrainsInflight() {
+    GdsOperationScheduler scheduler(weightedConfig());
+    EXPECT_TRUE(
+        scheduler
+            .enqueue(entry(1, 92, GdsDirection::Read, 2 * kMiB))
+            .ok());
+    EXPECT_TRUE(
+        scheduler
+            .enqueue(entry(2, 92, GdsDirection::Read, 2 * kMiB))
+            .ok());
+    const auto selected = scheduler.select({1, 2 * kMiB, 1});
+    EXPECT_EQ(selected.size(), 1u);
+    EXPECT_TRUE(scheduler.cancelOperation(92).ok());
+    EXPECT_TRUE(scheduler.select({16, 64 * kMiB, 16}).empty());
+    EXPECT_TRUE(
+        scheduler.complete(selected.front().id, 0, CANCELED).ok());
+    EXPECT_TRUE(scheduler.retireOperation(92).ok());
+    EXPECT_TRUE(
+        scheduler
+            .enqueue(entry(2, 92, GdsDirection::Read, 2 * kMiB))
+            .ok());
+}
+
 void testWriteBoostUsesPromotionDemotionAndCooldownHysteresis() {
     GdsWriteBoostController controller({1, 2, 3, 5, 10});
     EXPECT_EQ(controller.update(true, false),
@@ -351,6 +486,11 @@ int main() {
     testPartialCompletionRefundsReservation();
     testDuplicateAndOversizedCompletionFail();
     testPrimaryReadOperationFillsSharedTokens();
+    testOnlyOneSecondaryReadOperationCanBeActive();
+    testSecondaryWindowCountsLogicalEntriesNotPhysicalIos();
+    testSecondaryByteWindowIncludesOutstandingReservations();
+    testMultiPhysicalWriteMakesProgressAtOneTokenBaseline();
+    testBoostDoesNotActivateSecondWriteOperation();
     testIdleDirectionCannotBankCredit();
     testDispatcherWakeupDoesNotGrantAnotherQuantum();
     testDrainedOperationCanReceiveNextAdmissionSegment();
@@ -358,6 +498,7 @@ int main() {
     testFixedModeReservesOneContendedWriteToken();
     testGdsSegmentStopsAtFirstRequestOrByteLimit();
     testRetiredOperationReleasesReservationHistory();
+    testCanceledOperationStopsNewDispatchAndDrainsInflight();
     testWriteBoostUsesPromotionDemotionAndCooldownHysteresis();
     std::cout << "gds_operation_scheduler_test: PASS" << std::endl;
     return 0;

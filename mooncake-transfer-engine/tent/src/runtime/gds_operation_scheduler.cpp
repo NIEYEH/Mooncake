@@ -85,19 +85,29 @@ Status GdsOperationScheduler::validateConfig() const {
         return Status::InvalidArgument(
             "GDS direction/operation tokens exceed shared tokens" LOC_MARK);
     }
+    const size_t max_deficit =
+        static_cast<size_t>(std::numeric_limits<int64_t>::max());
+    if (config_.read_quantum_bytes > max_deficit ||
+        config_.write_quantum_bytes > max_deficit ||
+        config_.credit_cap_quanta >
+            max_deficit / config_.read_quantum_bytes ||
+        config_.credit_cap_quanta >
+            max_deficit / config_.write_quantum_bytes) {
+        return Status::InvalidArgument(
+            "GDS WDRR byte limits exceed signed accounting range"
+            LOC_MARK);
+    }
     return Status::OK();
 }
 
 Status GdsOperationScheduler::enqueue(const GdsDispatchEntry& entry) {
     CHECK_STATUS(config_status_);
     if (entry.owner_id == 0 || entry.operation_owner_id == 0 ||
-        entry.physical_bytes == 0 || entry.physical_tokens == 0) {
+        entry.physical_bytes == 0 || entry.physical_tokens == 0 ||
+        entry.physical_bytes >
+            static_cast<size_t>(std::numeric_limits<int64_t>::max())) {
         return Status::InvalidArgument(
             "invalid GDS scheduler entry" LOC_MARK);
-    }
-    if (entry.physical_tokens > config_.shared_tokens) {
-        return Status::InvalidArgument(
-            "GDS entry exceeds shared physical tokens" LOC_MARK);
     }
     if (!known_owner_ids_.insert(entry.owner_id).second) {
         return Status::InvalidEntry(
@@ -147,15 +157,21 @@ size_t GdsOperationScheduler::directionTokenLimit(
     GdsDirection direction, bool contended) const {
     if (direction == GdsDirection::Read) {
         if (contended &&
-            config_.shared_tokens > config_.contended_write_tokens) {
+            config_.shared_tokens > contended_write_tokens_) {
             return std::min(
                 config_.read_standalone_tokens,
-                config_.shared_tokens - config_.contended_write_tokens);
+                config_.shared_tokens - contended_write_tokens_);
         }
         return config_.read_standalone_tokens;
     }
     return contended ? contended_write_tokens_
                      : config_.write_standalone_tokens;
+}
+
+size_t GdsOperationScheduler::reservationTokenCharge(
+    const GdsDispatchEntry& entry, bool contended) const {
+    return std::min(entry.physical_tokens,
+                    directionTokenLimit(entry.direction, contended));
 }
 
 bool GdsOperationScheduler::directionHasCapacity(
@@ -196,17 +212,32 @@ uint64_t GdsOperationScheduler::primaryReadOperation() {
 bool GdsOperationScheduler::canReserve(
     const GdsDispatchEntry& entry,
     const GdsDispatchBudget& budget) {
+    const bool read_demand =
+        hasQueued(GdsDirection::Read) ||
+        directions_[index(GdsDirection::Read)]
+                .outstanding_reserved_tokens != 0;
+    const bool write_demand =
+        hasQueued(GdsDirection::Write) ||
+        directions_[index(GdsDirection::Write)]
+                .outstanding_reserved_tokens != 0;
+    const bool contended = read_demand && write_demand;
+    const size_t token_charge =
+        reservationTokenCharge(entry, contended);
     size_t next_global_tokens = 0;
     size_t next_global_bytes = 0;
-    const size_t global_tokens =
-        directions_[0].outstanding_reserved_tokens +
-        directions_[1].outstanding_reserved_tokens;
-    const size_t global_bytes =
-        directions_[0].outstanding_reserved_bytes +
-        directions_[1].outstanding_reserved_bytes;
-    if (!checkedAdd(global_tokens, entry.physical_tokens,
+    size_t global_tokens = 0;
+    size_t global_bytes = 0;
+    if (!checkedAdd(directions_[0].outstanding_reserved_tokens,
+                    directions_[1].outstanding_reserved_tokens,
+                    global_tokens) ||
+        !checkedAdd(directions_[0].outstanding_reserved_bytes,
+                    directions_[1].outstanding_reserved_bytes,
+                    global_bytes) ||
+        !checkedAdd(global_tokens, token_charge,
                     next_global_tokens) ||
-        !checkedAdd(global_bytes, entry.physical_bytes, next_global_bytes)) {
+        !checkedAdd(global_bytes, entry.physical_bytes, next_global_bytes) ||
+        next_global_bytes >
+            static_cast<size_t>(std::numeric_limits<int64_t>::max())) {
         return false;
     }
     if (next_global_tokens > config_.shared_tokens ||
@@ -215,15 +246,13 @@ bool GdsOperationScheduler::canReserve(
         return false;
     }
 
-    const bool contended =
-        hasQueued(GdsDirection::Read) && hasQueued(GdsDirection::Write);
     const auto& direction = directions_[index(entry.direction)];
     size_t next_direction_tokens = 0;
     const size_t budget_direction_tokens =
         entry.direction == GdsDirection::Read ? budget.max_read_tokens
                                               : budget.max_write_tokens;
     if (!checkedAdd(direction.outstanding_reserved_tokens,
-                    entry.physical_tokens, next_direction_tokens) ||
+                    token_charge, next_direction_tokens) ||
         next_direction_tokens >
             directionTokenLimit(entry.direction, contended) ||
         next_direction_tokens > budget_direction_tokens ||
@@ -241,7 +270,7 @@ bool GdsOperationScheduler::canReserve(
         size_t next_operation_tokens = 0;
         size_t next_operation_bytes = 0;
         if (!checkedAdd(operation_it->second.reserved_tokens,
-                        entry.physical_tokens, next_operation_tokens) ||
+                        token_charge, next_operation_tokens) ||
             !checkedAdd(operation_it->second.reserved_bytes,
                         entry.physical_bytes, next_operation_bytes) ||
             next_operation_tokens > config_.primary_read_tokens ||
@@ -254,12 +283,22 @@ bool GdsOperationScheduler::canReserve(
 
 std::deque<GdsDispatchEntry>::iterator
 GdsOperationScheduler::findCandidate(GdsDirection direction,
-                                     const GdsDispatchBudget& budget,
-                                     size_t secondary_requests,
-                                     size_t secondary_bytes) {
+    const GdsDispatchBudget& budget) {
     if (direction == GdsDirection::Write) {
         cleanupOperationOrder();
+        uint64_t active_write = 0;
         for (uint64_t operation_id : write_operation_order_) {
+            const auto operation_it = operations_.find(operation_id);
+            if (operation_it != operations_.end() &&
+                operation_it->second.reserved_entries != 0) {
+                active_write = operation_id;
+                break;
+            }
+        }
+        for (uint64_t operation_id : write_operation_order_) {
+            if (active_write != 0 && operation_id != active_write) {
+                continue;
+            }
             auto it = std::find_if(
                 queued_.begin(), queued_.end(),
                 [&](const GdsDispatchEntry& entry) {
@@ -284,12 +323,26 @@ GdsOperationScheduler::findCandidate(GdsDirection direction,
 
     // A secondary READ operation may consume one bounded segment only after
     // the primary cannot produce an immediately reservable physical IO.
+    uint64_t active_secondary = 0;
     for (uint64_t operation_id : read_operation_order_) {
         if (operation_id == primary) continue;
+        const auto operation_it = operations_.find(operation_id);
+        if (operation_it != operations_.end() &&
+            operation_it->second.reserved_entries != 0) {
+            active_secondary = operation_id;
+            break;
+        }
+    }
+    for (uint64_t operation_id : read_operation_order_) {
+        if (operation_id == primary) continue;
+        if (active_secondary != 0 &&
+            operation_id != active_secondary) {
+            continue;
+        }
         auto operation_it = operations_.find(operation_id);
         if (operation_it == operations_.end() ||
             operation_it->second.canceled ||
-            operation_it->second.reserved_tokens >=
+            operation_it->second.reserved_entries >=
                 config_.secondary_segment_requests ||
             operation_it->second.reserved_bytes >=
                 config_.secondary_segment_bytes) {
@@ -302,10 +355,11 @@ GdsOperationScheduler::findCandidate(GdsDirection direction,
                     !canReserve(entry, budget)) {
                     return false;
                 }
-                return secondary_requests <
+                return operation_it->second.reserved_entries <
                            config_.secondary_segment_requests &&
                        entry.physical_bytes <=
-                           config_.secondary_segment_bytes - secondary_bytes;
+                           config_.secondary_segment_bytes -
+                               operation_it->second.reserved_bytes;
             });
         if (candidate != queued_.end()) return candidate;
     }
@@ -337,9 +391,16 @@ void GdsOperationScheduler::grantRoundCredit(bool read_backlog,
         auto& direction = directions_[direction_index];
         const size_t credit_cap =
             quantum[direction_index] * config_.credit_cap_quanta;
+        const size_t maximum_deficit_bytes =
+            direction.outstanding_reserved_bytes >
+                    static_cast<size_t>(
+                        std::numeric_limits<int64_t>::max()) -
+                        credit_cap
+                ? static_cast<size_t>(
+                      std::numeric_limits<int64_t>::max())
+                : direction.outstanding_reserved_bytes + credit_cap;
         const int64_t maximum_deficit =
-            static_cast<int64_t>(direction.outstanding_reserved_bytes) +
-            static_cast<int64_t>(credit_cap);
+            static_cast<int64_t>(maximum_deficit_bytes);
         if (direction.deficit_bytes >
             std::numeric_limits<int64_t>::max() -
                 static_cast<int64_t>(quantum[direction_index])) {
@@ -392,21 +453,23 @@ GdsDirection GdsOperationScheduler::chooseWeightedDirection(
 }
 
 GdsDispatchReservation GdsOperationScheduler::reserve(
-    std::deque<GdsDispatchEntry>::iterator entry_it, bool wdrr_charged) {
+    std::deque<GdsDispatchEntry>::iterator entry_it, bool wdrr_charged,
+    size_t token_charge) {
     const auto entry = *entry_it;
     queued_.erase(entry_it);
 
     auto& direction = directions_[index(entry.direction)];
     direction.outstanding_reserved_bytes += entry.physical_bytes;
-    direction.outstanding_reserved_tokens += entry.physical_tokens;
+    direction.outstanding_reserved_tokens += token_charge;
     auto& operation = operations_.at(entry.operation_owner_id);
     --operation.queued_entries;
+    ++operation.reserved_entries;
     operation.reserved_bytes += entry.physical_bytes;
-    operation.reserved_tokens += entry.physical_tokens;
+    operation.reserved_tokens += token_charge;
 
     GdsDispatchReservation reservation{
         next_reservation_id_++, entry.owner_id, entry.operation_owner_id,
-        entry.direction, entry.physical_bytes, entry.physical_tokens};
+        entry.direction, entry.physical_bytes, token_charge};
     reservations_.emplace(
         reservation.id,
         ReservationState{reservation, false, wdrr_charged});
@@ -421,8 +484,6 @@ std::vector<GdsDispatchReservation> GdsOperationScheduler::select(
         return selected;
     }
 
-    size_t secondary_requests = 0;
-    size_t secondary_bytes = 0;
     size_t no_progress_rounds = 0;
     while (selected.size() < budget.max_entries) {
         const bool read_backlog = hasQueued(GdsDirection::Read);
@@ -443,9 +504,7 @@ std::vector<GdsDispatchReservation> GdsOperationScheduler::select(
             direction = GdsDirection::Write;
         }
 
-        auto candidate =
-            findCandidate(direction, budget, secondary_requests,
-                          secondary_bytes);
+        auto candidate = findCandidate(direction, budget);
         bool direction_capacity =
             directionHasCapacity(direction, contended);
         bool spendable =
@@ -458,8 +517,7 @@ std::vector<GdsDispatchReservation> GdsOperationScheduler::select(
                 direction == GdsDirection::Read ? GdsDirection::Write
                                                 : GdsDirection::Read;
             auto alternate_candidate =
-                findCandidate(alternate, budget, secondary_requests,
-                              secondary_bytes);
+                findCandidate(alternate, budget);
             const bool alternate_capacity =
                 directionHasCapacity(alternate, false);
             if (alternate_candidate != queued_.end() &&
@@ -483,22 +541,22 @@ std::vector<GdsDispatchReservation> GdsOperationScheduler::select(
         }
 
         no_progress_rounds = 0;
-        const uint64_t primary = primaryReadOperation();
-        const bool is_secondary =
-            direction == GdsDirection::Read &&
-            candidate->operation_owner_id != primary;
-        const size_t candidate_bytes = candidate->physical_bytes;
-        auto reservation = reserve(candidate, contended);
-        if (is_secondary) {
-            ++secondary_requests;
-            secondary_bytes += candidate_bytes;
-        }
+        const bool read_demand =
+            read_backlog ||
+            directions_[index(GdsDirection::Read)]
+                    .outstanding_reserved_tokens != 0;
+        const bool write_demand =
+            write_backlog ||
+            directions_[index(GdsDirection::Write)]
+                    .outstanding_reserved_tokens != 0;
+        const size_t token_charge = reservationTokenCharge(
+            *candidate, read_demand && write_demand);
+        auto reservation =
+            reserve(candidate, contended, token_charge);
         selected.push_back(reservation);
 
         if (contended) {
-            const auto next_candidate =
-                findCandidate(direction, budget, secondary_requests,
-                              secondary_bytes);
+            const auto next_candidate = findCandidate(direction, budget);
             if (next_candidate == queued_.end() ||
                 !directionHasCapacity(direction, true) ||
                 !canSpendWdrr(*next_candidate)) {
@@ -538,7 +596,11 @@ Status GdsOperationScheduler::complete(
         operations_.find(reservation.value.operation_owner_id);
     if (direction.outstanding_reserved_bytes < reservation.value.bytes ||
         direction.outstanding_reserved_tokens < reservation.value.tokens ||
+        actual_transferred_bytes >
+            std::numeric_limits<size_t>::max() -
+                direction.completed_bytes ||
         operation_it == operations_.end() ||
+        operation_it->second.reserved_entries == 0 ||
         operation_it->second.reserved_bytes < reservation.value.bytes ||
         operation_it->second.reserved_tokens < reservation.value.tokens) {
         return Status::InternalError(
@@ -553,6 +615,7 @@ Status GdsOperationScheduler::complete(
             static_cast<int64_t>(actual_transferred_bytes);
     }
     auto& operation = operation_it->second;
+    --operation.reserved_entries;
     operation.reserved_bytes -= reservation.value.bytes;
     operation.reserved_tokens -= reservation.value.tokens;
     reservation.reconciled = true;
@@ -596,6 +659,7 @@ Status GdsOperationScheduler::retireOperation(
     auto operation_it = operations_.find(operation_owner_id);
     if (operation_it == operations_.end()) return Status::OK();
     if (operation_it->second.queued_entries != 0 ||
+        operation_it->second.reserved_entries != 0 ||
         operation_it->second.reserved_tokens != 0 ||
         operation_it->second.reserved_bytes != 0) {
         return Status::InvalidEntry(

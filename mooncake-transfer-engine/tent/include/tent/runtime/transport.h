@@ -172,6 +172,11 @@ class Transport {
         return std::numeric_limits<size_t>::max();
     }
 
+    virtual Status setRuntimeQueueContendedWriteLimit(size_t tokens) {
+        (void)tokens;
+        return Status::OK();
+    }
+
     // Publish owners that are still waiting outside a transport's dispatch
     // window. The default is a no-op because only transports with their own
     // adaptive controller need this cross-layer backlog signal.

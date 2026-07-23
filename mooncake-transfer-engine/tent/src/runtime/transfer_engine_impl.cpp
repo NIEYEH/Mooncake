@@ -51,8 +51,12 @@ constexpr uint8_t kRedisDefaultDbIndex = 0;
 // The default must absorb normal overlapping vLLM BatchPut bursts. The
 // backlog is still finite, but only an explicitly tighter deployment setting
 // should turn routine 126/192-owner submits into synchronous rejection.
-constexpr size_t kDefaultMinWaitingOwners = 4096;
-constexpr size_t kDefaultMinWaitingBytes = size_t{8} << 30;
+// Keep enough backlog for three overlapping 192-key / 2.25 MiB KV
+// operations, but do not turn the runtime queue into an unbounded lease
+// holding area. Deployments with a different operation shape can override
+// both high-watermarks explicitly.
+constexpr size_t kDefaultMinWaitingOwners = 1024;
+constexpr size_t kDefaultMinWaitingBytes = size_t{2} << 30;
 constexpr size_t kRuntimeQueueSummarySampleCapacity = 4096;
 constexpr auto kRuntimeQueueSummaryInterval = std::chrono::seconds(1);
 
@@ -362,6 +366,8 @@ Status TransferEngineImpl::construct() {
         conf_->get("transports/gds/max_inflight_writes", 1UL);
     const size_t default_gds_write_inflight =
         std::min(configured_gds_write_workers, configured_gds_write_inflight);
+    const size_t configured_gds_shared_tokens =
+        conf_->get("transports/gds/shared_device_tokens", 16UL);
     const auto gds_scheduler_mode_name =
         conf_->get("runtime_queue/gds_scheduler_mode", "fixed");
     GdsSchedulerMode gds_scheduler_mode = GdsSchedulerMode::Fixed;
@@ -465,6 +471,9 @@ Status TransferEngineImpl::construct() {
          runtime_queue_config_.gds_write_boost.boosted_tokens >
              runtime_queue_config_.gds_scheduler
                  .write_standalone_tokens ||
+         (gds_enabled &&
+          runtime_queue_config_.gds_write_boost.boosted_tokens >
+              default_gds_write_inflight) ||
          runtime_queue_config_.gds_write_boost.promote_windows == 0 ||
          runtime_queue_config_.gds_write_boost.demote_windows == 0 ||
          runtime_queue_config_.gds_write_boost.cooldown_windows == 0 ||
@@ -505,6 +514,20 @@ Status TransferEngineImpl::construct() {
         GdsOperationScheduler scheduler(
             runtime_queue_config_.gds_scheduler);
         CHECK_STATUS(scheduler.status());
+        const size_t effective_gds_shared_tokens =
+            std::min(configured_gds_shared_tokens,
+                     saturatingAdd(default_gds_read_inflight,
+                                   default_gds_write_inflight));
+        if (runtime_queue_config_.gds_scheduler.shared_tokens >
+                effective_gds_shared_tokens ||
+            runtime_queue_config_.gds_scheduler.read_standalone_tokens >
+                default_gds_read_inflight ||
+            runtime_queue_config_.gds_scheduler.write_standalone_tokens >
+                default_gds_write_inflight) {
+            return Status::InvalidArgument(
+                "runtime GDS token limits exceed transport execution limits"
+                LOC_MARK);
+        }
     }
     if (runtime_queue_config_.enabled &&
         (runtime_queue_config_.max_dispatch_owners >
@@ -2301,12 +2324,25 @@ void TransferEngineImpl::maybeLogRuntimeQueueSummary(
         const auto boost_action = gds_write_boost_controller_.update(
             sustained_write_pressure, read_latency_degraded);
         if (boost_action != GdsWriteBoostAction::None) {
-            auto update_status =
+            const size_t write_tokens =
+                gds_write_boost_controller_.currentTokens();
+            auto scheduler_update_status =
                 runtime_queue_->setGdsContendedWriteTokens(
-                    gds_write_boost_controller_.currentTokens());
-            if (!update_status.ok()) {
+                    write_tokens);
+            Status transport_update_status = Status::OK();
+            const auto& gds_transport = transport_list_[GDS];
+            if (gds_transport) {
+                transport_update_status =
+                    gds_transport->setRuntimeQueueContendedWriteLimit(
+                        write_tokens);
+            }
+            if (!scheduler_update_status.ok() ||
+                !transport_update_status.ok()) {
                 LOG(ERROR) << "Failed to apply GDS WRITE boost: "
-                           << update_status.ToString();
+                           << "scheduler="
+                           << scheduler_update_status.ToString()
+                           << ", transport="
+                           << transport_update_status.ToString();
             } else {
                 LOG(INFO)
                     << "GDS WRITE boost hysteresis "
@@ -2314,7 +2350,7 @@ void TransferEngineImpl::maybeLogRuntimeQueueSummary(
                             ? "promoted"
                             : "demoted")
                     << ": contended_write_tokens="
-                    << gds_write_boost_controller_.currentTokens()
+                    << write_tokens
                     << ", queued_write_owners="
                     << queued_write_owners
                     << ", write_queue_p99_us="
@@ -2397,10 +2433,10 @@ Status TransferEngineImpl::finishQueuedOwner(
             dispatch_inflight_bytes_ < queued.byte_charge ||
             (queued.gds_read_in_dispatch &&
              dispatch_inflight_read_ios_ <
-                 queued.physical_plan.physical_ios) ||
+                 queued.dispatch_token_charge) ||
             (queued.gds_write_in_dispatch &&
              dispatch_inflight_write_ios_ <
-                 queued.physical_plan.physical_ios)) {
+                 queued.dispatch_token_charge)) {
             return Status::InternalError(
                 "runtime dispatch window accounting underflow" LOC_MARK);
         }
@@ -2478,15 +2514,14 @@ Status TransferEngineImpl::finishQueuedOwner(
         --dispatch_inflight_owners_;
         dispatch_inflight_bytes_ -= queued.byte_charge;
         if (queued.gds_read_in_dispatch) {
-            dispatch_inflight_read_ios_ -=
-                queued.physical_plan.physical_ios;
+            dispatch_inflight_read_ios_ -= queued.dispatch_token_charge;
             queued.gds_read_in_dispatch = false;
         }
         if (queued.gds_write_in_dispatch) {
-            dispatch_inflight_write_ios_ -=
-                queued.physical_plan.physical_ios;
+            dispatch_inflight_write_ios_ -= queued.dispatch_token_charge;
             queued.gds_write_in_dispatch = false;
         }
+        queued.dispatch_token_charge = 0;
         queued.in_dispatch_window = false;
     }
     for (const auto task_id : queued.public_task_ids) {
@@ -2520,17 +2555,21 @@ Status TransferEngineImpl::markQueuedOwnerSubmitted(QueueOwnerId owner_id) {
     auto& queued = queued_it->second;
     if (!queued.in_dispatch_window) {
         const auto& task = queued.batch->task_list[queued.owner_task_id];
+        size_t dispatch_token_charge = 0;
+        if (task.type == GDS) {
+            CHECK_STATUS(runtime_queue_->getGdsReservationTokens(
+                owner_id, dispatch_token_charge));
+        }
         queued.in_dispatch_window = true;
+        queued.dispatch_token_charge = dispatch_token_charge;
         ++dispatch_inflight_owners_;
         dispatch_inflight_bytes_ += queued.byte_charge;
         if (task.type == GDS && task.request.opcode == Request::READ) {
             queued.gds_read_in_dispatch = true;
-            dispatch_inflight_read_ios_ +=
-                queued.physical_plan.physical_ios;
+            dispatch_inflight_read_ios_ += dispatch_token_charge;
         } else if (task.type == GDS) {
             queued.gds_write_in_dispatch = true;
-            dispatch_inflight_write_ios_ +=
-                queued.physical_plan.physical_ios;
+            dispatch_inflight_write_ios_ += dispatch_token_charge;
         }
         updateRuntimeQueueMetrics();
     }
@@ -2579,9 +2618,10 @@ Status TransferEngineImpl::dispatchQueuedOwners(
         TentMetrics::instance().recordRuntimeQueueWait(
             is_read, queue_wait_seconds);
         recordRuntimeQueueWaitSummary(is_read, queue_wait_seconds);
-        auto route = resolveTransport(task.request, 0);
-        task.type = route.transport;
-        task.device_mask = route.device_mask;
+        // Admission and reservation were computed from this immutable route.
+        // Re-resolving here can switch into or out of GDS without rebuilding
+        // the physical plan and reservation ledger.
+        task.type = queued.initial_transport;
         if (task.type == UNSPEC) {
             remember_error(finishQueuedOwner(owner_id, 0, FAILED));
             continue;
@@ -2826,8 +2866,13 @@ Status TransferEngineImpl::progressRuntimeQueue() {
         auto prev_status = task.status;
         TransferStatus task_status;
         CHECK_STATUS(pollTaskStatus(batch, queued.owner_task_id, task_status));
+        // A runtime-queued GDS transfer owns one reservation for its initial
+        // transport attempt. Settle that attempt directly; automatic failover
+        // requires a new per-attempt plan/reservation and must not reuse the
+        // initial GDS accounting. Preserve the existing failover behavior for
+        // other transports.
         updateTaskStatusAfterPoll(batch, queued.owner_task_id, task_status,
-                                  true);
+                                  queued.initial_transport != GDS);
         recordTaskCompletionMetrics(task, prev_status, task_status.s);
 
         if (task_status.s == PENDING) continue;
@@ -3088,6 +3133,7 @@ Status TransferEngineImpl::getTransferStatus(BatchID batch_id, size_t task_id,
     }
     const size_t public_task_id = task_id;
     size_t poll_task_id = task_id;
+    bool runtime_gds_attempt = false;
     CHECK_STATUS(refillDispatchWindow());
     if (runtime_queue_config_.enabled && batch->queue_token != 0) {
         QueueOwnerId owner_id = 0;
@@ -3095,17 +3141,25 @@ Status TransferEngineImpl::getTransferStatus(BatchID batch_id, size_t task_id,
             batch->queue_token, public_task_id, owner_id);
         if (resolve_status.ok()) {
             TransferStatusEnum public_status = PENDING;
+            size_t actual_transferred_bytes = 0;
             CHECK_STATUS(runtime_queue_->getPublicStatus(
-                batch->queue_token, public_task_id, public_status));
+                batch->queue_token, public_task_id, public_status,
+                &actual_transferred_bytes));
             auto queued_it = queued_owners_.find(owner_id);
+            runtime_gds_attempt =
+                queued_it != queued_owners_.end() &&
+                queued_it->second.initial_transport == GDS;
             if (public_status != PENDING ||
                 (queued_it != queued_owners_.end() &&
                  !queued_it->second.in_dispatch_window)) {
                 task_status.s = public_status;
                 task_status.transferred_bytes =
-                    public_status == COMPLETED
-                        ? batch->task_list[public_task_id].request.length
-                        : 0;
+                    batch->task_list[public_task_id].derived
+                        ? (public_status == COMPLETED
+                               ? batch->task_list[public_task_id]
+                                     .request.length
+                               : 0)
+                        : actual_transferred_bytes;
                 return Status::OK();
             }
             if (batch->task_list[public_task_id].derived &&
@@ -3117,8 +3171,9 @@ Status TransferEngineImpl::getTransferStatus(BatchID batch_id, size_t task_id,
     auto& task = batch->task_list[poll_task_id];
     auto prev_status = task.status;
     CHECK_STATUS(pollTaskStatus(batch, poll_task_id, task_status));
-    updateTaskStatusAfterPoll(batch, poll_task_id, task_status,
-                              enable_auto_failover_on_poll_);
+    updateTaskStatusAfterPoll(
+        batch, poll_task_id, task_status,
+        enable_auto_failover_on_poll_ && !runtime_gds_attempt);
     if (runtime_queue_config_.enabled && batch->queue_token != 0 &&
         task_status.s != PENDING) {
         QueueOwnerId owner_id = 0;
@@ -3179,6 +3234,7 @@ Status TransferEngineImpl::getBatchStatus(BatchID batch_id,
     };
     for (size_t task_id = 0; task_id < batch->task_list.size(); ++task_id) {
         auto& task = batch->task_list[task_id];
+        bool runtime_gds_attempt = false;
         if (task.derived) continue;  // This task is performed by other tasks
         total_tasks++;
         if (task.runtime_admission_waiting) continue;
@@ -3191,6 +3247,9 @@ Status TransferEngineImpl::getBatchStatus(BatchID batch_id,
                 CHECK_STATUS(runtime_queue_->getPublicStatus(
                     batch->queue_token, task_id, public_status));
                 auto queued_it = queued_owners_.find(owner_id);
+                runtime_gds_attempt =
+                    queued_it != queued_owners_.end() &&
+                    queued_it->second.initial_transport == GDS;
                 if (public_status == PENDING) {
                     if (queued_it != queued_owners_.end() &&
                         !queued_it->second.in_dispatch_window) {
@@ -3224,7 +3283,9 @@ Status TransferEngineImpl::getBatchStatus(BatchID batch_id,
         }
         auto prev_status = task.status;
         CHECK_STATUS(pollTaskStatus(batch, task_id, task_status));
-        updateTaskStatusAfterPoll(batch, task_id, task_status, allow_failover);
+        updateTaskStatusAfterPoll(
+            batch, task_id, task_status,
+            allow_failover && !runtime_gds_attempt);
         if (runtime_queue_config_.enabled && batch->queue_token != 0 &&
             task_status.s != PENDING) {
             QueueOwnerId owner_id = 0;

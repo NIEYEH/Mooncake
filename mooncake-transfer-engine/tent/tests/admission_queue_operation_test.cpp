@@ -114,6 +114,30 @@ void testPhysicalTokensBoundSelection() {
     EXPECT_EQ(picked.size(), 5u);
 }
 
+void testMultiPhysicalWriteReservesAvailableConcurrency() {
+    auto config = schedulerConfig();
+    config.mode = GdsSchedulerMode::Fixed;
+    config.write_standalone_tokens = 1;
+    config.contended_write_tokens = 1;
+    LocalTransferAdmissionQueue queue(
+        {4, 64 * kMiB, 0, 0}, config);
+    QueueSubmit submit;
+    submit.batch_token = 95;
+    submit.batch_slots_left = 1;
+    submit.owners.push_back(
+        owner(0, Request::WRITE, GDS, 2359296, 3));
+    std::vector<QueueOwnerId> admitted;
+    EXPECT_TRUE(queue.tryAdmit(submit, admitted).ok());
+
+    const auto picked =
+        queue.pickForDispatch(1, 48 * kMiB, 16, 1);
+    EXPECT_EQ(picked.size(), 1u);
+    size_t tokens = 0;
+    EXPECT_TRUE(
+        queue.getGdsReservationTokens(picked.front(), tokens).ok());
+    EXPECT_EQ(tokens, 1u);
+}
+
 void testActualBytesReconcileReservation() {
     LocalTransferAdmissionQueue queue(
         {4, 64 * kMiB, 0, 0}, schedulerConfig());
@@ -126,6 +150,31 @@ void testActualBytesReconcileReservation() {
     const auto snapshot = queue.gdsSchedulerSnapshot();
     EXPECT_EQ(snapshot.completed_bytes[0], 1 * kMiB);
     EXPECT_EQ(snapshot.reserved_tokens[0], 0u);
+}
+
+void testTerminalOwnerPreservesPartialBytes() {
+    LocalTransferAdmissionQueue queue(
+        {4, 64 * kMiB, 0, 0}, schedulerConfig());
+    QueueSubmit submit;
+    submit.batch_token = 96;
+    submit.batch_slots_left = 1;
+    submit.owners.push_back(
+        owner(0, Request::READ, GDS, 3 * kMiB));
+    std::vector<QueueOwnerId> admitted;
+    EXPECT_TRUE(queue.tryAdmit(submit, admitted).ok());
+    const auto picked =
+        queue.pickForDispatch(1, 48 * kMiB, 16, 1);
+    EXPECT_EQ(picked.size(), 1u);
+    EXPECT_TRUE(queue.complete(picked.front(), kMiB, FAILED).ok());
+
+    TransferStatusEnum status = PENDING;
+    size_t actual_transferred_bytes = 0;
+    EXPECT_TRUE(
+        queue.getPublicStatus(96, 0, status,
+                              &actual_transferred_bytes)
+            .ok());
+    EXPECT_EQ(status, FAILED);
+    EXPECT_EQ(actual_transferred_bytes, kMiB);
 }
 
 void testMixedDirectionPublicBatchRemainsValid() {
@@ -167,7 +216,9 @@ int main() {
     using namespace mooncake::tent;
     testPrimaryOperationFillsWindowBeforeSecondOperation();
     testPhysicalTokensBoundSelection();
+    testMultiPhysicalWriteReservesAvailableConcurrency();
     testActualBytesReconcileReservation();
+    testTerminalOwnerPreservesPartialBytes();
     testMixedDirectionPublicBatchRemainsValid();
     testNonGdsOwnerIsDispatchBarrier();
     std::cout << "admission_queue_operation_test: PASS" << std::endl;

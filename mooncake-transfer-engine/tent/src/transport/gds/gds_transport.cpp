@@ -305,7 +305,22 @@ GdsTransport::~GdsTransport() { uninstall(); }
 size_t GdsTransport::runtimeQueueDispatchLimit(Request::OpCode opcode) const {
     std::lock_guard<std::mutex> scheduler_guard(scheduler_lock_);
     if (opcode == Request::READ) return read_adaptive_.current_limit;
-    return write_adaptive_.current_limit;
+    const bool read_pressure =
+        pending_read_ios_ != 0 || !inflight_direct_reads_.empty() ||
+        runtime_queued_reads_.load(std::memory_order_relaxed) != 0;
+    return gdsFifoEffectiveWriteLimit(
+        write_adaptive_.current_limit,
+        runtime_contended_write_limit_, read_pressure);
+}
+
+Status GdsTransport::setRuntimeQueueContendedWriteLimit(size_t tokens) {
+    std::lock_guard<std::mutex> scheduler_guard(scheduler_lock_);
+    if (tokens == 0 || tokens > max_inflight_writes_) {
+        return Status::InvalidArgument(
+            "runtime contended WRITE limit exceeds GDS pool" LOC_MARK);
+    }
+    runtime_contended_write_limit_ = tokens;
+    return dispatchPendingIoLocked();
 }
 
 void GdsTransport::updateRuntimeQueueDepth(size_t queued_reads,
@@ -353,9 +368,12 @@ Status GdsTransport::install(std::string& local_segment_name,
     const int configured_shared_device_tokens = conf_->get(
         "transports/gds/shared_device_tokens",
         static_cast<int>(kDefaultSharedDeviceTokens));
+    const int configured_contended_write_limit = conf_->get(
+        "runtime_queue/gds_contended_write_tokens", 1);
     if (configured_read_threads <= 0 || configured_write_threads <= 0 ||
         configured_inflight_reads <= 0 || configured_inflight_writes <= 0 ||
-        configured_shared_device_tokens <= 0) {
+        configured_shared_device_tokens <= 0 ||
+        configured_contended_write_limit <= 0) {
         return Status::InvalidArgument(
             "GDS direct IO worker limits must be greater than zero" LOC_MARK);
     }
@@ -373,6 +391,13 @@ Status GdsTransport::install(std::string& local_segment_name,
     max_inflight_ios_ = std::min(
         static_cast<size_t>(configured_shared_device_tokens),
         max_inflight_reads_ + max_inflight_writes_);
+    runtime_contended_write_limit_ =
+        static_cast<size_t>(configured_contended_write_limit);
+    if (runtime_contended_write_limit_ > max_inflight_writes_) {
+        return Status::InvalidArgument(
+            "runtime contended WRITE limit exceeds configured GDS inflight"
+            LOC_MARK);
+    }
     if (static_cast<size_t>(configured_inflight_reads) >
         max_inflight_reads_) {
         LOG(WARNING) << "GDS max_inflight_reads=" << configured_inflight_reads
@@ -516,6 +541,8 @@ Status GdsTransport::install(std::string& local_segment_name,
               << ", write_worker_threads=" << write_worker_threads_
               << ", max_inflight_reads=" << max_inflight_reads_
               << ", max_inflight_writes=" << max_inflight_writes_
+              << ", contended_write_limit="
+              << runtime_contended_write_limit_
               << ", shared_device_tokens=" << max_inflight_ios_
               << ", submit_retry_count=" << submit_retry_count_
               << ", merge_mode="
@@ -939,10 +966,15 @@ Status GdsTransport::dispatchPendingIoLocked() {
     size_t enqueue_failures = 0;
     while (!pending_ios_.empty()) {
         const bool write = pending_ios_.front().operation.write;
+        const bool read_pressure =
+            pending_read_ios_ != 0 || !inflight_direct_reads_.empty() ||
+            runtime_queued_reads_.load(std::memory_order_relaxed) != 0;
         GdsFifoDispatchState state{
             max_inflight_ios_,
             read_adaptive_.current_limit,
-            write_adaptive_.current_limit,
+            gdsFifoEffectiveWriteLimit(
+                write_adaptive_.current_limit,
+                runtime_contended_write_limit_, read_pressure),
             inflight_direct_reads_.size(),
             inflight_direct_writes_.size()};
         if (gdsFifoFrontBlocksQueue(state, write)) break;
@@ -1442,8 +1474,10 @@ Status GdsTransport::submitTransferTasks(
     size_t write_io_count = 0;
     size_t shadow_input_ios = 0;
     size_t shadow_candidate_ios = 0;
-    size_t shadow_candidate_bytes = 0;
+    size_t shadow_input_bytes = 0;
+    size_t shadow_mergeable_bytes = 0;
     size_t shadow_run_bytes = 0;
+    bool shadow_run_has_merge = false;
     int shadow_previous_device = -2;
     bool shadow_has_previous = false;
     IoOperation shadow_previous{};
@@ -1471,7 +1505,7 @@ Status GdsTransport::submitTransferTasks(
             };
             if (merge_shadow_enabled_) {
                 ++shadow_input_ios;
-                shadow_candidate_bytes += length;
+                shadow_input_bytes += length;
                 const bool contiguous =
                     shadow_has_previous &&
                     shadow_previous.write == operation.write &&
@@ -1499,10 +1533,17 @@ Status GdsTransport::submitTransferTasks(
                     shadow_run_bytes <=
                         shadow_max_merge_size - length;
                 if (contiguous) {
+                    if (!shadow_run_has_merge) {
+                        shadow_mergeable_bytes +=
+                            shadow_previous.size;
+                    }
+                    shadow_mergeable_bytes += length;
                     shadow_run_bytes += length;
+                    shadow_run_has_merge = true;
                 } else {
                     ++shadow_candidate_ios;
                     shadow_run_bytes = length;
+                    shadow_run_has_merge = false;
                 }
                 shadow_previous = operation;
                 shadow_previous_device =
@@ -1541,7 +1582,8 @@ Status GdsTransport::submitTransferTasks(
             << ", candidate_ios=" << shadow_candidate_ios
             << ", candidate_reduction="
             << (shadow_input_ios - shadow_candidate_ios)
-            << ", candidate_bytes=" << shadow_candidate_bytes
+            << ", input_bytes=" << shadow_input_bytes
+            << ", mergeable_bytes=" << shadow_mergeable_bytes
             << ", max_candidate_bytes=" << shadow_max_merge_size
             << ", execution_enabled=false";
     }

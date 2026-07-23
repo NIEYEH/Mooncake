@@ -134,6 +134,8 @@ class GdsTransport : public Transport {
 
     size_t runtimeQueueDispatchLimit(Request::OpCode opcode) const override;
 
+    Status setRuntimeQueueContendedWriteLimit(size_t tokens) override;
+
     void updateRuntimeQueueDepth(size_t queued_reads,
                                  size_t queued_writes) override;
 
@@ -225,6 +227,7 @@ class GdsTransport : public Transport {
     size_t max_inflight_ios_;
     size_t max_inflight_reads_;
     size_t max_inflight_writes_;
+    size_t runtime_contended_write_limit_{1};
     size_t submit_retry_count_;
     bool merge_shadow_enabled_;
     bool adaptive_concurrency_enabled_;

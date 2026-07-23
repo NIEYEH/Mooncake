@@ -342,6 +342,7 @@ class TransferEngineImpl {
         std::vector<size_t> public_task_ids;
         size_t byte_charge{0};
         QueuePhysicalPlan physical_plan{};
+        size_t dispatch_token_charge{0};
         std::chrono::steady_clock::time_point enqueue_time{};
         TransportType initial_transport{UNSPEC};
         bool in_dispatch_window{false};

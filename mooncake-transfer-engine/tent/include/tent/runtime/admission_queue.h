@@ -111,7 +111,11 @@ class LocalTransferAdmissionQueue {
                         QueueOwnerId& owner_id) const;
 
     Status getPublicStatus(uint64_t batch_token, size_t public_task_id,
-                           TransferStatusEnum& status) const;
+                           TransferStatusEnum& status,
+                           size_t* actual_transferred_bytes = nullptr) const;
+
+    Status getGdsReservationTokens(QueueOwnerId owner_id,
+                                   size_t& tokens) const;
 
     size_t outstandingOwners() const;
 
@@ -140,8 +144,10 @@ class LocalTransferAdmissionQueue {
         QueueOwnerKind kind{QueueOwnerKind::User};
         QueuePhysicalPlan physical_plan{};
         uint64_t gds_reservation_id{0};
+        size_t gds_reservation_tokens{0};
         QueueState state{QueueState::Queued};
         TransferStatusEnum terminal_status{TransferStatusEnum::PENDING};
+        size_t actual_transferred_bytes{0};
     };
 
     QueueLimits limits_;

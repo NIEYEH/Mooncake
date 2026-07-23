@@ -221,6 +221,7 @@ class GdsOperationScheduler {
     struct OperationState {
         GdsDirection direction{GdsDirection::Read};
         size_t queued_entries{0};
+        size_t reserved_entries{0};
         size_t reserved_bytes{0};
         size_t reserved_tokens{0};
         bool canceled{false};
@@ -243,11 +244,13 @@ class GdsOperationScheduler {
     size_t directionTokenLimit(GdsDirection direction,
                                bool contended) const;
 
+    size_t reservationTokenCharge(const GdsDispatchEntry& entry,
+                                  bool contended) const;
+
     uint64_t primaryReadOperation();
 
     std::deque<GdsDispatchEntry>::iterator findCandidate(
-        GdsDirection direction, const GdsDispatchBudget& budget,
-        size_t secondary_requests, size_t secondary_bytes);
+        GdsDirection direction, const GdsDispatchBudget& budget);
 
     bool canReserve(const GdsDispatchEntry& entry,
                     const GdsDispatchBudget& budget);
@@ -264,7 +267,8 @@ class GdsOperationScheduler {
                                          bool write_backlog);
 
     GdsDispatchReservation reserve(
-        std::deque<GdsDispatchEntry>::iterator entry, bool wdrr_charged);
+        std::deque<GdsDispatchEntry>::iterator entry, bool wdrr_charged,
+        size_t token_charge);
 
     void cleanupOperationOrder();
 
