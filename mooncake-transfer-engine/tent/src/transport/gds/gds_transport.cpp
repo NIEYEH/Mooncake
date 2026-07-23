@@ -55,13 +55,17 @@ constexpr size_t kDefaultAdaptiveSampleWindow = 128;
 constexpr size_t kDefaultAdaptiveEvaluationInterval = 32;
 constexpr size_t kDefaultAdaptiveRecoveryWindows = 3;
 constexpr size_t kDefaultMinReadInflight = 4;
-constexpr size_t kDefaultMinWriteInflight = 2;
+constexpr size_t kDefaultMinWriteInflight = 1;
 constexpr double kDefaultAdaptiveDegradationRatio = 1.25;
 constexpr double kDefaultAdaptiveRecoveryRatio = 1.05;
 constexpr double kAdaptiveLoadedRecoveryRatio = 1.00;
 constexpr size_t kDefaultWriteP99TargetUs = 10000;
 constexpr size_t kDefaultWriteStarvationTimeoutUs = 100000;
 constexpr size_t kSubmitRetryBackoffUs = 50;
+constexpr size_t kIoSummarySampleCapacity = 4096;
+constexpr auto kIoSummaryInterval = std::chrono::seconds(1);
+constexpr auto kMinimumDegradedWarningInterval =
+    std::chrono::seconds(10);
 
 class CudaDeviceGuard {
    public:
@@ -120,6 +124,37 @@ size_t gdsAvailableWorkerSlots(size_t effective_limit,
                : 0;
 }
 
+size_t gdsEffectiveWriteLimit(size_t adaptive_write_limit,
+                              bool reads_active) {
+    if (adaptive_write_limit == 0) return 0;
+    return reads_active ? std::min<size_t>(adaptive_write_limit, 1)
+                        : adaptive_write_limit;
+}
+
+bool gdsReadWindowSaturated(size_t effective_read_limit,
+                            size_t inflight_reads,
+                            size_t inflight_writes,
+                            bool write_is_at_minimum) {
+    if (effective_read_limit == 0) return false;
+    if (inflight_reads >= effective_read_limit) return true;
+    // READ owns the latency-sensitive path. While WRITE can still be
+    // reduced, mixed-device pressure is attributed to WRITE first. Once
+    // WRITE is at its floor, account for its unavoidable shared occupancy
+    // without using an overflow-prone addition.
+    return write_is_at_minimum &&
+           inflight_writes >= effective_read_limit - inflight_reads;
+}
+
+double gdsNearestRankP99(std::vector<double> samples) {
+    if (samples.empty()) return 0.0;
+    const size_t index = std::min(
+        samples.size() - 1,
+        static_cast<size_t>(std::ceil(samples.size() * 0.99)) - 1);
+    std::nth_element(samples.begin(), samples.begin() + index,
+                     samples.end());
+    return samples[index];
+}
+
 bool gdsAdaptiveEvaluationReady(const GdsAdaptiveState& state,
                                 size_t sample_window,
                                 size_t evaluation_interval) {
@@ -150,6 +185,7 @@ GdsAdaptiveAction adjustGdsAdaptiveConcurrency(
     if (degraded) {
         state.healthy_windows = 0;
         if (state.current_limit > state.minimum_limit) {
+            state.degraded_at_minimum_windows = 0;
             const size_t reduction =
                 std::max<size_t>(1, state.current_limit / 4);
             state.current_limit = std::max(
@@ -158,8 +194,13 @@ GdsAdaptiveAction adjustGdsAdaptiveConcurrency(
         }
         // Freeze the baseline at the minimum: overload must never normalize
         // itself into a healthy signal and trigger a later increase.
-        return GdsAdaptiveAction::NONE;
+        if (state.degraded_at_minimum_windows <
+            std::numeric_limits<size_t>::max()) {
+            ++state.degraded_at_minimum_windows;
+        }
+        return GdsAdaptiveAction::HOLD_AT_MINIMUM;
     }
+    state.degraded_at_minimum_windows = 0;
 
     if (!saturated && queued_ios == 0) {
         const double baseline_weight =
@@ -261,8 +302,12 @@ GdsTransport::~GdsTransport() { uninstall(); }
 
 size_t GdsTransport::runtimeQueueDispatchLimit(Request::OpCode opcode) const {
     std::lock_guard<std::mutex> scheduler_guard(scheduler_lock_);
-    return opcode == Request::READ ? read_adaptive_.current_limit
-                                   : write_adaptive_.current_limit;
+    if (opcode == Request::READ) return read_adaptive_.current_limit;
+    const bool reads_active =
+        !pending_reads_.empty() || !inflight_direct_reads_.empty() ||
+        runtime_queued_reads_.load(std::memory_order_relaxed) > 0;
+    return gdsEffectiveWriteLimit(write_adaptive_.current_limit,
+                                  reads_active);
 }
 
 void GdsTransport::updateRuntimeQueueDepth(size_t queued_reads,
@@ -429,6 +474,19 @@ Status GdsTransport::install(std::string& local_segment_name,
     write_window_blocked_ = false;
     runtime_queued_reads_.store(0, std::memory_order_relaxed);
     runtime_queued_writes_.store(0, std::memory_order_relaxed);
+    read_io_summary_ = IoSummaryDirection{};
+    write_io_summary_ = IoSummaryDirection{};
+    for (auto* samples : {&read_io_summary_.queue_wait_us,
+                          &read_io_summary_.io_latency_us,
+                          &read_io_summary_.total_latency_us,
+                          &write_io_summary_.queue_wait_us,
+                          &write_io_summary_.io_latency_us,
+                          &write_io_summary_.total_latency_us}) {
+        samples->reserve(kIoSummarySampleCapacity);
+    }
+    io_summary_started_at_ = std::chrono::steady_clock::now();
+    last_read_minimum_degraded_warning_at_ = {};
+    last_write_minimum_degraded_warning_at_ = {};
 
     CUfileDrvProps_t properties{};
     auto properties_result = cuFileDriverGetProperties(&properties);
@@ -719,7 +777,10 @@ Status GdsTransport::dispatchDirectIoLocked(bool write,
 
     const size_t available_slots = gdsAvailableWorkerSlots(
         adaptive.current_limit, inflight_ios.size());
-    if (available_slots == 0) return Status::OK();
+    if (available_slots == 0) {
+        markSaturatedIoLocked();
+        return Status::OK();
+    }
     const size_t schedule_count =
         std::min({available_slots, max_to_schedule, pending_ios.size()});
     if (schedule_count == 0) return Status::OK();
@@ -757,16 +818,7 @@ Status GdsTransport::dispatchDirectIoLocked(bool write,
                        << operation_name << ": " << error.what();
         }
     }
-    if (inflight_ios.size() >= adaptive.current_limit) {
-        // A refill can take an existing window from N-1 to N. Mark every IO
-        // sharing the saturated window, since older IOs may complete first
-        // and trigger evaluation before the refill IO finishes.
-        for (auto& entry : inflight_ios) {
-            if (entry.second) {
-                entry.second->dispatched_at_capacity = true;
-            }
-        }
-    }
+    markSaturatedIoLocked();
 
     if (!scheduled.empty()) {
         LOG_EVERY_N(INFO, 64)
@@ -799,6 +851,9 @@ void GdsTransport::executeDirectIo(std::shared_ptr<DirectIo> direct_io) {
         auto& active_workers =
             write ? active_write_workers_ : active_read_workers_;
         ++active_workers;
+        auto& summary = write ? write_io_summary_ : read_io_summary_;
+        summary.peak_active_workers =
+            std::max(summary.peak_active_workers, active_workers);
         worker_started_at = std::chrono::steady_clock::now();
         updateIoMetricsLocked();
     }
@@ -876,6 +931,10 @@ void GdsTransport::executeDirectIo(std::shared_ptr<DirectIo> direct_io) {
     TentMetrics::instance().recordGdsDirectIo(
         !write, direct_io->operation.size, final_status == COMPLETED,
         queue_wait_seconds, io_seconds, total_seconds);
+    recordIoSummaryLocked(
+        write, transferred_bytes, final_status == COMPLETED,
+        queue_wait_seconds * 1e6, io_seconds * 1e6,
+        total_seconds * 1e6);
     if (final_status == COMPLETED) {
         LOG_EVERY_N(INFO, 256)
             << "Parallel " << operation_name
@@ -983,6 +1042,151 @@ Status GdsTransport::dispatchPendingIoLocked() {
     return Status::OK();
 }
 
+void GdsTransport::markSaturatedIoLocked() {
+    const bool reads_active =
+        !pending_reads_.empty() || !inflight_direct_reads_.empty() ||
+        runtime_queued_reads_.load(std::memory_order_relaxed) > 0;
+    const size_t effective_write_limit = gdsEffectiveWriteLimit(
+        write_adaptive_.current_limit, reads_active);
+
+    if (effective_write_limit > 0 &&
+        inflight_direct_writes_.size() >= effective_write_limit) {
+        // Under READ pressure the scheduler deliberately exposes only one
+        // WRITE slot. Treat that real dispatch ceiling as saturation so slow
+        // mixed WRITE samples can reduce the adaptive limit from 4/2 to 1.
+        for (auto& entry : inflight_direct_writes_) {
+            if (entry.second) entry.second->dispatched_at_capacity = true;
+        }
+    }
+
+    if (gdsReadWindowSaturated(
+            read_adaptive_.current_limit,
+            inflight_direct_reads_.size(),
+            inflight_direct_writes_.size(),
+            write_adaptive_.current_limit <=
+                write_adaptive_.minimum_limit)) {
+        // Mark every READ sharing the full device window. WRITE pressure is
+        // counted only after WRITE reached its floor, preserving READ-first
+        // adaptation.
+        for (auto& entry : inflight_direct_reads_) {
+            if (entry.second) entry.second->dispatched_at_capacity = true;
+        }
+    }
+}
+
+void GdsTransport::recordIoSummaryLocked(
+    bool write, size_t transferred_bytes, bool success,
+    double queue_wait_us, double io_latency_us,
+    double total_latency_us) {
+    auto& summary = write ? write_io_summary_ : read_io_summary_;
+    ++summary.completions;
+    if (!success) ++summary.failures;
+    if (transferred_bytes <=
+        std::numeric_limits<size_t>::max() - summary.bytes) {
+        summary.bytes += transferred_bytes;
+    } else {
+        summary.bytes = std::numeric_limits<size_t>::max();
+    }
+    summary.peak_active_workers = std::max(
+        summary.peak_active_workers,
+        write ? active_write_workers_ : active_read_workers_);
+
+    const size_t sample_index =
+        summary.samples_seen % kIoSummarySampleCapacity;
+    auto append_sample = [sample_index](std::vector<double>& samples,
+                                        double value) {
+        if (samples.size() < kIoSummarySampleCapacity) {
+            samples.push_back(value);
+        } else {
+            samples[sample_index] = value;
+        }
+    };
+    append_sample(summary.queue_wait_us, queue_wait_us);
+    append_sample(summary.io_latency_us, io_latency_us);
+    append_sample(summary.total_latency_us, total_latency_us);
+    ++summary.samples_seen;
+
+    maybeLogIoSummaryLocked(std::chrono::steady_clock::now());
+}
+
+void GdsTransport::maybeLogIoSummaryLocked(
+    std::chrono::steady_clock::time_point now) {
+    if (io_summary_started_at_.time_since_epoch().count() == 0) {
+        io_summary_started_at_ = now;
+        return;
+    }
+    const auto elapsed = now - io_summary_started_at_;
+    if (elapsed < kIoSummaryInterval) return;
+
+    const double elapsed_seconds =
+        std::chrono::duration<double>(elapsed).count();
+    LOG(INFO)
+        << "GDS IO 1s summary: window_ms=" << elapsed_seconds * 1000.0
+        << ", READ{completions=" << read_io_summary_.completions
+        << ", failures=" << read_io_summary_.failures
+        << ", bytes=" << read_io_summary_.bytes
+        << ", throughput_mib_s="
+        << static_cast<double>(read_io_summary_.bytes) /
+               (1024.0 * 1024.0 * elapsed_seconds)
+        << ", queue_wait_p99_us="
+        << gdsNearestRankP99(read_io_summary_.queue_wait_us)
+        << ", cufile_p99_us="
+        << gdsNearestRankP99(read_io_summary_.io_latency_us)
+        << ", total_p99_us="
+        << gdsNearestRankP99(read_io_summary_.total_latency_us)
+        << ", active_workers=" << active_read_workers_
+        << ", peak_active_workers="
+        << read_io_summary_.peak_active_workers
+        << ", inflight=" << inflight_direct_reads_.size()
+        << ", internal_queued=" << pending_reads_.size()
+        << ", runtime_queued_owners="
+        << runtime_queued_reads_.load(std::memory_order_relaxed)
+        << ", effective_limit=" << read_adaptive_.current_limit
+        << "}, WRITE{completions=" << write_io_summary_.completions
+        << ", failures=" << write_io_summary_.failures
+        << ", bytes=" << write_io_summary_.bytes
+        << ", throughput_mib_s="
+        << static_cast<double>(write_io_summary_.bytes) /
+               (1024.0 * 1024.0 * elapsed_seconds)
+        << ", queue_wait_p99_us="
+        << gdsNearestRankP99(write_io_summary_.queue_wait_us)
+        << ", cufile_p99_us="
+        << gdsNearestRankP99(write_io_summary_.io_latency_us)
+        << ", total_p99_us="
+        << gdsNearestRankP99(write_io_summary_.total_latency_us)
+        << ", active_workers=" << active_write_workers_
+        << ", peak_active_workers="
+        << write_io_summary_.peak_active_workers
+        << ", inflight=" << inflight_direct_writes_.size()
+        << ", internal_queued=" << pending_writes_.size()
+        << ", runtime_queued_owners="
+        << runtime_queued_writes_.load(std::memory_order_relaxed)
+        << ", effective_limit=" << write_adaptive_.current_limit
+        << ", runtime_dispatch_limit="
+        << gdsEffectiveWriteLimit(
+               write_adaptive_.current_limit,
+               !pending_reads_.empty() ||
+                   !inflight_direct_reads_.empty() ||
+                   runtime_queued_reads_.load(
+                       std::memory_order_relaxed) > 0)
+        << "}}";
+
+    auto reset_summary = [](IoSummaryDirection& summary,
+                            size_t active_workers) {
+        summary.completions = 0;
+        summary.failures = 0;
+        summary.bytes = 0;
+        summary.peak_active_workers = active_workers;
+        summary.samples_seen = 0;
+        summary.queue_wait_us.clear();
+        summary.io_latency_us.clear();
+        summary.total_latency_us.clear();
+    };
+    reset_summary(read_io_summary_, active_read_workers_);
+    reset_summary(write_io_summary_, active_write_workers_);
+    io_summary_started_at_ = now;
+}
+
 void GdsTransport::updateIoMetricsLocked() const {
     TentMetrics::instance().updateGdsIoState(
         pending_reads_.size(), pending_read_bytes_,
@@ -1015,13 +1219,9 @@ void GdsTransport::evaluateAdaptiveConcurrencyLocked(bool write) {
     auto& state = write ? write_adaptive_ : read_adaptive_;
     if (state.recent_io_latency_us.empty()) return;
 
-    std::vector<double> sorted(state.recent_io_latency_us.begin(),
-                               state.recent_io_latency_us.end());
-    std::sort(sorted.begin(), sorted.end());
-    const size_t p99_index = std::min(
-        sorted.size() - 1,
-        static_cast<size_t>(std::ceil(sorted.size() * 0.99)) - 1);
-    const double p99_us = sorted[p99_index];
+    const double p99_us = gdsNearestRankP99(std::vector<double>(
+        state.recent_io_latency_us.begin(),
+        state.recent_io_latency_us.end()));
     const auto& pending = write ? pending_writes_ : pending_reads_;
     const size_t runtime_queued =
         write ? runtime_queued_writes_.load(std::memory_order_relaxed)
@@ -1041,6 +1241,30 @@ void GdsTransport::evaluateAdaptiveConcurrencyLocked(bool write) {
     if (action == GdsAdaptiveAction::NONE) return;
 
     state.recent_io_latency_us.clear();
+    if (action == GdsAdaptiveAction::HOLD_AT_MINIMUM) {
+        auto& last_warning =
+            write ? last_write_minimum_degraded_warning_at_
+                  : last_read_minimum_degraded_warning_at_;
+        const auto now = std::chrono::steady_clock::now();
+        if (last_warning.time_since_epoch().count() == 0 ||
+            now - last_warning >= kMinimumDegradedWarningInterval) {
+            LOG(WARNING)
+                << "GDS adaptive concurrency remains degraded at minimum "
+                << (write ? "WRITE" : "READ")
+                << " inflight=" << state.current_limit
+                << ", consecutive_degraded_windows="
+                << state.degraded_at_minimum_windows
+                << ", rolling_p99_us=" << p99_us
+                << ", baseline_p99_us=" << state.baseline_p99_us
+                << ", target_p99_us=" << state.target_p99_us
+                << ", reached_effective_limit="
+                << reached_effective_limit
+                << ", internal_queued_ios=" << pending.size()
+                << ", runtime_queued_owners=" << runtime_queued;
+            last_warning = now;
+        }
+        return;
+    }
     const bool reduced = action == GdsAdaptiveAction::REDUCE;
     TentMetrics::instance().recordGdsAdaptiveConcurrency(
         !write, reduced, state.current_limit);

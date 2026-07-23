@@ -21,16 +21,21 @@ results_root=${RESULT_ROOT:-"results"}
 # Readiness only covers server startup. These requests execute the real vLLM
 # scheduler/attention path before benchmark_serving.py starts its timer, so
 # Triton kernels (including _compute_slot_mapping_kernel on V1) compile during
-# warmup. A round-robin proxy needs at least one request per participating
-# instance; four rounds per instance also exercise a small steady-state load.
+# warmup. Every timed input/output shape is repeated across all round-robin
+# slots, followed by a sustained concurrent load that exercises batch
+# scheduling before measurements begin.
 VLLM_WARMUP_ENABLED=${VLLM_WARMUP_ENABLED:-1}
 VLLM_WARMUP_SCRIPT=${VLLM_WARMUP_SCRIPT:-"${SCRIPT_DIR}/../../vllm_warmup.py"}
 VLLM_WARMUP_REQUESTS_PER_INSTANCE=${VLLM_WARMUP_REQUESTS_PER_INSTANCE:-4}
-VLLM_WARMUP_CONCURRENCY=${VLLM_WARMUP_CONCURRENCY:-4}
-VLLM_WARMUP_PROMPT_TOKEN_COUNTS=${VLLM_WARMUP_PROMPT_TOKEN_COUNTS:-"8,128,512"}
-VLLM_WARMUP_MIN_DURATION_SECONDS=${VLLM_WARMUP_MIN_DURATION_SECONDS:-30}
-VLLM_WARMUP_SETTLE_SECONDS=${VLLM_WARMUP_SETTLE_SECONDS:-10}
-VLLM_WARMUP_MAX_TOKENS=${VLLM_WARMUP_MAX_TOKENS:-8}
+VLLM_WARMUP_CONCURRENCY=${VLLM_WARMUP_CONCURRENCY:-16}
+# Match every timed benchmark shape. warmup_vllm_cluster repeats each shape
+# once per round-robin slot so every prefill and decode engine sees it.
+VLLM_WARMUP_PROMPT_TOKEN_COUNTS=${VLLM_WARMUP_PROMPT_TOKEN_COUNTS:-"1024,4096"}
+VLLM_WARMUP_OUTPUT_TOKEN_COUNTS=${VLLM_WARMUP_OUTPUT_TOKEN_COUNTS:-"6,256"}
+VLLM_WARMUP_MIN_DURATION_SECONDS=${VLLM_WARMUP_MIN_DURATION_SECONDS:-60}
+VLLM_WARMUP_SETTLE_SECONDS=${VLLM_WARMUP_SETTLE_SECONDS:-15}
+# Deprecated compatibility override. Leave unset to warm both output shapes.
+VLLM_WARMUP_MAX_TOKENS=${VLLM_WARMUP_MAX_TOKENS:-}
 VLLM_WARMUP_NAMESPACE=${VLLM_WARMUP_NAMESPACE:-"xypd-$$"}
 
 PROXY_ID=0
@@ -95,6 +100,12 @@ warmup_vllm_cluster() {
   fi
   local warmup_requests=$((max_instances * VLLM_WARMUP_REQUESTS_PER_INSTANCE))
   local warmup_summary="${logs_root}/warmup-${topology}.json"
+  local output_shape_args=(
+    --output-token-counts "${VLLM_WARMUP_OUTPUT_TOKEN_COUNTS}"
+  )
+  if [ -n "${VLLM_WARMUP_MAX_TOKENS}" ]; then
+    output_shape_args=(--max-tokens "${VLLM_WARMUP_MAX_TOKENS}")
+  fi
 
   echo "Warming vLLM topology ${topology} before timed traffic (${warmup_requests} load requests)"
   python3 "${VLLM_WARMUP_SCRIPT}" \
@@ -102,11 +113,12 @@ warmup_vllm_cluster() {
     --ready-path "/status" \
     --model "${MODEL}" \
     --prompt-token-counts "${VLLM_WARMUP_PROMPT_TOKEN_COUNTS}" \
+    "${output_shape_args[@]}" \
+    --compile-probe-repetitions "${max_instances}" \
     --requests "${warmup_requests}" \
     --concurrency "${VLLM_WARMUP_CONCURRENCY}" \
     --min-duration-seconds "${VLLM_WARMUP_MIN_DURATION_SECONDS}" \
     --settle-seconds "${VLLM_WARMUP_SETTLE_SECONDS}" \
-    --max-tokens "${VLLM_WARMUP_MAX_TOKENS}" \
     --namespace "${VLLM_WARMUP_NAMESPACE}" \
     --output "${warmup_summary}"
 }

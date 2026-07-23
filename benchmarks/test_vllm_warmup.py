@@ -83,11 +83,13 @@ class VllmWarmupTest(unittest.TestCase):
             ready_path="/status",
             model="test-model",
             prompt_token_counts=(8, 16),
+            output_token_counts=(2, 4),
+            compile_probe_repetitions=1,
             requests=3,
             concurrency=2,
             min_duration_seconds=0,
             batch_interval_seconds=0,
-            max_tokens=2,
+            max_tokens=None,
             request_timeout_seconds=2,
             ready_timeout_seconds=2,
             settle_seconds=0,
@@ -98,12 +100,28 @@ class VllmWarmupTest(unittest.TestCase):
         summary = vllm_warmup.run_warmup(self._config())
 
         self.assertTrue(summary["success"])
-        self.assertEqual(summary["compile_probe_requests"], 2)
+        self.assertEqual(summary["compile_probe_requests"], 4)
         self.assertEqual(summary["load_requests"], 3)
-        self.assertEqual(summary["requests"], 5)
-        self.assertEqual(len(_FakeVllmHandler.post_payloads), 5)
+        self.assertEqual(summary["requests"], 7)
+        self.assertEqual(len(_FakeVllmHandler.post_payloads), 7)
+        self.assertEqual(
+            summary["compile_probe_shapes"],
+            [
+                {"prompt_tokens": 8, "output_tokens": 2},
+                {"prompt_tokens": 8, "output_tokens": 4},
+                {"prompt_tokens": 16, "output_tokens": 2},
+                {"prompt_tokens": 16, "output_tokens": 4},
+            ],
+        )
+        self.assertEqual(
+            {item["max_tokens"] for item in _FakeVllmHandler.post_payloads},
+            {2, 4},
+        )
         self.assertTrue(
             all(item["stream"] is False for item in _FakeVllmHandler.post_payloads)
+        )
+        self.assertTrue(
+            all(item["ignore_eos"] is True for item in _FakeVllmHandler.post_payloads)
         )
         self.assertTrue(
             all(
@@ -119,18 +137,6 @@ class VllmWarmupTest(unittest.TestCase):
 
     def test_load_minimum_duration_starts_after_compile_probes(self) -> None:
         calls = 0
-
-        def fake_request(*_args: object, **_kwargs: object) -> dict:
-            nonlocal calls
-            calls += 1
-            if calls <= len(self._config().prompt_token_counts):
-                time.sleep(0.03)
-            return {
-                "latency_seconds": 0.001,
-                "prompt_tokens": 1,
-                "completion_tokens": 1,
-            }
-
         config = replace(
             self._config(),
             requests=1,
@@ -138,6 +144,23 @@ class VllmWarmupTest(unittest.TestCase):
             min_duration_seconds=0.04,
             batch_interval_seconds=0.005,
         )
+        compile_probe_requests = (
+            len(config.prompt_token_counts)
+            * len(config.output_token_counts)
+            * config.compile_probe_repetitions
+        )
+
+        def fake_request(*_args: object, **_kwargs: object) -> dict:
+            nonlocal calls
+            calls += 1
+            if calls <= compile_probe_requests:
+                time.sleep(0.03)
+            return {
+                "latency_seconds": 0.001,
+                "prompt_tokens": 1,
+                "completion_tokens": 1,
+            }
+
         with patch.object(
             vllm_warmup, "send_inference_request", side_effect=fake_request
         ):
@@ -152,6 +175,63 @@ class VllmWarmupTest(unittest.TestCase):
         )
         with self.assertRaises(Exception):
             vllm_warmup.parse_prompt_token_counts("32,0")
+
+    def test_compile_probe_repetitions_cover_every_shape(self) -> None:
+        config = replace(
+            self._config(),
+            prompt_token_counts=(1024, 4096),
+            output_token_counts=(6, 256),
+            compile_probe_repetitions=3,
+            requests=0,
+        )
+        summary = vllm_warmup.run_warmup(config)
+
+        self.assertEqual(summary["compile_probe_requests"], 12)
+        self.assertEqual(summary["requests"], 12)
+        shape_counts: dict[tuple[int, int], int] = {}
+        for payload in _FakeVllmHandler.post_payloads:
+            content = payload["messages"][0]["content"]
+            prompt = 4096 if content.count("warmup ") == 4096 else 1024
+            key = (prompt, payload["max_tokens"])
+            shape_counts[key] = shape_counts.get(key, 0) + 1
+        self.assertEqual(
+            shape_counts,
+            {(1024, 6): 3, (1024, 256): 3, (4096, 6): 3, (4096, 256): 3},
+        )
+
+    def test_max_tokens_remains_a_compatibility_override(self) -> None:
+        args = vllm_warmup.build_parser().parse_args(
+            ["--model", "test-model", "--max-tokens", "17"]
+        )
+        config = vllm_warmup.config_from_args(args)
+        self.assertEqual(config.max_tokens, 17)
+        self.assertEqual(
+            config.output_token_counts, vllm_warmup.DEFAULT_OUTPUT_TOKEN_COUNTS
+        )
+
+        summary = vllm_warmup.run_warmup(
+            replace(
+                self._config(),
+                max_tokens=config.max_tokens,
+                output_token_counts=config.output_token_counts,
+                requests=0,
+            )
+        )
+        self.assertEqual(summary["compile_probe_output_token_counts"], [17])
+        self.assertTrue(
+            all(
+                payload["max_tokens"] == 17
+                for payload in _FakeVllmHandler.post_payloads
+            )
+        )
+
+    def test_cli_defaults_match_timed_benchmark_shapes(self) -> None:
+        args = vllm_warmup.build_parser().parse_args(["--model", "test-model"])
+        self.assertEqual(args.prompt_token_counts, (1024, 4096))
+        self.assertEqual(args.output_token_counts, (6, 256))
+        self.assertEqual(args.concurrency, 16)
+        self.assertEqual(args.min_duration_seconds, 60)
+        self.assertEqual(args.settle_seconds, 15)
 
 
 if __name__ == "__main__":

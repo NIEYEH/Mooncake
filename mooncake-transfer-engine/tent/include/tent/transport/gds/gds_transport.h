@@ -54,7 +54,12 @@ struct GdsSubBatch : public Transport::SubBatch {
     virtual size_t size() const { return io_param_ranges.size(); }
 };
 
-enum class GdsAdaptiveAction { NONE, REDUCE, RECOVER };
+enum class GdsAdaptiveAction {
+    NONE,
+    REDUCE,
+    RECOVER,
+    HOLD_AT_MINIMUM
+};
 
 // Pure adaptive-control state and helpers are intentionally independent of a
 // CUDA device so overload behavior remains covered by ordinary unit tests.
@@ -64,6 +69,7 @@ struct GdsAdaptiveState {
     size_t minimum_limit{1};
     size_t completions_since_evaluation{0};
     size_t healthy_windows{0};
+    size_t degraded_at_minimum_windows{0};
     double target_p99_us{0.0};
     double baseline_p99_us{0.0};
     bool saturation_since_evaluation{false};
@@ -81,6 +87,16 @@ bool gdsAdaptiveEvaluationReady(const GdsAdaptiveState& state,
 
 size_t gdsAvailableWorkerSlots(size_t effective_limit,
                                size_t inflight_ios);
+
+size_t gdsEffectiveWriteLimit(size_t adaptive_write_limit,
+                              bool reads_active);
+
+bool gdsReadWindowSaturated(size_t effective_read_limit,
+                            size_t inflight_reads,
+                            size_t inflight_writes,
+                            bool write_is_at_minimum);
+
+double gdsNearestRankP99(std::vector<double> samples);
 
 class GdsTransport : public Transport {
    public:
@@ -178,6 +194,16 @@ class GdsTransport : public Transport {
 
     void evaluateAdaptiveConcurrencyLocked(bool write);
 
+    void markSaturatedIoLocked();
+
+    void recordIoSummaryLocked(bool write, size_t transferred_bytes,
+                               bool success, double queue_wait_us,
+                               double io_latency_us,
+                               double total_latency_us);
+
+    void maybeLogIoSummaryLocked(
+        std::chrono::steady_clock::time_point now);
+
    private:
     bool installed_;
     std::string local_segment_name_;
@@ -227,6 +253,24 @@ class GdsTransport : public Transport {
     std::atomic<bool> shutting_down_{false};
     std::atomic<size_t> runtime_queued_reads_{0};
     std::atomic<size_t> runtime_queued_writes_{0};
+
+    struct IoSummaryDirection {
+        size_t completions{0};
+        size_t failures{0};
+        size_t bytes{0};
+        size_t peak_active_workers{0};
+        size_t samples_seen{0};
+        std::vector<double> queue_wait_us;
+        std::vector<double> io_latency_us;
+        std::vector<double> total_latency_us;
+    };
+    IoSummaryDirection read_io_summary_;
+    IoSummaryDirection write_io_summary_;
+    std::chrono::steady_clock::time_point io_summary_started_at_;
+    std::chrono::steady_clock::time_point
+        last_read_minimum_degraded_warning_at_;
+    std::chrono::steady_clock::time_point
+        last_write_minimum_degraded_warning_at_;
 
     // Track all allocated sub-batches to clean up on uninstall.
     std::vector<GdsSubBatch*> allocated_batches_;

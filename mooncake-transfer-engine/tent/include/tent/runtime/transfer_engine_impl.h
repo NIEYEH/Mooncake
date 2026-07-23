@@ -255,6 +255,16 @@ class TransferEngineImpl {
 
     void updateRuntimeQueueMetrics();
 
+    void recordRuntimeQueueWaitSummary(bool read,
+                                       double queue_wait_seconds);
+
+    void recordRuntimeQueueCompletionSummary(
+        bool read, size_t bytes, TransferStatusEnum terminal_status,
+        double total_latency_seconds);
+
+    void maybeLogRuntimeQueueSummary(
+        std::chrono::steady_clock::time_point now);
+
     Status pollTaskStatus(Batch* batch, size_t task_id,
                           TransferStatus& task_status);
 
@@ -304,6 +314,11 @@ class TransferEngineImpl {
         QueueLimits limits{};
         size_t max_dispatch_owners{0};
         size_t max_dispatch_bytes{0};
+        // Owners not yet admitted are bounded separately from the active
+        // admission queue. This lets a large public submit stream through the
+        // smaller active window without allowing an unbounded deferred list.
+        size_t max_waiting_owners{0};
+        size_t max_waiting_bytes{0};
         // Directional caps apply to GDS owners only. All transports still
         // share the global owner/byte window above.
         size_t max_dispatch_read_owners{0};
@@ -332,6 +347,17 @@ class TransferEngineImpl {
         std::chrono::steady_clock::time_point enqueue_time{};
         TransportType initial_transport{UNSPEC};
         QueueOwnerKind kind{QueueOwnerKind::User};
+    };
+
+    struct RuntimeQueueSummaryDirection {
+        size_t dispatches{0};
+        size_t completions{0};
+        size_t failures{0};
+        size_t bytes{0};
+        size_t queue_wait_samples_seen{0};
+        size_t total_latency_samples_seen{0};
+        std::vector<double> queue_wait_us;
+        std::vector<double> total_latency_us;
     };
 
    private:
@@ -378,6 +404,9 @@ class TransferEngineImpl {
     static constexpr size_t kMaxConsecutiveAdmissionReads = 16;
     size_t consecutive_admission_read_owners_{0};
     uint64_t next_batch_token_{1};
+    std::array<RuntimeQueueSummaryDirection, 2> runtime_queue_summary_;
+    std::chrono::steady_clock::time_point
+        runtime_queue_summary_started_at_{};
 
     // Guards alive_batches_ and serializes pollTaskStatus /
     // updateTaskStatusAfterPoll / lazyFreeBatch against the optional

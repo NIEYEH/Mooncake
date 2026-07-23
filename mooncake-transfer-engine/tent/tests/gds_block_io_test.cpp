@@ -153,7 +153,7 @@ std::shared_ptr<Config> makeGdsConfig() {
     config->set("transports/gds/adaptive_evaluation_interval", 32);
     config->set("transports/gds/adaptive_recovery_windows", 3);
     config->set("transports/gds/adaptive_min_read_inflight", 4);
-    config->set("transports/gds/adaptive_min_write_inflight", 2);
+    config->set("transports/gds/adaptive_min_write_inflight", 1);
     config->set("transports/gds/adaptive_p99_degradation_ratio", 1.25);
     config->set("transports/gds/adaptive_p99_recovery_ratio", 1.05);
     config->set("transports/gds/adaptive_read_p99_target_us", 60000);
@@ -388,6 +388,67 @@ TEST(GdsAdaptiveConcurrencyTest,
     EXPECT_DOUBLE_EQ(state.baseline_p99_us, 100.0);
 }
 
+TEST(GdsAdaptiveConcurrencyTest,
+     WriteCanReachOneAndSignalsPersistentDegradationAtFloor) {
+    GdsAdaptiveState state;
+    state.configured_limit = 4;
+    state.current_limit = 4;
+    state.minimum_limit = 1;
+    state.target_p99_us = 100.0;
+    state.baseline_p99_us = 100.0;
+
+    for (size_t expected_limit : {3u, 2u, 1u}) {
+        state.saturation_since_evaluation = true;
+        EXPECT_EQ(adjustGdsAdaptiveConcurrency(
+                      state, 200.0, 16, 1.25, 1.05, 3),
+                  GdsAdaptiveAction::REDUCE);
+        EXPECT_EQ(state.current_limit, expected_limit);
+        EXPECT_EQ(state.degraded_at_minimum_windows, 0u);
+    }
+
+    state.saturation_since_evaluation = true;
+    EXPECT_EQ(adjustGdsAdaptiveConcurrency(state, 200.0, 16, 1.25, 1.05,
+                                           3),
+              GdsAdaptiveAction::HOLD_AT_MINIMUM);
+    EXPECT_EQ(state.current_limit, 1u);
+    EXPECT_EQ(state.degraded_at_minimum_windows, 1u);
+
+    state.saturation_since_evaluation = true;
+    EXPECT_EQ(adjustGdsAdaptiveConcurrency(state, 200.0, 16, 1.25, 1.05,
+                                           3),
+              GdsAdaptiveAction::HOLD_AT_MINIMUM);
+    EXPECT_EQ(state.degraded_at_minimum_windows, 2u);
+
+    EXPECT_EQ(adjustGdsAdaptiveConcurrency(state, 100.0, 0, 1.25, 1.05, 3),
+              GdsAdaptiveAction::NONE);
+    EXPECT_EQ(state.degraded_at_minimum_windows, 0u);
+}
+
+TEST(GdsAdaptiveConcurrencyTest,
+     MixedReadPressureReducesWriteBeforeRead) {
+    EXPECT_EQ(gdsEffectiveWriteLimit(4, false), 4u);
+    EXPECT_EQ(gdsEffectiveWriteLimit(4, true), 1u);
+    EXPECT_EQ(gdsEffectiveWriteLimit(1, true), 1u);
+
+    // Two WRITEs sharing a nominal 16-slot device window must not make the
+    // controller cut latency-sensitive READ while WRITE can still shrink.
+    EXPECT_FALSE(gdsReadWindowSaturated(16, 14, 2, false));
+    // Once WRITE is at its floor, the same combined occupancy is real,
+    // unavoidable READ-side saturation.
+    EXPECT_TRUE(gdsReadWindowSaturated(16, 15, 1, true));
+    EXPECT_TRUE(gdsReadWindowSaturated(16, 16, 4, false));
+    EXPECT_FALSE(gdsReadWindowSaturated(16, 15, 0, true));
+}
+
+TEST(GdsAdaptiveConcurrencyTest, NearestRankP99HandlesEmptyAndTail) {
+    EXPECT_DOUBLE_EQ(gdsNearestRankP99({}), 0.0);
+    std::vector<double> samples;
+    for (int value = 1; value <= 100; ++value) {
+        samples.push_back(static_cast<double>(value));
+    }
+    EXPECT_DOUBLE_EQ(gdsNearestRankP99(samples), 99.0);
+}
+
 TEST(GdsAdaptiveConcurrencyTest, ConfiguredTargetIsABaselineFloor) {
     GdsAdaptiveState state;
     state.configured_limit = 4;
@@ -425,7 +486,7 @@ TEST(GdsAdaptiveConcurrencyTest, MinimumAndExistingInflightAreUnderflowSafe) {
     state.saturation_since_evaluation = true;
     EXPECT_EQ(adjustGdsAdaptiveConcurrency(state, 200.0, 64, 1.25, 1.05,
                                            3),
-              GdsAdaptiveAction::NONE);
+              GdsAdaptiveAction::HOLD_AT_MINIMUM);
     EXPECT_EQ(state.current_limit, 4u);
     EXPECT_DOUBLE_EQ(state.baseline_p99_us, 100.0);
     EXPECT_EQ(gdsAvailableWorkerSlots(4, 8), 0u);

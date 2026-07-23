@@ -47,6 +47,49 @@ namespace tent {
 namespace {
 constexpr uint8_t kRedisMaxDbIndex = 255;
 constexpr uint8_t kRedisDefaultDbIndex = 0;
+// The default must absorb normal overlapping vLLM BatchPut bursts. The
+// backlog is still finite, but only an explicitly tighter deployment setting
+// should turn routine 126/192-owner submits into synchronous rejection.
+constexpr size_t kDefaultMinWaitingOwners = 4096;
+constexpr size_t kDefaultMinWaitingBytes = size_t{8} << 30;
+constexpr size_t kRuntimeQueueSummarySampleCapacity = 4096;
+constexpr auto kRuntimeQueueSummaryInterval = std::chrono::seconds(1);
+
+size_t saturatingMultiply(size_t value, size_t multiplier) {
+    if (value > std::numeric_limits<size_t>::max() / multiplier) {
+        return std::numeric_limits<size_t>::max();
+    }
+    return value * multiplier;
+}
+
+size_t saturatingAdd(size_t lhs, size_t rhs) {
+    if (rhs > std::numeric_limits<size_t>::max() - lhs) {
+        return std::numeric_limits<size_t>::max();
+    }
+    return lhs + rhs;
+}
+
+Status checkedDispatchOwnerSum(size_t read_owners, size_t write_owners,
+                               size_t& total) {
+    if (write_owners >
+        std::numeric_limits<size_t>::max() - read_owners) {
+        return Status::InvalidArgument(
+            "runtime queue directional dispatch window overflow" LOC_MARK);
+    }
+    total = read_owners + write_owners;
+    return Status::OK();
+}
+
+double runtimeQueueNearestRankP99(std::vector<double> samples) {
+    if (samples.empty()) return 0.0;
+    // Samples are capped at 4096, so this integer nearest-rank calculation
+    // cannot overflow.
+    const size_t rank = (samples.size() * 99 + 99) / 100;
+    const size_t index = rank - 1;
+    std::nth_element(samples.begin(), samples.begin() + index,
+                     samples.end());
+    return samples[index];
+}
 }  // namespace
 
 struct Batch {
@@ -318,13 +361,31 @@ Status TransferEngineImpl::construct() {
         conf_->get("transports/gds/max_inflight_writes", 4UL);
     const size_t default_gds_write_inflight =
         std::min(configured_gds_write_workers, configured_gds_write_inflight);
-    const size_t default_max_dispatch_owners =
-        gds_enabled ? default_gds_read_inflight : 64UL;
+    size_t default_max_dispatch_owners = 64;
+    if (gds_enabled) {
+        CHECK_STATUS(checkedDispatchOwnerSum(
+            default_gds_read_inflight, default_gds_write_inflight,
+            default_max_dispatch_owners));
+    }
     runtime_queue_config_.max_dispatch_owners =
         conf_->get("runtime_queue/max_dispatch_owners",
                    default_max_dispatch_owners);
     runtime_queue_config_.max_dispatch_bytes =
         conf_->get("runtime_queue/max_dispatch_bytes", 64UL << 20);
+    const size_t default_max_waiting_owners = std::max(
+        kDefaultMinWaitingOwners,
+        saturatingMultiply(
+            runtime_queue_config_.limits.max_outstanding_owners, 8));
+    const size_t default_max_waiting_bytes = std::max(
+        kDefaultMinWaitingBytes,
+        saturatingMultiply(
+            runtime_queue_config_.limits.max_outstanding_bytes, 4));
+    runtime_queue_config_.max_waiting_owners =
+        conf_->get("runtime_queue/max_waiting_owners",
+                   default_max_waiting_owners);
+    runtime_queue_config_.max_waiting_bytes =
+        conf_->get("runtime_queue/max_waiting_bytes",
+                   default_max_waiting_bytes);
     runtime_queue_config_.max_dispatch_read_owners = conf_->get(
         "runtime_queue/max_dispatch_read_owners",
         gds_enabled ? std::min(default_gds_read_inflight,
@@ -346,11 +407,27 @@ Status TransferEngineImpl::construct() {
          runtime_queue_config_.limits.max_outstanding_bytes == 0 ||
          runtime_queue_config_.max_dispatch_owners == 0 ||
          runtime_queue_config_.max_dispatch_bytes == 0 ||
+         runtime_queue_config_.max_waiting_owners == 0 ||
+         runtime_queue_config_.max_waiting_bytes == 0 ||
          runtime_queue_config_.max_dispatch_read_owners == 0 ||
          runtime_queue_config_.max_dispatch_write_owners == 0)) {
         return Status::InvalidArgument(
-            "runtime queue limits and dispatch window must be non-zero"
+            "runtime queue limits, waiting backlog, and dispatch window must "
+            "be non-zero"
             LOC_MARK);
+    }
+    if (runtime_queue_config_.enabled && gds_enabled) {
+        size_t configured_directional_dispatch_owners = 0;
+        CHECK_STATUS(checkedDispatchOwnerSum(
+            runtime_queue_config_.max_dispatch_read_owners,
+            runtime_queue_config_.max_dispatch_write_owners,
+            configured_directional_dispatch_owners));
+        if (runtime_queue_config_.max_dispatch_owners <
+            configured_directional_dispatch_owners) {
+            return Status::InvalidArgument(
+                "runtime queue global dispatch owner window must cover the "
+                "sum of GDS READ and WRITE direction windows" LOC_MARK);
+        }
     }
     if (runtime_queue_config_.enabled &&
         (runtime_queue_config_.max_dispatch_owners >
@@ -379,6 +456,10 @@ Status TransferEngineImpl::construct() {
                   << runtime_queue_config_.max_dispatch_owners
                   << ", max_dispatch_bytes="
                   << runtime_queue_config_.max_dispatch_bytes
+                  << ", max_waiting_owners="
+                  << runtime_queue_config_.max_waiting_owners
+                  << ", max_waiting_bytes="
+                  << runtime_queue_config_.max_waiting_bytes
                   << ", max_dispatch_read_owners="
                   << runtime_queue_config_.max_dispatch_read_owners
                   << ", max_dispatch_write_owners="
@@ -398,6 +479,14 @@ Status TransferEngineImpl::construct() {
     }
     runtime_queue_ = std::make_unique<LocalTransferAdmissionQueue>(
         runtime_queue_config_.limits);
+    for (auto& summary : runtime_queue_summary_) {
+        summary.queue_wait_us.reserve(
+            kRuntimeQueueSummarySampleCapacity);
+        summary.total_latency_us.reserve(
+            kRuntimeQueueSummarySampleCapacity);
+    }
+    runtime_queue_summary_started_at_ =
+        std::chrono::steady_clock::now();
     if (!hostname_.empty())
         CHECK_STATUS(checkLocalIpAddress(hostname_, ipv6_));
     else
@@ -1672,6 +1761,19 @@ Status TransferEngineImpl::enqueuePreparedSubmit(Batch* batch,
         return Status::InvalidArgument(
             "runtime queue waiting backlog overflow" LOC_MARK);
     }
+    if (admission_waiting_owners_ >
+            runtime_queue_config_.max_waiting_owners ||
+        admission_waiting_bytes_ >
+            runtime_queue_config_.max_waiting_bytes ||
+        prepared.owners.size() >
+            runtime_queue_config_.max_waiting_owners -
+                admission_waiting_owners_ ||
+        submit_bytes > runtime_queue_config_.max_waiting_bytes -
+                           admission_waiting_bytes_) {
+        return Status::TooManyRequests(
+            "runtime queue pre-admission waiting high watermark exceeded"
+            LOC_MARK);
+    }
 
     batch->queue_token = batch_token;
     batch->task_list.insert(batch->task_list.end(), prepared.tasks.size(),
@@ -1901,6 +2003,128 @@ void TransferEngineImpl::updateRuntimeQueueMetrics() {
         dispatch_inflight_bytes_);
 }
 
+void TransferEngineImpl::recordRuntimeQueueWaitSummary(
+    bool read, double queue_wait_seconds) {
+    auto& summary = runtime_queue_summary_[read ? 0 : 1];
+    ++summary.dispatches;
+    const size_t sample_index =
+        summary.queue_wait_samples_seen %
+        kRuntimeQueueSummarySampleCapacity;
+    if (summary.queue_wait_us.size() <
+        kRuntimeQueueSummarySampleCapacity) {
+        summary.queue_wait_us.push_back(queue_wait_seconds * 1e6);
+    } else {
+        summary.queue_wait_us[sample_index] =
+            queue_wait_seconds * 1e6;
+    }
+    ++summary.queue_wait_samples_seen;
+    maybeLogRuntimeQueueSummary(std::chrono::steady_clock::now());
+}
+
+void TransferEngineImpl::recordRuntimeQueueCompletionSummary(
+    bool read, size_t bytes, TransferStatusEnum terminal_status,
+    double total_latency_seconds) {
+    auto& summary = runtime_queue_summary_[read ? 0 : 1];
+    ++summary.completions;
+    if (terminal_status != COMPLETED) {
+        ++summary.failures;
+    } else if (bytes >
+               std::numeric_limits<size_t>::max() - summary.bytes) {
+        summary.bytes = std::numeric_limits<size_t>::max();
+    } else {
+        summary.bytes += bytes;
+    }
+    const size_t sample_index =
+        summary.total_latency_samples_seen %
+        kRuntimeQueueSummarySampleCapacity;
+    if (summary.total_latency_us.size() <
+        kRuntimeQueueSummarySampleCapacity) {
+        summary.total_latency_us.push_back(
+            total_latency_seconds * 1e6);
+    } else {
+        summary.total_latency_us[sample_index] =
+            total_latency_seconds * 1e6;
+    }
+    ++summary.total_latency_samples_seen;
+    maybeLogRuntimeQueueSummary(std::chrono::steady_clock::now());
+}
+
+void TransferEngineImpl::maybeLogRuntimeQueueSummary(
+    std::chrono::steady_clock::time_point now) {
+    if (runtime_queue_summary_started_at_.time_since_epoch().count() == 0) {
+        runtime_queue_summary_started_at_ = now;
+        return;
+    }
+    const auto elapsed = now - runtime_queue_summary_started_at_;
+    if (elapsed < kRuntimeQueueSummaryInterval) return;
+
+    size_t queued_owners = admission_waiting_owners_;
+    size_t queued_bytes = admission_waiting_bytes_;
+    if (runtime_queue_) {
+        const size_t outstanding_owners =
+            runtime_queue_->outstandingOwners();
+        const size_t outstanding_bytes =
+            runtime_queue_->outstandingBytes();
+        queued_owners = saturatingAdd(
+            queued_owners,
+            outstanding_owners >= dispatch_inflight_owners_
+                ? outstanding_owners - dispatch_inflight_owners_
+                : 0);
+        queued_bytes = saturatingAdd(
+            queued_bytes,
+            outstanding_bytes >= dispatch_inflight_bytes_
+                ? outstanding_bytes - dispatch_inflight_bytes_
+                : 0);
+    }
+
+    const auto& read = runtime_queue_summary_[0];
+    const auto& write = runtime_queue_summary_[1];
+    const double elapsed_seconds =
+        std::chrono::duration<double>(elapsed).count();
+    LOG(INFO)
+        << "Runtime queue 1s summary: window_ms="
+        << elapsed_seconds * 1000.0
+        << ", queued_owners=" << queued_owners
+        << ", queued_bytes=" << queued_bytes
+        << ", dispatch_inflight_owners=" << dispatch_inflight_owners_
+        << ", dispatch_inflight_bytes=" << dispatch_inflight_bytes_
+        << ", READ{dispatches=" << read.dispatches
+        << ", completions=" << read.completions
+        << ", failures=" << read.failures
+        << ", bytes=" << read.bytes
+        << ", throughput_mib_s="
+        << static_cast<double>(read.bytes) /
+               (1024.0 * 1024.0 * elapsed_seconds)
+        << ", queue_wait_p99_us="
+        << runtimeQueueNearestRankP99(read.queue_wait_us)
+        << ", total_p99_us="
+        << runtimeQueueNearestRankP99(read.total_latency_us)
+        << "}, WRITE{dispatches=" << write.dispatches
+        << ", completions=" << write.completions
+        << ", failures=" << write.failures
+        << ", bytes=" << write.bytes
+        << ", throughput_mib_s="
+        << static_cast<double>(write.bytes) /
+               (1024.0 * 1024.0 * elapsed_seconds)
+        << ", queue_wait_p99_us="
+        << runtimeQueueNearestRankP99(write.queue_wait_us)
+        << ", total_p99_us="
+        << runtimeQueueNearestRankP99(write.total_latency_us)
+        << "}}";
+
+    for (auto& summary : runtime_queue_summary_) {
+        summary.dispatches = 0;
+        summary.completions = 0;
+        summary.failures = 0;
+        summary.bytes = 0;
+        summary.queue_wait_samples_seen = 0;
+        summary.total_latency_samples_seen = 0;
+        summary.queue_wait_us.clear();
+        summary.total_latency_us.clear();
+    }
+    runtime_queue_summary_started_at_ = now;
+}
+
 Status TransferEngineImpl::finishQueuedOwner(
     QueueOwnerId owner_id, TransferStatusEnum terminal_status) {
     auto queued_it = queued_owners_.find(owner_id);
@@ -1929,6 +2153,9 @@ Status TransferEngineImpl::finishQueuedOwner(
                                              .count();
     TentMetrics::instance().recordRuntimeQueueTotal(
         is_read, total_latency_seconds);
+    recordRuntimeQueueCompletionSummary(
+        is_read, queued.byte_charge, terminal_status,
+        total_latency_seconds);
     if (queued.in_dispatch_window) {
         --dispatch_inflight_owners_;
         dispatch_inflight_bytes_ -= queued.byte_charge;
@@ -2025,8 +2252,10 @@ Status TransferEngineImpl::dispatchQueuedOwners(
                                               std::chrono::steady_clock::now() -
                                               queued.enqueue_time)
                                               .count();
+        const bool is_read = task.request.opcode == Request::READ;
         TentMetrics::instance().recordRuntimeQueueWait(
-            task.request.opcode == Request::READ, queue_wait_seconds);
+            is_read, queue_wait_seconds);
+        recordRuntimeQueueWaitSummary(is_read, queue_wait_seconds);
         auto route = resolveTransport(task.request, 0);
         task.type = route.transport;
         task.device_mask = route.device_mask;

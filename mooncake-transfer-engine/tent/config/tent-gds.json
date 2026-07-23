@@ -7,10 +7,13 @@
     "max_outstanding_owners": 64,
     "max_outstanding_bytes": 268435456,
 
-    "max_dispatch_owners": 16,
+    "max_dispatch_owners": 20,
     "max_dispatch_bytes": 67108864,
     "max_dispatch_read_owners": 16,
     "max_dispatch_write_owners": 4,
+
+    "max_waiting_owners": 4096,
+    "max_waiting_bytes": 8589934592,
 
     "staging_owner_reserve": 0,
     "staging_byte_reserve": 0,
@@ -40,7 +43,7 @@
       "adaptive_evaluation_interval": 32,
       "adaptive_recovery_windows": 3,
       "adaptive_min_read_inflight": 4,
-      "adaptive_min_write_inflight": 2,
+      "adaptive_min_write_inflight": 1,
       "adaptive_p99_degradation_ratio": 1.25,
       "adaptive_p99_recovery_ratio": 1.05,
       "adaptive_read_p99_target_us": 60000,
