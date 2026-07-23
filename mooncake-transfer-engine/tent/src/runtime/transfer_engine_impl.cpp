@@ -2781,20 +2781,21 @@ Status TransferEngineImpl::dispatchQueuedOwners(
                 << ", logical_bytes=" << group.bytes;
         }
 
+        const auto is_request_specific_gds_error =
+            [](const Status& candidate) {
+                return candidate.IsInvalidArgument() ||
+                       candidate.IsAddressNotRegistered() ||
+                       candidate.IsDeviceNotFound() ||
+                       candidate.IsNeedsRefreshCache();
+            };
         auto status = transport->submitTransferTasks(sub_batch, group.requests);
-        const bool request_specific_gds_error =
-            status.IsInvalidArgument() ||
-            status.IsAddressNotRegistered() ||
-            status.IsDeviceNotFound() ||
-            status.IsNeedsRefreshCache();
         if (!status.ok() && group.type == GDS &&
-            request_specific_gds_error &&
+            is_request_specific_gds_error(status) &&
             group.requests.size() > 1) {
             // GDS validates every request before mutating its sub-batch. Retry
             // a rejected dequeue segment one owner at a time so a stale
             // mapping or registration affects only the corresponding key.
             // This is error isolation, not a fast-path retry policy.
-            remember_error(status);
             LOG(WARNING)
                 << "GDS operation segment rejected; isolating "
                    "request-specific failure across "
@@ -2819,7 +2820,9 @@ Status TransferEngineImpl::dispatchQueuedOwners(
                 auto owner_status = transport->submitTransferTasks(
                     sub_batch, {group.requests[index]});
                 if (!owner_status.ok()) {
-                    remember_error(owner_status);
+                    if (!is_request_specific_gds_error(owner_status)) {
+                        remember_error(owner_status);
+                    }
                     task.type = UNSPEC;
                     remember_error(finishQueuedOwner(owner_id, 0, FAILED));
                     continue;
