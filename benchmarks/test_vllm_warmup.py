@@ -275,6 +275,26 @@ class VllmWarmupTest(unittest.TestCase):
                     )
                 )
 
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "compiled_kernels": ["attention_kernel"],
+                        "failed_kernels": ["_compute_slot_mapping_kernel"],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(
+                RuntimeError, "_compute_slot_mapping_kernel"
+            ):
+                vllm_warmup.run_warmup(
+                    replace(
+                        self._config(),
+                        requests=0,
+                        kernel_manifest_path=str(manifest),
+                    )
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

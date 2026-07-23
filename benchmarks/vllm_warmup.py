@@ -235,10 +235,28 @@ def validate_kernel_manifest(config: WarmupConfig) -> dict[str, Any]:
         raise RuntimeError(
             f"required kernel manifest does not exist: {manifest_path}"
         )
-    manifest_text = manifest_path.read_text(encoding="utf-8")
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            f"invalid required kernel manifest {manifest_path}: {exc}"
+        ) from exc
+    compiled = (
+        manifest.get("compiled_kernels")
+        if isinstance(manifest, dict)
+        else None
+    )
+    if not isinstance(compiled, list) or not all(
+        isinstance(kernel, str) for kernel in compiled
+    ):
+        raise RuntimeError(
+            "required kernel manifest must contain a compiled_kernels "
+            "string array"
+        )
+    compiled_kernels = set(compiled)
     missing = [
         kernel for kernel in config.required_kernels
-        if kernel not in manifest_text
+        if kernel not in compiled_kernels
     ]
     if missing:
         raise RuntimeError(
