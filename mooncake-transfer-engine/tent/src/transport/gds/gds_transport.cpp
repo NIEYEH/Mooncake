@@ -309,6 +309,7 @@ size_t GdsTransport::runtimeQueueDispatchLimit(Request::OpCode opcode) const {
     const bool read_pressure =
         pending_read_ios_ != 0 || !inflight_direct_reads_.empty() ||
         runtime_queued_reads_.load(std::memory_order_relaxed) != 0;
+    if (pause_writes_while_reads_pending_ && read_pressure) return 0;
     return gdsFifoEffectiveWriteLimit(
         write_adaptive_.current_limit,
         runtime_contended_write_limit_, read_pressure);
@@ -371,6 +372,11 @@ Status GdsTransport::install(std::string& local_segment_name,
         static_cast<int>(kDefaultSharedDeviceTokens));
     const int configured_contended_write_limit = conf_->get(
         "runtime_queue/gds_contended_write_tokens", 1);
+    const auto runtime_scheduler_mode = conf_->get(
+        "runtime_queue/gds_scheduler_mode", "fixed");
+    pause_writes_while_reads_pending_ = conf_->get(
+        "runtime_queue/gds_pause_writes_while_reads_pending",
+        runtime_scheduler_mode == "fixed");
     if (configured_read_threads <= 0 || configured_write_threads <= 0 ||
         configured_inflight_reads <= 0 || configured_inflight_writes <= 0 ||
         configured_shared_device_tokens <= 0 ||
@@ -544,6 +550,8 @@ Status GdsTransport::install(std::string& local_segment_name,
               << ", max_inflight_writes=" << max_inflight_writes_
               << ", contended_write_limit="
               << runtime_contended_write_limit_
+              << ", pause_writes_while_reads_pending="
+              << pause_writes_while_reads_pending_
               << ", shared_device_tokens=" << max_inflight_ios_
               << ", submit_retry_count=" << submit_retry_count_
               << ", merge_mode="
@@ -972,12 +980,16 @@ Status GdsTransport::dispatchPendingIoLocked() {
         const bool read_pressure =
             pending_read_ios_ != 0 || !inflight_direct_reads_.empty() ||
             runtime_queued_reads_.load(std::memory_order_relaxed) != 0;
+        const size_t effective_write_limit =
+            pause_writes_while_reads_pending_ && read_pressure
+                ? 0
+                : gdsFifoEffectiveWriteLimit(
+                      write_adaptive_.current_limit,
+                      runtime_contended_write_limit_, read_pressure);
         GdsFifoDispatchState state{
             max_inflight_ios_,
             read_adaptive_.current_limit,
-            gdsFifoEffectiveWriteLimit(
-                write_adaptive_.current_limit,
-                runtime_contended_write_limit_, read_pressure),
+            effective_write_limit,
             inflight_direct_reads_.size(),
             inflight_direct_writes_.size()};
         if (gdsFifoFrontBlocksQueue(state, write)) {

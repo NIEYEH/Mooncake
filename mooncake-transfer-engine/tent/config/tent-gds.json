@@ -19,6 +19,7 @@
     "gds_read_standalone_tokens": 16,
     "gds_write_standalone_tokens": 1,
     "gds_contended_write_tokens": 1,
+    "gds_pause_writes_while_reads_pending": true,
     "gds_primary_read_tokens": 16,
     "gds_primary_read_bytes": 50331648,
     "gds_secondary_segment_requests": 8,

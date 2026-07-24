@@ -19,6 +19,7 @@
     "gds_read_standalone_tokens": 16,
     "gds_write_standalone_tokens": 2,
     "gds_contended_write_tokens": 1,
+    "gds_pause_writes_while_reads_pending": false,
     "gds_read_quantum_bytes": 8388608,
     "gds_write_quantum_bytes": 2097152,
     "gds_credit_cap_quanta": 2,

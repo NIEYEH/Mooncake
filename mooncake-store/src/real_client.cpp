@@ -11,10 +11,12 @@
 #include <dlfcn.h>  // for dlsym (Python detection)
 #include <cstdlib>  // for atexit
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <functional>
 #include <limits>
 #include <optional>
+#include <tuple>
 #include <vector>
 
 #include "real_client.h"
@@ -48,6 +50,79 @@ DEFINE_int32(http_port, 9300,
 namespace mooncake {
 namespace {
 constexpr std::chrono::seconds kIpcRequestRecvTimeout{5};
+std::atomic<uint64_t> gStoreGdsBatchGetToken{1};
+std::atomic<int64_t> gLastStoreGdsBatchGetStartUs{0};
+
+std::pair<uint64_t, int64_t> beginStoreGdsBatchGetTimeline(
+    std::chrono::steady_clock::time_point started_at) {
+    const auto start_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                              started_at.time_since_epoch())
+                              .count();
+    const auto previous_start_us =
+        gLastStoreGdsBatchGetStartUs.exchange(start_us,
+                                              std::memory_order_relaxed);
+    const auto caller_interarrival_us =
+        previous_start_us > 0 && start_us > previous_start_us
+            ? start_us - previous_start_us
+            : 0;
+    return {gStoreGdsBatchGetToken.fetch_add(
+                1, std::memory_order_relaxed),
+            caller_interarrival_us};
+}
+
+void logStoreGdsBatchGetTimeline(
+    const char *api,
+    std::chrono::steady_clock::time_point started_at,
+    std::chrono::steady_clock::time_point metadata_done_at,
+    uint64_t first_gds_dispatch_delay_us, uint64_t gds_transfer_us,
+    size_t requested_keys, size_t gds_keys, uint64_t gds_bytes,
+    uint64_t store_operation_token, int64_t caller_interarrival_us,
+    const std::vector<tl::expected<int64_t, ErrorCode>> &results) {
+    if (gds_keys == 0) return;
+
+    const auto finished_at = std::chrono::steady_clock::now();
+    const auto metadata_query_us =
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            metadata_done_at - started_at)
+            .count();
+    const auto total_us =
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            finished_at - started_at)
+            .count();
+    const auto prepare_before_gds_us =
+        first_gds_dispatch_delay_us >
+                static_cast<uint64_t>(std::max<int64_t>(0, metadata_query_us))
+            ? first_gds_dispatch_delay_us -
+                  static_cast<uint64_t>(metadata_query_us)
+            : 0;
+    size_t successful_keys = 0;
+    for (const auto &result : results) {
+        if (result.has_value()) ++successful_keys;
+    }
+
+    LOG(INFO) << "Store GDS BatchGet timeline: api=" << api
+              << ", store_operation_token="
+              << store_operation_token
+              << ", requested_keys=" << requested_keys
+              << ", gds_keys=" << gds_keys
+              << ", gds_bytes=" << gds_bytes
+              << ", successful_keys=" << successful_keys
+              << ", failed_keys=" << results.size() - successful_keys
+              << ", caller_interarrival_us=" << caller_interarrival_us
+              << ", metadata_query_us=" << metadata_query_us
+              << ", prepare_before_gds_us=" << prepare_before_gds_us
+              << ", gds_transfer_us=" << gds_transfer_us
+              << ", post_gds_us="
+              << (total_us >
+                          static_cast<int64_t>(first_gds_dispatch_delay_us +
+                                               gds_transfer_us)
+                      ? total_us -
+                            static_cast<int64_t>(
+                                first_gds_dispatch_delay_us +
+                                gds_transfer_us)
+                      : 0)
+              << ", total_us=" << total_us;
+}
 
 #ifdef USE_ASCEND_DIRECT
 bool checkAcl(aclError result, const char *message) {
@@ -4428,6 +4503,13 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
 
     // Query metadata for all keys
     const auto query_results = client_->BatchQuery(keys);
+    const auto metadata_done_time = std::chrono::steady_clock::now();
+    size_t gds_key_count = 0;
+    uint64_t gds_bytes = 0;
+    uint64_t first_gds_dispatch_delay_us = 0;
+    uint64_t gds_transfer_us = 0;
+    uint64_t store_operation_token = 0;
+    int64_t caller_interarrival_us = 0;
 
     // Process each key individually and prepare for batch transfer
     struct ValidKeyInfo {
@@ -4496,6 +4578,10 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
             results[i] = tl::unexpected(ErrorCode::INVALID_PARAMS);
             continue;
         }
+        if (replica.is_gds_ssd_replica()) {
+            ++gds_key_count;
+            gds_bytes += total_size;
+        }
 
         if (replica.is_local_disk_replica()) {
             std::vector<Slice> key_slices;
@@ -4557,8 +4643,25 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
     }
     if (!valid_operations.empty()) {
         // Execute batch transfer
+        const auto transfer_started_at = std::chrono::steady_clock::now();
+        if (gds_key_count != 0) {
+            std::tie(store_operation_token, caller_interarrival_us) =
+                beginStoreGdsBatchGetTimeline(start_time);
+            first_gds_dispatch_delay_us =
+                static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::microseconds>(
+                        transfer_started_at - start_time)
+                        .count());
+        }
         const auto batch_get_results =
             client_->BatchGet(batch_keys, batch_query_results, batch_slices);
+        if (gds_key_count != 0) {
+            gds_transfer_us = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() -
+                    transfer_started_at)
+                    .count());
+        }
 
         // Process transfer results
         for (size_t j = 0; j < batch_get_results.size(); ++j) {
@@ -4702,6 +4805,11 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
     //           << "us, with memory key count: " << valid_operations.size()
     //           << ", offload key count: " << offload_object_count;
 
+    logStoreGdsBatchGetTimeline(
+        "batch_get_into", start_time, metadata_done_time,
+        first_gds_dispatch_delay_us, gds_transfer_us, keys.size(),
+        gds_key_count, gds_bytes, store_operation_token,
+        caller_interarrival_us, results);
     return results;
 }
 
@@ -4884,6 +4992,7 @@ RealClient::batch_get_into_multi_buffers_internal(
     const std::vector<std::vector<void *>> &all_buffers,
     const std::vector<std::vector<size_t>> &all_sizes,
     bool prefer_alloc_in_same_node) {
+    const auto start_time = std::chrono::steady_clock::now();
     // Validate preconditions
     if (!client_) {
         LOG(ERROR) << "Client is not initialized";
@@ -4907,6 +5016,13 @@ RealClient::batch_get_into_multi_buffers_internal(
     }
     // Query metadata for all keys
     const auto query_results = client_->BatchQuery(keys);
+    const auto metadata_done_time = std::chrono::steady_clock::now();
+    size_t gds_key_count = 0;
+    uint64_t gds_bytes = 0;
+    uint64_t first_gds_dispatch_delay_us = 0;
+    uint64_t gds_transfer_us = 0;
+    uint64_t store_operation_token = 0;
+    int64_t caller_interarrival_us = 0;
     // Process each key individually and prepare for batch transfer
     struct ValidKeyInfo {
         std::string key;
@@ -4973,6 +5089,10 @@ RealClient::batch_get_into_multi_buffers_internal(
                        << ", available=" << dst_total_size;
             results.emplace_back(tl::unexpected(ErrorCode::INVALID_PARAMS));
             continue;
+        }
+        if (replica.is_gds_ssd_replica()) {
+            ++gds_key_count;
+            gds_bytes += total_size;
         }
         // Create slices for this key's buffer
         const auto &buffers = all_buffers[i];
@@ -5042,9 +5162,26 @@ RealClient::batch_get_into_multi_buffers_internal(
             batch_slices[op.key] = op.slices;
         }
 
+        const auto transfer_started_at = std::chrono::steady_clock::now();
+        if (gds_key_count != 0) {
+            std::tie(store_operation_token, caller_interarrival_us) =
+                beginStoreGdsBatchGetTimeline(start_time);
+            first_gds_dispatch_delay_us =
+                static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::microseconds>(
+                        transfer_started_at - start_time)
+                        .count());
+        }
         auto batch_get_results =
             client_->BatchGet(batch_keys, batch_query_results, batch_slices,
                               prefer_alloc_in_same_node);
+        if (gds_key_count != 0) {
+            gds_transfer_us = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() -
+                    transfer_started_at)
+                    .count());
+        }
 
         for (size_t j = 0; j < batch_get_results.size(); ++j) {
             const auto &op = valid_operations[j];
@@ -5230,6 +5367,11 @@ RealClient::batch_get_into_multi_buffers_internal(
         }
     }
 
+    logStoreGdsBatchGetTimeline(
+        "batch_get_into_multi_buffers", start_time, metadata_done_time,
+        first_gds_dispatch_delay_us, gds_transfer_us, keys.size(),
+        gds_key_count, gds_bytes, store_operation_token,
+        caller_interarrival_us, results);
     return results;
 }
 

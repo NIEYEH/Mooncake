@@ -87,6 +87,13 @@ void testWriteExecutionLimitTracksReadContention() {
     EXPECT_EQ(gdsFifoEffectiveWriteLimit(4, 1, false), 4u);
     EXPECT_EQ(gdsFifoEffectiveWriteLimit(4, 1, true), 1u);
     EXPECT_EQ(gdsFifoEffectiveWriteLimit(4, 2, true), 2u);
+
+    // A zero limit is a valid execution policy for read-drain mode. The
+    // opposite direction may still bypass the blocked WRITE head.
+    GdsFifoDispatchState read_drain{16, 16, 0, 15, 0};
+    EXPECT_TRUE(!gdsFifoFrontCanDispatch(read_drain, true));
+    EXPECT_TRUE(gdsFifoFrontCanDispatch(read_drain, false));
+    EXPECT_TRUE(gdsFifoCanBypassBlockedFront(read_drain, true, false));
 }
 
 }  // namespace

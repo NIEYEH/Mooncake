@@ -228,6 +228,7 @@ class GdsTransport : public Transport {
     size_t max_inflight_reads_;
     size_t max_inflight_writes_;
     size_t runtime_contended_write_limit_{1};
+    bool pause_writes_while_reads_pending_{false};
     size_t submit_retry_count_;
     bool merge_shadow_enabled_;
     bool adaptive_concurrency_enabled_;
