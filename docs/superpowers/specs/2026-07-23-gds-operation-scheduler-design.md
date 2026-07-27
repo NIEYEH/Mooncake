@@ -86,6 +86,13 @@ Two checked-in example configurations define reproducible modes.
 | Async | disabled |
 | merge mode | `shadow` (statistics only) |
 
+The waiting high-watermark is a hard bound and a producer-backpressure point.
+A submit that fits the bound by itself waits when existing backlog temporarily
+leaves insufficient room; it is not rejected as a whole. Blocked submitters
+use FIFO tickets to prevent smaller newcomers from starving a large operation.
+A single submit that cannot fit the configured owner or byte bound is rejected
+immediately.
+
 ### Weighted-fair mode
 
 | Setting | Default |

@@ -733,6 +733,12 @@ Status TransferEngineImpl::construct() {
 Status TransferEngineImpl::deconstruct() {
     // Metrics cleanup is handled automatically by TentMetrics destructor
 
+    {
+        std::lock_guard<std::recursive_mutex> lk(progress_mutex_);
+        runtime_queue_stopping_ = true;
+    }
+    admission_waiting_capacity_cv_.notify_all();
+
     // Stop the progress worker first so it cannot race with batch teardown
     // below (it dereferences BatchID into Batch* via progressBatch). Keep the
     // object alive until transports are destroyed: completion paths may still
@@ -1847,7 +1853,11 @@ Status TransferEngineImpl::commitPreparedSubmit(
 Status TransferEngineImpl::enqueuePreparedSubmit(Batch* batch,
                                                  const PreparedSubmit& prepared,
                                                  QueueOwnerKind owner_kind) {
-    std::lock_guard<std::recursive_mutex> lk(progress_mutex_);
+    std::unique_lock<std::recursive_mutex> lk(progress_mutex_);
+    if (runtime_queue_stopping_) {
+        return Status::InvalidEntry(
+            "runtime queue is stopping" LOC_MARK);
+    }
     if (prepared.tasks.empty()) return Status::OK();
     if (prepared.tasks.size() > batch->max_size - batch->task_list.size()) {
         return Status::TooManyRequests(
@@ -1928,18 +1938,99 @@ Status TransferEngineImpl::enqueuePreparedSubmit(Batch* batch,
         return Status::InvalidArgument(
             "runtime queue waiting backlog overflow" LOC_MARK);
     }
-    if (admission_waiting_owners_ >
+    if (prepared.owners.size() >
             runtime_queue_config_.max_waiting_owners ||
-        admission_waiting_bytes_ >
-            runtime_queue_config_.max_waiting_bytes ||
-        prepared.owners.size() >
-            runtime_queue_config_.max_waiting_owners -
-                admission_waiting_owners_ ||
-        submit_bytes > runtime_queue_config_.max_waiting_bytes -
-                           admission_waiting_bytes_) {
+        submit_bytes > runtime_queue_config_.max_waiting_bytes) {
         return Status::TooManyRequests(
-            "runtime queue pre-admission waiting high watermark exceeded"
+            "single submit exceeds runtime queue pre-admission waiting "
+            "high watermark"
             LOC_MARK);
+    }
+
+    const auto waiting_capacity_available = [&] {
+        return admission_waiting_owners_ <=
+                   runtime_queue_config_.max_waiting_owners &&
+               admission_waiting_bytes_ <=
+                   runtime_queue_config_.max_waiting_bytes &&
+               prepared.owners.size() <=
+                   runtime_queue_config_.max_waiting_owners -
+                       admission_waiting_owners_ &&
+               submit_bytes <= runtime_queue_config_.max_waiting_bytes -
+                                   admission_waiting_bytes_;
+    };
+    if (!admission_waiter_tickets_.empty() ||
+        !waiting_capacity_available()) {
+        if (next_admission_waiter_ticket_ == 0) {
+            return Status::InternalError(
+                "runtime queue admission waiter ticket overflow" LOC_MARK);
+        }
+        const uint64_t waiter_ticket =
+            next_admission_waiter_ticket_++;
+        admission_waiter_tickets_.push_back(waiter_ticket);
+        const auto wait_started = std::chrono::steady_clock::now();
+        LOG(INFO)
+            << "Runtime queue pre-admission backpressure start: "
+            << "waiter_ticket=" << waiter_ticket
+            << ", submit_owners=" << prepared.owners.size()
+            << ", submit_bytes=" << submit_bytes
+            << ", blocked_submitters="
+            << admission_waiter_tickets_.size()
+            << ", waiting_owners=" << admission_waiting_owners_
+            << ", waiting_bytes=" << admission_waiting_bytes_
+            << ", max_waiting_owners="
+            << runtime_queue_config_.max_waiting_owners
+            << ", max_waiting_bytes="
+            << runtime_queue_config_.max_waiting_bytes;
+        notifyRuntimeQueueReady();
+        admission_waiting_capacity_cv_.wait(lk, [&] {
+            return runtime_queue_stopping_ ||
+                   (!admission_waiter_tickets_.empty() &&
+                    admission_waiter_tickets_.front() ==
+                        waiter_ticket &&
+                    waiting_capacity_available());
+        });
+        if (runtime_queue_stopping_) {
+            auto waiter_it = std::find(
+                admission_waiter_tickets_.begin(),
+                admission_waiter_tickets_.end(), waiter_ticket);
+            if (waiter_it != admission_waiter_tickets_.end()) {
+                admission_waiter_tickets_.erase(waiter_it);
+            }
+            admission_waiting_capacity_cv_.notify_all();
+            return Status::InvalidEntry(
+                "runtime queue stopped while submit was backpressured"
+                LOC_MARK);
+        }
+        if (admission_waiter_tickets_.empty() ||
+            admission_waiter_tickets_.front() != waiter_ticket) {
+            auto waiter_it = std::find(
+                admission_waiter_tickets_.begin(),
+                admission_waiter_tickets_.end(), waiter_ticket);
+            if (waiter_it != admission_waiter_tickets_.end()) {
+                admission_waiter_tickets_.erase(waiter_it);
+            }
+            admission_waiting_capacity_cv_.notify_all();
+            return Status::InternalError(
+                "runtime queue admission waiter order corrupted"
+                LOC_MARK);
+        }
+        admission_waiter_tickets_.pop_front();
+        // Wake the next ticket while retaining progress_mutex_. It cannot
+        // observe capacity until this submit's accounting is committed or
+        // this function exits with an error.
+        admission_waiting_capacity_cv_.notify_all();
+        const double wait_us =
+            std::chrono::duration<double, std::micro>(
+                std::chrono::steady_clock::now() - wait_started)
+                .count();
+        LOG(INFO)
+            << "Runtime queue pre-admission backpressure end: "
+            << "waiter_ticket=" << waiter_ticket
+            << ", submit_owners=" << prepared.owners.size()
+            << ", submit_bytes=" << submit_bytes
+            << ", wait_us=" << wait_us
+            << ", waiting_owners=" << admission_waiting_owners_
+            << ", waiting_bytes=" << admission_waiting_bytes_;
     }
 
     std::array<size_t, 2> operation_requests{};
@@ -2048,6 +2139,13 @@ Status TransferEngineImpl::enqueuePreparedSubmit(Batch* batch,
 }
 
 Status TransferEngineImpl::admitWaitingOwners() {
+    struct CapacityReleaseNotifier {
+        std::condition_variable_any& cv;
+        bool released{false};
+        ~CapacityReleaseNotifier() {
+            if (released) cv.notify_all();
+        }
+    } capacity_release_notifier{admission_waiting_capacity_cv_};
     while (!admission_waiting_queue_.empty()) {
         const auto find_gds_opcode = [&](Request::OpCode opcode) {
             return std::find_if(
@@ -2159,6 +2257,7 @@ Status TransferEngineImpl::admitWaitingOwners() {
         }
         --admission_waiting_owners_;
         admission_waiting_bytes_ -= waiting.byte_charge;
+        capacity_release_notifier.released = true;
         if (admitting_gds_read) {
             if (admission_waiting_gds_reads_ == 0) {
                 return Status::InternalError(

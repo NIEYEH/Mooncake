@@ -18,6 +18,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -429,6 +430,13 @@ class TransferEngineImpl {
     // ProgressWorker thread. Recursive because freeBatch -> lazyFreeBatch ->
     // getTransferStatus can re-enter on the same thread. See issue #2116.
     std::recursive_mutex progress_mutex_;
+    // Submitters wait here when the bounded pre-admission backlog is full.
+    // Capacity release wakes them without turning transient pressure into a
+    // whole-batch TooManyRequests failure.
+    std::condition_variable_any admission_waiting_capacity_cv_;
+    bool runtime_queue_stopping_{false};
+    uint64_t next_admission_waiter_ticket_{1};
+    std::deque<uint64_t> admission_waiter_tickets_;
     std::unordered_set<BatchID> alive_batches_;
     std::unique_ptr<ProgressWorker> progress_worker_;
 };

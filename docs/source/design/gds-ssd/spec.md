@@ -102,8 +102,12 @@ large 126/192-key operations through bounded segments. The checked-in waiting
 high-watermark is 1024 owners / 2 GiB: enough for three overlapping
 192-key, 2.25-MiB operations, but not an unbounded lease-holding queue. An
 operation is not rejected merely because all of its keys cannot enter the
-dispatch window at once; a submit beyond the waiting high-watermark receives
-explicit backpressure.
+dispatch window at once. If a submit fits the waiting high-watermark by itself
+but the current aggregate backlog leaves insufficient room, its producer waits
+until admission releases capacity; the configured owner and byte bounds are
+never exceeded. Blocked producers are served in arrival order so a stream of
+smaller submits cannot starve an earlier large operation. Only a single submit
+that cannot fit the configured high-watermark by itself is rejected.
 
 An operation can wait, dispatch bounded work, drain inflight IO, and finish or
 fail. The scheduler's cancellation state prevents new dispatch and lets

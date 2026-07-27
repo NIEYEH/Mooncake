@@ -21,6 +21,7 @@
 #include <functional>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <utility>
@@ -77,6 +78,12 @@ class FakeTransport : public Transport {
     std::atomic<size_t> runtime_queued_writes{0};
     std::atomic<size_t> planned_physical_ios{1};
     std::function<bool(const Request&)> reject_request;
+    std::function<void(const Request&)> plan_request_hook;
+
+    std::vector<void*> submittedSources() {
+        std::lock_guard<std::mutex> lock(submitted_sources_mutex_);
+        return submitted_sources_;
+    }
 
     Status install(std::string&, std::shared_ptr<ControlService>,
                    std::shared_ptr<Topology>,
@@ -124,6 +131,12 @@ class FakeTransport : public Transport {
                 ++submitted_writes;
             }
         }
+        {
+            std::lock_guard<std::mutex> lock(submitted_sources_mutex_);
+            for (const auto& request : requests) {
+                submitted_sources_.push_back(request.source);
+            }
+        }
         if (reject_request &&
             std::any_of(requests.begin(), requests.end(),
                         [&](const Request& request) {
@@ -149,6 +162,7 @@ class FakeTransport : public Transport {
 
     Status planRuntimeQueueRequest(
         const Request& request, RuntimeQueuePlan& plan) override {
+        if (plan_request_hook) plan_request_hook(request);
         plan.physical_ios = planned_physical_ios.load();
         plan.physical_bytes = request.length;
         return Status::OK();
@@ -219,6 +233,8 @@ class FakeTransport : public Transport {
     PollStatusFactory poll_status_factory_;
     bool notify_on_submit_;
     bool fail_on_submit_;
+    std::mutex submitted_sources_mutex_;
+    std::vector<void*> submitted_sources_;
 };
 
 std::shared_ptr<Config> makeRuntimeQueueConfig(size_t max_dispatch_owners,
@@ -1117,6 +1133,204 @@ TEST(RuntimeQueueDispatch, RejectsSubmitAboveWaitingBacklogHighWatermark) {
         engine.getTransferStatus(batch, 0, task_status).IsInvalidArgument());
 
     EXPECT_TRUE(engine.freeBatch(batch).ok());
+    EXPECT_TRUE(engine.unregisterLocalMemory(buffer.data(), buffer.size()).ok());
+}
+
+TEST(RuntimeQueueDispatch,
+     BackpressuresConcurrentSubmitUntilWaitingCapacityIsReleased) {
+    constexpr size_t kReqLen = 4096;
+    auto cfg = makeRuntimeQueueConfig(1, 1UL << 20);
+    cfg->set("runtime_queue/max_outstanding_owners", 1UL);
+    cfg->set("runtime_queue/max_outstanding_bytes", kReqLen);
+    cfg->set("runtime_queue/max_waiting_owners", 3UL);
+    cfg->set("runtime_queue/max_waiting_bytes", 3 * kReqLen);
+    cfg->set("runtime_queue/progress_fallback_interval_us", 60000000UL);
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+
+    std::atomic<bool> complete{false};
+    auto fake_gds = std::make_shared<FakeTransport>(
+        GDS, [&complete](const Request& request, int) {
+            if (!complete.load()) {
+                return TransferStatus{TransferStatusEnum::PENDING, 0};
+            }
+            return TransferStatus{TransferStatusEnum::COMPLETED,
+                                  request.length};
+        });
+    installFakeGds(engine, fake_gds);
+
+    std::vector<uint8_t> buffer(5 * kReqLen, 0x50);
+    ASSERT_TRUE(engine.registerLocalMemory(buffer.data(), buffer.size()).ok());
+    BatchID first_batch = engine.allocateBatch(3);
+    BatchID second_batch = engine.allocateBatch(2);
+    ASSERT_NE(first_batch, (BatchID)0);
+    ASSERT_NE(second_batch, (BatchID)0);
+
+    ASSERT_TRUE(engine
+                    .submitTransfer(
+                        first_batch,
+                        {makeLocalGdsWrite(buffer.data(), kReqLen),
+                         makeLocalGdsWrite(buffer.data() + kReqLen, kReqLen),
+                         makeLocalGdsWrite(buffer.data() + 2 * kReqLen,
+                                           kReqLen)})
+                    .ok());
+
+    Status release_status = Status::OK();
+    bool first_batch_completed = true;
+    std::atomic<bool> second_submit_planned{false};
+    std::atomic<bool> capacity_release_started{false};
+    fake_gds->plan_request_hook = [&](const Request&) {
+        second_submit_planned.store(true);
+    };
+    std::thread release_capacity([&] {
+        while (!second_submit_planned.load()) std::this_thread::yield();
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        capacity_release_started.store(true);
+        complete.store(true);
+        for (size_t task_id = 0; task_id < 3; ++task_id) {
+            TransferStatus task_status{};
+            release_status =
+                engine.getTransferStatus(first_batch, task_id, task_status);
+            if (!release_status.ok()) return;
+            if (task_status.s != TransferStatusEnum::COMPLETED) {
+                first_batch_completed = false;
+                return;
+            }
+        }
+    });
+
+    auto second_status = engine.submitTransfer(
+        second_batch,
+        {makeLocalGdsWrite(buffer.data() + 3 * kReqLen, kReqLen),
+         makeLocalGdsWrite(buffer.data() + 4 * kReqLen, kReqLen)});
+    const bool release_observed_before_submit_returned =
+        capacity_release_started.load();
+    release_capacity.join();
+
+    ASSERT_TRUE(release_status.ok()) << release_status.ToString();
+    ASSERT_TRUE(first_batch_completed);
+    ASSERT_TRUE(second_status.ok()) << second_status.ToString();
+    EXPECT_TRUE(release_observed_before_submit_returned);
+
+    TransferStatus task_status{};
+    for (size_t task_id = 0; task_id < 2; ++task_id) {
+        ASSERT_TRUE(
+            engine.getTransferStatus(second_batch, task_id, task_status).ok());
+        EXPECT_EQ(task_status.s, TransferStatusEnum::COMPLETED);
+    }
+
+    EXPECT_TRUE(engine.freeBatch(first_batch).ok());
+    EXPECT_TRUE(engine.freeBatch(second_batch).ok());
+    EXPECT_TRUE(engine.unregisterLocalMemory(buffer.data(), buffer.size()).ok());
+}
+
+TEST(RuntimeQueueDispatch, BackpressuredSubmittersDoNotBarge) {
+    constexpr size_t kReqLen = 4096;
+    auto cfg = makeRuntimeQueueConfig(1, 1UL << 20);
+    cfg->set("runtime_queue/max_outstanding_owners", 1UL);
+    cfg->set("runtime_queue/max_outstanding_bytes", kReqLen);
+    cfg->set("runtime_queue/max_waiting_owners", 3UL);
+    cfg->set("runtime_queue/max_waiting_bytes", 3 * kReqLen);
+    cfg->set("runtime_queue/progress_fallback_interval_us", 60000000UL);
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+
+    std::atomic<bool> complete{false};
+    auto fake_gds = std::make_shared<FakeTransport>(
+        GDS, [&complete](const Request& request, int) {
+            if (!complete.load()) {
+                return TransferStatus{TransferStatusEnum::PENDING, 0};
+            }
+            return TransferStatus{TransferStatusEnum::COMPLETED,
+                                  request.length};
+        });
+    installFakeGds(engine, fake_gds);
+
+    std::vector<uint8_t> buffer(6 * kReqLen, 0x51);
+    ASSERT_TRUE(engine.registerLocalMemory(buffer.data(), buffer.size()).ok());
+    BatchID occupying_batch = engine.allocateBatch(3);
+    BatchID earlier_batch = engine.allocateBatch(2);
+    BatchID later_batch = engine.allocateBatch(1);
+    ASSERT_NE(occupying_batch, (BatchID)0);
+    ASSERT_NE(earlier_batch, (BatchID)0);
+    ASSERT_NE(later_batch, (BatchID)0);
+
+    ASSERT_TRUE(engine
+                    .submitTransfer(
+                        occupying_batch,
+                        {makeLocalGdsWrite(buffer.data(), kReqLen),
+                         makeLocalGdsWrite(buffer.data() + kReqLen, kReqLen),
+                         makeLocalGdsWrite(buffer.data() + 2 * kReqLen,
+                                           kReqLen)})
+                    .ok());
+
+    Status later_status = Status::OK();
+    Status release_status = Status::OK();
+    bool occupying_batch_completed = true;
+    std::atomic<bool> start_later_submit{false};
+    std::atomic<size_t> blocked_submit_plans{0};
+    fake_gds->plan_request_hook = [&](const Request&) {
+        blocked_submit_plans.fetch_add(1);
+        start_later_submit.store(true);
+    };
+
+    std::thread later_submit_thread([&] {
+        while (!start_later_submit.load()) std::this_thread::yield();
+        later_status = engine.submitTransfer(
+            later_batch,
+            {makeLocalGdsWrite(buffer.data() + 5 * kReqLen, kReqLen)});
+    });
+    std::thread release_capacity([&] {
+        while (blocked_submit_plans.load() < 3)
+            std::this_thread::yield();
+        complete.store(true);
+        for (size_t task_id = 0; task_id < 3; ++task_id) {
+            TransferStatus task_status{};
+            release_status = engine.getTransferStatus(
+                occupying_batch, task_id, task_status);
+            if (!release_status.ok()) return;
+            if (task_status.s != TransferStatusEnum::COMPLETED) {
+                occupying_batch_completed = false;
+                return;
+            }
+        }
+    });
+
+    auto earlier_status = engine.submitTransfer(
+        earlier_batch,
+        {makeLocalGdsWrite(buffer.data() + 3 * kReqLen, kReqLen),
+         makeLocalGdsWrite(buffer.data() + 4 * kReqLen, kReqLen)});
+
+    release_capacity.join();
+    later_submit_thread.join();
+    ASSERT_TRUE(release_status.ok()) << release_status.ToString();
+    ASSERT_TRUE(occupying_batch_completed);
+    ASSERT_TRUE(earlier_status.ok()) << earlier_status.ToString();
+    ASSERT_TRUE(later_status.ok()) << later_status.ToString();
+
+    TransferStatus task_status{};
+    for (size_t task_id = 0; task_id < 2; ++task_id) {
+        ASSERT_TRUE(
+            engine.getTransferStatus(earlier_batch, task_id, task_status).ok());
+        EXPECT_EQ(task_status.s, TransferStatusEnum::COMPLETED);
+    }
+    ASSERT_TRUE(engine.getTransferStatus(later_batch, 0, task_status).ok());
+    EXPECT_EQ(task_status.s, TransferStatusEnum::COMPLETED);
+    const auto submitted_sources = fake_gds->submittedSources();
+    const auto earlier_submit = std::find(
+        submitted_sources.begin(), submitted_sources.end(),
+        static_cast<void*>(buffer.data() + 3 * kReqLen));
+    const auto later_submission = std::find(
+        submitted_sources.begin(), submitted_sources.end(),
+        static_cast<void*>(buffer.data() + 5 * kReqLen));
+    ASSERT_NE(earlier_submit, submitted_sources.end());
+    ASSERT_NE(later_submission, submitted_sources.end());
+    EXPECT_LT(std::distance(submitted_sources.begin(), earlier_submit),
+              std::distance(submitted_sources.begin(), later_submission));
+
+    EXPECT_TRUE(engine.freeBatch(occupying_batch).ok());
+    EXPECT_TRUE(engine.freeBatch(earlier_batch).ok());
+    EXPECT_TRUE(engine.freeBatch(later_batch).ok());
     EXPECT_TRUE(engine.unregisterLocalMemory(buffer.data(), buffer.size()).ok());
 }
 
