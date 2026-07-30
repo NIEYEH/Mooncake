@@ -7,6 +7,7 @@ import argparse
 import concurrent.futures
 import hashlib
 import json
+import math
 import shutil
 import subprocess
 import time
@@ -114,6 +115,47 @@ def _collect_endpoint(url: str | None) -> dict[str, Any]:
         return {"available": False, "reason": f"endpoint failed: {exc}"}
 
 
+def parse_prometheus_counters(payload: str) -> dict[str, int | float]:
+    counters: dict[str, int | float] = {}
+    for raw_line in payload.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        fields = line.split()
+        if len(fields) != 2:
+            continue
+        name, raw_value = fields
+        if (
+            not name.startswith("mooncake_batch_get_")
+            or "{" in name
+            or "}" in name
+        ):
+            continue
+        try:
+            value = float(raw_value)
+        except ValueError:
+            continue
+        if not math.isfinite(value):
+            continue
+        counters[name] = int(value) if value.is_integer() else value
+    return counters
+
+
+def _collect_prometheus_endpoint(url: str | None) -> dict[str, Any]:
+    if not url:
+        return {"available": False, "reason": "endpoint not configured"}
+    try:
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open(url, timeout=2) as response:
+            payload = response.read().decode("utf-8", errors="replace")
+        return {
+            "available": True,
+            "counters": parse_prometheus_counters(payload),
+        }
+    except Exception as exc:
+        return {"available": False, "reason": f"endpoint failed: {exc}"}
+
+
 def _timed_collect(
     collector: Callable[[], dict[str, Any]],
 ) -> dict[str, Any]:
@@ -142,6 +184,9 @@ def collect_sample(
     for source in ("vllm", "runtime", "kv_restore", "inference"):
         url = endpoints.get(source)
         collectors[source] = lambda url=url: _collect_endpoint(url)
+    collectors["store"] = lambda: _collect_prometheus_endpoint(
+        endpoints.get("store")
+    )
     with concurrent.futures.ThreadPoolExecutor(
         max_workers=len(collectors)
     ) as executor:
@@ -167,6 +212,7 @@ def main() -> int:
     parser.add_argument("--runtime-endpoint")
     parser.add_argument("--kv-restore-endpoint")
     parser.add_argument("--inference-endpoint")
+    parser.add_argument("--store-metrics-endpoint")
     args = parser.parse_args()
     if args.duration_seconds <= 0 or args.interval_seconds <= 0:
         parser.error("duration and interval must be greater than zero")
@@ -176,6 +222,7 @@ def main() -> int:
         "runtime": args.runtime_endpoint,
         "kv_restore": args.kv_restore_endpoint,
         "inference": args.inference_endpoint,
+        "store": args.store_metrics_endpoint,
     }
     deadline = time.monotonic() + args.duration_seconds
     with args.output.open("w", encoding="utf-8") as stream:

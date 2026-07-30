@@ -556,6 +556,49 @@ void testCanceledOperationStopsNewDispatchAndDrainsInflight() {
             .ok());
 }
 
+void testTerminalStatusesReleaseReservationsAndAllowNextDispatch() {
+    struct Case {
+        TransferStatusEnum status;
+        size_t completed_bytes;
+    };
+    const std::vector<Case> cases = {
+        {FAILED, kMiB}, {CANCELED, 0}, {TIMEOUT, 0}};
+    for (size_t index = 0; index < cases.size(); ++index) {
+        GdsOperationScheduler scheduler(weightedConfig());
+        const uint64_t operation_id = 200 + index;
+        EXPECT_TRUE(
+            scheduler
+                .enqueue(entry(10 + index, operation_id,
+                               GdsDirection::Read, 2 * kMiB))
+                .ok());
+        const auto selected = scheduler.select({1, 2 * kMiB, 1});
+        EXPECT_EQ(selected.size(), 1u);
+        EXPECT_TRUE(
+            scheduler
+                .complete(selected.front().id,
+                          cases[index].completed_bytes,
+                          cases[index].status)
+                .ok());
+
+        const auto drained = scheduler.snapshot();
+        EXPECT_EQ(drained.global_reserved_bytes, 0u);
+        EXPECT_EQ(drained.global_reserved_tokens, 0u);
+        EXPECT_EQ(drained.reserved_bytes[0], 0u);
+        EXPECT_EQ(drained.reserved_tokens[0], 0u);
+        EXPECT_EQ(
+            drained.operation_reserved_bytes.at(operation_id), 0u);
+        EXPECT_EQ(
+            drained.operation_reserved_tokens.at(operation_id), 0u);
+
+        EXPECT_TRUE(
+            scheduler
+                .enqueue(entry(100 + index, 300 + index,
+                               GdsDirection::Read, 2 * kMiB))
+                .ok());
+        EXPECT_EQ(scheduler.select({1, 2 * kMiB, 1}).size(), 1u);
+    }
+}
+
 void testWriteBoostUsesPromotionDemotionAndCooldownHysteresis() {
     GdsWriteBoostController controller({1, 2, 3, 5, 10});
     EXPECT_EQ(controller.update(true, false),
@@ -606,6 +649,7 @@ int main() {
     testGdsSegmentStopsAtFirstRequestOrByteLimit();
     testRetiredOperationReleasesReservationHistory();
     testCanceledOperationStopsNewDispatchAndDrainsInflight();
+    testTerminalStatusesReleaseReservationsAndAllowNextDispatch();
     testWriteBoostUsesPromotionDemotionAndCooldownHysteresis();
     std::cout << "gds_operation_scheduler_test: PASS" << std::endl;
     return 0;

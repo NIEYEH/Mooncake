@@ -12,6 +12,30 @@ ROOT = Path(__file__).resolve().parents[1]
 CONFIG_DIR = ROOT / "mooncake-transfer-engine" / "tent" / "config"
 
 
+def test_prometheus_parser_keeps_only_fixed_batch_get_counters():
+    payload = """
+# HELP mooncake_batch_get_calls_total Total calls
+mooncake_batch_get_calls_total 2
+mooncake_batch_get_requested_keys_total 80
+mooncake_batch_get_selected_gds_keys_total 12
+unrelated_metric{route="dynamic"} 99
+mooncake_batch_get_bad_value_total not-a-number
+"""
+    counters = gds_baseline_collector.parse_prometheus_counters(payload)
+    assert counters == {
+        "mooncake_batch_get_calls_total": 2,
+        "mooncake_batch_get_requested_keys_total": 80,
+        "mooncake_batch_get_selected_gds_keys_total": 12,
+    }
+
+
+def test_missing_store_endpoint_is_explicitly_unavailable():
+    result = gds_baseline_collector._collect_prometheus_endpoint(None)
+    assert result["available"] is False
+    assert result["reason"] == "endpoint not configured"
+    assert "counters" not in result
+
+
 def test_baseline_and_default_configs_are_fixed_and_conservative():
     for name in ("tent-gds.json", "tent-gds-baseline.json"):
         config = json.loads((CONFIG_DIR / name).read_text(encoding="utf-8"))
@@ -80,6 +104,7 @@ def test_missing_gpu_and_block_tools_are_explicitly_unavailable(tmp_path):
         "runtime",
         "kv_restore",
         "inference",
+        "store",
     ):
         assert (
             sample[source]["source_finished_monotonic_ns"]
