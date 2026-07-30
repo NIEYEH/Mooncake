@@ -29,7 +29,8 @@ the supplied run showed WRITE traffic but no GDS READ traffic.
 
 ## Goals
 
-- Allow up to four concurrent GDS WRITEs when no READ work is pending.
+- Add an explicit target-validation configuration that allows up to four
+  concurrent GDS WRITEs when no READ work is pending.
 - Preserve strict READ priority and a one-token contended WRITE limit.
 - Keep the shared physical device limit at 16.
 - Reject inconsistent token configurations with field-specific values and
@@ -52,7 +53,8 @@ the supplied run showed WRITE traffic but no GDS READ traffic.
 
 ## Configuration
 
-The default and fixed-baseline configurations use these matched limits:
+The new `tent-gds-write4.json` target-validation configuration uses these
+matched limits:
 
 | Setting | Value |
 | --- | ---: |
@@ -67,8 +69,11 @@ The default and fixed-baseline configurations use these matched limits:
 | `transports/gds/max_inflight_reads` | 16 |
 | `transports/gds/max_inflight_writes` | 4 |
 
-The weighted-fair configuration remains opt-in and keeps its existing
-standalone WRITE limit of two.
+The production default and fixed-baseline configurations retain a WRITE limit
+of one until the target-host acceptance gates pass. The weighted-fair
+configuration remains opt-in and keeps its existing standalone WRITE limit of
+two. After a successful target-host run, promoting the fixed/default files to
+four is a separate, evidence-backed configuration change.
 
 The scheduler validates these relationships:
 
@@ -83,14 +88,26 @@ The runtime also retains its transport-capacity checks. Invalid configuration
 is a startup error; the error names the failed relationship and prints all
 five scheduler token values.
 
+Standalone and direction limits are caps, not reserved partitions. Every
+reservation consumes the same shared pool:
+
+```text
+reserved_read_tokens + reserved_write_tokens <= shared_physical_tokens
+```
+
+The scheduler already enforces this invariant. Under weighted contention, one
+reserved WRITE token leaves at most 15 of the 16 shared tokens available for
+READ. `primary_read_tokens=16` is the standalone operation cap; it does not
+permit 16 READ reservations alongside a WRITE reservation.
+
 ## Dispatch Behavior
 
 The existing scheduling authority remains unchanged.
 
-1. `TransferEngineImpl` admits a maximum of four WRITE owners in a write-only
-   fixed-mode dispatch window.
-2. `GdsOperationScheduler` reserves at most four standalone WRITE tokens while
-   enforcing the global 16-token limit.
+1. With `tent-gds-write4.json`, `TransferEngineImpl` admits a maximum of four
+   WRITE owners in a write-only fixed-mode dispatch window.
+2. `GdsOperationScheduler` reserves at most four standalone WRITE physical-IO
+   tokens while enforcing the global 16-token limit.
 3. `GdsTransport` runs at most four cuFile WRITE calls on its four WRITE worker
    threads.
 4. When READ pressure exists, fixed mode continues to pause new WRITEs. If a
@@ -99,6 +116,30 @@ The existing scheduling authority remains unchanged.
 
 Client concurrency is not a device-token setting. An 80-client benchmark must
 not configure 80 WRITE tokens.
+
+One scheduler token represents one physical IO slot, not one conversation,
+operation, or logical owner. A logical owner may charge multiple tokens when
+its transport plan contains multiple physical IOs, bounded by direction,
+operation, and shared limits. The observed workload uses approximately one
+2.25 MiB physical IO per logical owner, so four independent owners are needed
+to demonstrate four active workers reliably.
+
+READ pressure is:
+
+```text
+queued_read_owners > 0
+|| reserved_read_tokens > 0
+|| transport_pending_reads > 0
+|| transport_inflight_reads > 0
+```
+
+When READ pressure appears, fixed mode stops dispatching new WRITEs. It does
+not cancel a WRITE already submitted to cuFile. Existing WRITEs complete and
+release their reservations exactly once, after which READ consumes the
+released shared capacity. When every READ-pressure source returns to zero,
+the runtime wakes dispatch and the validation configuration's write-only
+limit returns to four. Configured and current transport limits remain four
+while the actual runtime limit is zero due to `write_paused_for_read`.
 
 ## Observability
 
@@ -142,14 +183,31 @@ one record per IO.
 
 ### External-cache lookup
 
-The Store BatchGet boundary emits a sampled lookup summary even when zero keys
-resolve to GDS. It reports requested keys and counts classified as metadata
-miss, memory replica, GDS replica, local/offload replica, or query error.
-Consequently:
+The Store BatchGet boundary records lossless cumulative counters in
+`ClientMetric` and exports them through the existing client `/metrics`
+endpoint. The synchronized benchmark collector samples the cumulative values
+once per second and writes interval deltas, including zero-activity intervals.
+Counters include:
 
-- no lookup summary means vLLM did not call the Store BatchGet path;
-- a summary with only metadata misses means keys were requested but absent;
-- GDS replicas with no READ dispatch identify a later Store/TENT failure.
+- BatchGet calls and requested keys;
+- metadata hits, misses, and query errors;
+- multi-label replica availability for memory, GDS, and local/offload;
+- mutually exclusive selected routes for memory, GDS, and local/offload;
+- GDS skipped because memory or local was selected;
+- GDS submit attempts and submit failures.
+
+This supports bounded diagnostic conclusions:
+
+- `batch_get_calls=0` means vLLM did not call the Store BatchGet path during
+  that interval;
+- calls with zero metadata hits mean keys were requested but absent or errored;
+- GDS available with GDS selected zero may be normal route preference;
+- GDS selected above zero with zero GDS submit attempts identifies a break
+  before the Store/TENT submit boundary;
+- GDS submit attempts above zero with zero transport READ dispatch identifies
+  a later submit/admission issue;
+- transport READ dispatch with no completion identifies the GDS execution or
+  completion path.
 
 No object key or prompt content is logged.
 
@@ -169,33 +227,65 @@ No object key or prompt content is logged.
 
 Host-independent tests cover:
 
-- the fixed/default JSON files contain the matched 4/16/1 limits;
+- the production fixed/default JSON files retain the conservative one-WRITE
+  limit;
+- `tent-gds-write4.json` contains the matched 4/16/1 validation limits;
 - each invalid scheduler relationship returns a field-specific error with all
   effective values;
 - valid READ=16, WRITE=4, contended WRITE=1, primary READ=16 configuration is
   accepted;
+- contended reservation never exceeds 15 READ plus one WRITE token, and the
+  combined reservation never exceeds the shared pool;
 - write-only dispatch exposes four tokens;
-- READ pressure reduces the actual WRITE dispatch limit according to fixed-mode
-  policy;
+- existing WRITEs drain without cancellation when READ pressure appears;
+- queued, reserved, pending, or inflight READ pressure prevents new WRITE
+  dispatch, and clearing all pressure wakes WRITE dispatch back to four;
 - summary snapshots distinguish configured, current, and runtime limits;
-- BatchGet lookup classification covers metadata misses, GDS replicas, other
-  replicas, and query errors without exposing keys.
+- BatchGet interval accounting is lossless and separates multi-label available
+  replicas from a mutually exclusive selected route;
+- scheduler/runtime fault paths cover immediate submit rejection, failed,
+  canceled, timeout, duplicate, and partial completion, plus shutdown with
+  outstanding work. Each path verifies reservations and inflight counts return
+  to zero, the terminal transition occurs once, the runtime is woken, and the
+  next batch can dispatch.
 
 Target-host verification uses the existing destructive GDS test controls and
 the 80-client, 10-turn benchmark:
 
-1. Run independent concurrent WRITEs at limits 1, 2, and 4 on non-overlapping,
-   explicitly confirmed block-device ranges.
+1. Run four independent WRITE operations/owners, each with sustained,
+   non-overlapping IO backlog, at limits 1, 2, and 4 on explicitly confirmed
+   block-device ranges.
 2. Verify byte-for-byte data, zero cuFile failures, and terminal completion.
 3. Under write-only load, verify `runtime_dispatch_limit=4` and
    `peak_active_workers` reaches at least two; four is expected under sustained
    backlog.
 4. Run mixed READ/WRITE load and verify READ pressure prevents four concurrent
-   WRITEs.
-5. Run all 800 conversation requests and require 800 terminal client results,
-   zero GDS transfer failures, and a drained runtime backlog.
+   WRITEs. Relative to the one-WRITE baseline, READ throughput may decline by
+   no more than 5% and READ P99 may increase by no more than 10%.
+5. Require WRITE-only throughput at limit 2 to reach at least 1.5 times limit
+   1, and limit 4 to reach at least 1.25 times limit 2. Runtime queue-wait P99
+   must decrease, cuFile P99 must remain bounded, and all reservations must
+   return to zero.
+6. Run the complete conversation workload and require:
+
+```text
+submitted_requests = 800
+completed_http_200 = 800
+client_timeouts = 0
+server_5xx = 0
+cancelled = 0
+max_input_num_turns = 10
+GDS failed_requests = 0
+active_gds_operations = 0
+queued_owners = 0
+dispatch_inflight_owners = 0
+reserved_read_tokens = 0
+reserved_write_tokens = 0
+```
+
+7. Only after gates 1 through 6 pass may the fixed/default configuration be
+   promoted from one to four WRITE tokens.
 
 The local environment cannot prove target NVMe/GPU throughput. Completion is
 therefore split into host-independent test success and a clearly reported
 target-host acceptance result.
-
