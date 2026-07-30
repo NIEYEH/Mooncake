@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <limits>
+#include <string>
 
 namespace mooncake::tent {
 namespace {
@@ -77,13 +78,41 @@ Status GdsOperationScheduler::validateConfig() const {
         return Status::InvalidArgument(
             "GDS operation scheduler limits must be non-zero" LOC_MARK);
     }
-    if (config_.read_standalone_tokens > config_.shared_tokens ||
-        config_.write_standalone_tokens > config_.shared_tokens ||
-        config_.contended_write_tokens >
-            config_.write_standalone_tokens ||
-        config_.primary_read_tokens > config_.shared_tokens) {
+    const std::string token_values =
+        " [shared_tokens=" + std::to_string(config_.shared_tokens) +
+        ", read_standalone_tokens=" +
+        std::to_string(config_.read_standalone_tokens) +
+        ", write_standalone_tokens=" +
+        std::to_string(config_.write_standalone_tokens) +
+        ", contended_write_tokens=" +
+        std::to_string(config_.contended_write_tokens) +
+        ", primary_read_tokens=" +
+        std::to_string(config_.primary_read_tokens) + "]";
+    if (config_.read_standalone_tokens > config_.shared_tokens) {
         return Status::InvalidArgument(
-            "GDS direction/operation tokens exceed shared tokens" LOC_MARK);
+            std::string("GDS token relationship violated: "
+                        "read_standalone_tokens <= shared_tokens") +
+            token_values + LOC_MARK);
+    }
+    if (config_.write_standalone_tokens > config_.shared_tokens) {
+        return Status::InvalidArgument(
+            std::string("GDS token relationship violated: "
+                        "write_standalone_tokens <= shared_tokens") +
+            token_values + LOC_MARK);
+    }
+    if (config_.contended_write_tokens >
+        config_.write_standalone_tokens) {
+        return Status::InvalidArgument(
+            std::string("GDS token relationship violated: "
+                        "contended_write_tokens <= "
+                        "write_standalone_tokens") +
+            token_values + LOC_MARK);
+    }
+    if (config_.primary_read_tokens > config_.shared_tokens) {
+        return Status::InvalidArgument(
+            std::string("GDS token relationship violated: "
+                        "primary_read_tokens <= shared_tokens") +
+            token_values + LOC_MARK);
     }
     const size_t max_deficit =
         static_cast<size_t>(std::numeric_limits<int64_t>::max());

@@ -62,6 +62,49 @@ GdsOperationSchedulerConfig weightedConfig() {
     return config;
 }
 
+void expectContains(const std::string& text, const std::string& needle) {
+    EXPECT_TRUE(text.find(needle) != std::string::npos);
+}
+
+void testInvalidTokenRelationshipsNameValues() {
+    struct Case {
+        const char* relationship;
+        void (*mutate)(GdsOperationSchedulerConfig&);
+    };
+    const std::vector<Case> cases = {
+        {"read_standalone_tokens <= shared_tokens",
+         [](GdsOperationSchedulerConfig& config) {
+             config.read_standalone_tokens = 17;
+         }},
+        {"write_standalone_tokens <= shared_tokens",
+         [](GdsOperationSchedulerConfig& config) {
+             config.write_standalone_tokens = 17;
+         }},
+        {"contended_write_tokens <= write_standalone_tokens",
+         [](GdsOperationSchedulerConfig& config) {
+             config.contended_write_tokens = 3;
+         }},
+        {"primary_read_tokens <= shared_tokens",
+         [](GdsOperationSchedulerConfig& config) {
+             config.primary_read_tokens = 17;
+         }},
+    };
+    for (const auto& item : cases) {
+        auto config = weightedConfig();
+        item.mutate(config);
+        GdsOperationScheduler scheduler(config);
+        const auto status = scheduler.status();
+        EXPECT_TRUE(!status.ok());
+        const auto message = status.ToString();
+        expectContains(message, item.relationship);
+        expectContains(message, "shared_tokens=16");
+        expectContains(message, "read_standalone_tokens=");
+        expectContains(message, "write_standalone_tokens=");
+        expectContains(message, "contended_write_tokens=");
+        expectContains(message, "primary_read_tokens=");
+    }
+}
+
 GdsDispatchEntry entry(uint64_t owner, uint64_t operation,
                        GdsDirection direction, size_t bytes,
                        size_t tokens = 1) {
@@ -423,6 +466,34 @@ void testFixedModeReservesOneContendedWriteToken() {
     EXPECT_EQ(writes, 1u);
 }
 
+void testWriteFourConfigSharesTokensWithRead() {
+    auto config = weightedConfig();
+    config.mode = GdsSchedulerMode::Fixed;
+    config.write_standalone_tokens = 4;
+    GdsOperationScheduler scheduler(config);
+    EXPECT_TRUE(scheduler.status().ok());
+    for (uint64_t index = 0; index < 32; ++index) {
+        EXPECT_TRUE(scheduler
+                        .enqueue(entry(300 + index, 85,
+                                       GdsDirection::Read, 2 * kMiB))
+                        .ok());
+    }
+    EXPECT_TRUE(
+        scheduler
+            .enqueue(entry(400, 86, GdsDirection::Write, 2 * kMiB))
+            .ok());
+
+    const auto selected =
+        scheduler.select({16, 64 * kMiB, 16, 16, 4});
+    EXPECT_EQ(selected.size(), 16u);
+    const auto snapshot = scheduler.snapshot();
+    EXPECT_EQ(snapshot.reserved_tokens[0], 15u);
+    EXPECT_EQ(snapshot.reserved_tokens[1], 1u);
+    EXPECT_EQ(snapshot.reserved_tokens[0] +
+                  snapshot.reserved_tokens[1],
+              config.shared_tokens);
+}
+
 void testGdsSegmentStopsAtFirstRequestOrByteLimit() {
     GdsDispatchSegment segment;
     constexpr size_t kObjectBytes = 2359296;
@@ -515,6 +586,7 @@ void testWriteBoostUsesPromotionDemotionAndCooldownHysteresis() {
 
 int main() {
     using namespace mooncake::tent;
+    testInvalidTokenRelationshipsNameValues();
     testOutstandingReservationsBoundRepeatedSelection();
     testPartialCompletionRefundsReservation();
     testDuplicateAndOversizedCompletionFail();
@@ -530,6 +602,7 @@ int main() {
     testDrainedOperationCanReceiveNextAdmissionSegment();
     testFixedModeUsesWriteSlotWhenReadWindowIsFull();
     testFixedModeReservesOneContendedWriteToken();
+    testWriteFourConfigSharesTokensWithRead();
     testGdsSegmentStopsAtFirstRequestOrByteLimit();
     testRetiredOperationReleasesReservationHistory();
     testCanceledOperationStopsNewDispatchAndDrainsInflight();
