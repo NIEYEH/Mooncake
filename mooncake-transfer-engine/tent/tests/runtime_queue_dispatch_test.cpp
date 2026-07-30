@@ -871,59 +871,6 @@ TEST(RuntimeQueueDispatch, FailedGdsSubmitDoesNotStrandBulkPickedOwners) {
     EXPECT_TRUE(engine.unregisterLocalMemory(buffer.data(), buffer.size()).ok());
 }
 
-TEST(RuntimeQueueDispatch, ShutdownWithInflightGdsAllowsFreshDispatch) {
-    constexpr size_t kReqLen = 4096;
-    std::vector<uint8_t> buffer(kReqLen, 0x49);
-    auto pending_gds = std::make_shared<FakeTransport>(
-        GDS, [](const Request&, int) {
-            return TransferStatus{TransferStatusEnum::PENDING, 0};
-        });
-    {
-        auto cfg = makeRuntimeQueueConfig(1, 1UL << 20);
-        TransferEngineImpl engine(cfg);
-        ASSERT_TRUE(engine.available());
-        installFakeGds(engine, pending_gds);
-        ASSERT_TRUE(
-            engine.registerLocalMemory(buffer.data(), buffer.size()).ok());
-        BatchID batch = engine.allocateBatch(1);
-        ASSERT_NE(batch, (BatchID)0);
-        ASSERT_TRUE(
-            engine
-                .submitTransfer(
-                    batch,
-                    {makeLocalGdsRead(buffer.data(), kReqLen)})
-                .ok());
-        EXPECT_EQ(
-            pending_gds->runtime_reserved_read_tokens.load(), 1u);
-    }
-
-    auto fresh_cfg = makeRuntimeQueueConfig(1, 1UL << 20);
-    TransferEngineImpl fresh_engine(fresh_cfg);
-    ASSERT_TRUE(fresh_engine.available());
-    auto fresh_gds = std::make_shared<FakeTransport>(GDS);
-    installFakeGds(fresh_engine, fresh_gds);
-    ASSERT_TRUE(
-        fresh_engine.registerLocalMemory(buffer.data(), buffer.size()).ok());
-    BatchID fresh_batch = fresh_engine.allocateBatch(1);
-    ASSERT_NE(fresh_batch, (BatchID)0);
-    ASSERT_TRUE(
-        fresh_engine
-            .submitTransfer(
-                fresh_batch,
-                {makeLocalGdsRead(buffer.data(), kReqLen)})
-            .ok());
-    TransferStatus status{};
-    ASSERT_TRUE(
-        fresh_engine.getTransferStatus(fresh_batch, 0, status).ok());
-    EXPECT_EQ(status.s, TransferStatusEnum::COMPLETED);
-    EXPECT_EQ(fresh_gds->submit_calls.load(), 1);
-    EXPECT_TRUE(fresh_engine.freeBatch(fresh_batch).ok());
-    EXPECT_TRUE(
-        fresh_engine.unregisterLocalMemory(
-            buffer.data(), buffer.size())
-            .ok());
-}
-
 TEST(RuntimeQueueDispatch, RejectedGdsSegmentFailsOnlyInvalidOwner) {
     constexpr size_t kRequestCount = 3;
     constexpr size_t kReqLen = 4096;

@@ -527,9 +527,11 @@ zero or partial bytes, assert all reservation fields return to zero, then
 enqueue/select another owner. Keep the existing duplicate-completion assertion
 and verify it does not underflow accounting.
 
-Extend fake-transport runtime tests so immediate submit failure and engine
-shutdown leave no dispatch-inflight owner and allow a later fresh engine/queue
-to dispatch. Reuse the existing fake transport; do not mock cuFile.
+Extend fake-transport runtime tests so immediate submit failure leaves no
+dispatch-inflight owner and the same engine can dispatch a later batch. Reuse
+the existing fake transport; do not mock cuFile. Engine shutdown with
+outstanding work remains out of scope per the user request and the design
+scope.
 
 - [ ] **Step 4: Run affected tests**
 

@@ -244,10 +244,11 @@ Host-independent tests cover:
 - BatchGet interval accounting is lossless and separates multi-label available
   replicas from a mutually exclusive selected route;
 - scheduler/runtime fault paths cover immediate submit rejection, failed,
-  canceled, timeout, duplicate, and partial completion, plus shutdown with
-  outstanding work. Each path verifies reservations and inflight counts return
-  to zero, the terminal transition occurs once, the runtime is woken, and the
-  next batch can dispatch.
+  canceled, timeout, duplicate, and partial completion. Each in-scope path
+  verifies reservations and inflight counts return to zero, the terminal
+  transition occurs once, the runtime is woken, and the next batch can
+  dispatch. Shutdown with outstanding work remains outside this change, as
+  stated in the scope above.
 
 Target-host verification uses the existing destructive GDS test controls and
 the 80-client, 10-turn benchmark:

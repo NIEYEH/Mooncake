@@ -124,12 +124,14 @@ def parse_prometheus_counters(payload: str) -> dict[str, int | float]:
         fields = line.split()
         if len(fields) != 2:
             continue
-        name, raw_value = fields
-        if (
-            not name.startswith("mooncake_batch_get_")
-            or "{" in name
-            or "}" in name
-        ):
+        metric_token, raw_value = fields
+        if "{" in metric_token:
+            name, labels = metric_token.split("{", 1)
+            if not labels.endswith("}"):
+                continue
+        else:
+            name = metric_token
+        if not name.startswith("mooncake_batch_get_"):
             continue
         try:
             value = float(raw_value)
@@ -137,7 +139,10 @@ def parse_prometheus_counters(payload: str) -> dict[str, int | float]:
             continue
         if not math.isfinite(value):
             continue
-        counters[name] = int(value) if value.is_integer() else value
+        parsed_value: int | float = (
+            int(value) if value.is_integer() else value
+        )
+        counters[name] = counters.get(name, 0) + parsed_value
     return counters
 
 

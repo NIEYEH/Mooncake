@@ -18,6 +18,7 @@ def test_prometheus_parser_keeps_only_fixed_batch_get_counters():
 mooncake_batch_get_calls_total 2
 mooncake_batch_get_requested_keys_total 80
 mooncake_batch_get_selected_gds_keys_total 12
+mooncake_batch_get_available_gds_keys_total{cluster_id="test"} 7
 unrelated_metric{route="dynamic"} 99
 mooncake_batch_get_bad_value_total not-a-number
 """
@@ -26,6 +27,7 @@ mooncake_batch_get_bad_value_total not-a-number
         "mooncake_batch_get_calls_total": 2,
         "mooncake_batch_get_requested_keys_total": 80,
         "mooncake_batch_get_selected_gds_keys_total": 12,
+        "mooncake_batch_get_available_gds_keys_total": 7,
     }
 
 
