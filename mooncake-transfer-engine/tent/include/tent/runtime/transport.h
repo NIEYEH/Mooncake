@@ -180,10 +180,12 @@ class Transport {
     // Publish owners that are still waiting outside a transport's dispatch
     // window. The default is a no-op because only transports with their own
     // adaptive controller need this cross-layer backlog signal.
-    virtual void updateRuntimeQueueDepth(size_t queued_reads,
-                                         size_t queued_writes) {
+    virtual void updateRuntimeQueueDepth(
+        size_t queued_reads, size_t queued_writes,
+        size_t reserved_read_tokens) {
         (void)queued_reads;
         (void)queued_writes;
+        (void)reserved_read_tokens;
     }
 
    protected:

@@ -96,6 +96,30 @@ void testWriteExecutionLimitTracksReadContention() {
     EXPECT_TRUE(gdsFifoCanBypassBlockedFront(read_drain, true, false));
 }
 
+void testWriteDispatchDecisionReportsActualRuntimeLimit() {
+    const auto idle =
+        gdsWriteDispatchDecision(4, 4, 1, true, false);
+    EXPECT_EQ(idle.configured_limit, 4u);
+    EXPECT_EQ(idle.current_limit, 4u);
+    EXPECT_EQ(idle.runtime_limit, 4u);
+    EXPECT_TRUE(!idle.read_pressure);
+    EXPECT_EQ(idle.reason, GdsWriteDispatchBlockReason::None);
+
+    const auto paused =
+        gdsWriteDispatchDecision(4, 4, 1, true, true);
+    EXPECT_EQ(paused.configured_limit, 4u);
+    EXPECT_EQ(paused.current_limit, 4u);
+    EXPECT_EQ(paused.runtime_limit, 0u);
+    EXPECT_TRUE(paused.read_pressure);
+    EXPECT_EQ(paused.reason,
+              GdsWriteDispatchBlockReason::WritePausedForRead);
+
+    const auto contended =
+        gdsWriteDispatchDecision(4, 4, 1, false, true);
+    EXPECT_EQ(contended.runtime_limit, 1u);
+    EXPECT_EQ(contended.reason, GdsWriteDispatchBlockReason::None);
+}
+
 }  // namespace
 }  // namespace mooncake::tent
 
@@ -106,6 +130,7 @@ int main() {
     testReservationUpdatesPhysicalCounts();
     testPartialDirectIoReportsActualBytesWithoutCompleting();
     testWriteExecutionLimitTracksReadContention();
+    testWriteDispatchDecisionReportsActualRuntimeLimit();
     std::cout << "gds_fifo_dispatch_test: PASS" << std::endl;
     return 0;
 }

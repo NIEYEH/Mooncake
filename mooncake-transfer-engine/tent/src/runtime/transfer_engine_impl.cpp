@@ -2303,10 +2303,16 @@ void TransferEngineImpl::updateRuntimeQueueMetrics() {
             ++queued_gds_writes;
         }
     }
+    size_t reserved_gds_read_tokens = 0;
+    if (runtime_queue_) {
+        reserved_gds_read_tokens =
+            runtime_queue_->gdsSchedulerSnapshot().reserved_tokens[0];
+    }
     const auto& gds_transport = transport_list_[GDS];
     if (gds_transport) {
         gds_transport->updateRuntimeQueueDepth(
-            queued_gds_reads, queued_gds_writes);
+            queued_gds_reads, queued_gds_writes,
+            reserved_gds_read_tokens);
     }
 
     if (!runtime_queue_config_.enabled || !runtime_queue_) {

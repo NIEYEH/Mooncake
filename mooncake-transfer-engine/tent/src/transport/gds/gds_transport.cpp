@@ -306,13 +306,7 @@ GdsTransport::~GdsTransport() { uninstall(); }
 size_t GdsTransport::runtimeQueueDispatchLimit(Request::OpCode opcode) const {
     std::lock_guard<std::mutex> scheduler_guard(scheduler_lock_);
     if (opcode == Request::READ) return read_adaptive_.current_limit;
-    const bool read_pressure =
-        pending_read_ios_ != 0 || !inflight_direct_reads_.empty() ||
-        runtime_queued_reads_.load(std::memory_order_relaxed) != 0;
-    if (pause_writes_while_reads_pending_ && read_pressure) return 0;
-    return gdsFifoEffectiveWriteLimit(
-        write_adaptive_.current_limit,
-        runtime_contended_write_limit_, read_pressure);
+    return writeDispatchDecisionLocked().runtime_limit;
 }
 
 Status GdsTransport::setRuntimeQueueContendedWriteLimit(size_t tokens) {
@@ -325,10 +319,31 @@ Status GdsTransport::setRuntimeQueueContendedWriteLimit(size_t tokens) {
     return dispatchPendingIoLocked();
 }
 
-void GdsTransport::updateRuntimeQueueDepth(size_t queued_reads,
-                                           size_t queued_writes) {
+void GdsTransport::updateRuntimeQueueDepth(
+    size_t queued_reads, size_t queued_writes,
+    size_t reserved_read_tokens) {
     runtime_queued_reads_.store(queued_reads, std::memory_order_relaxed);
     runtime_queued_writes_.store(queued_writes, std::memory_order_relaxed);
+    runtime_reserved_read_tokens_.store(
+        reserved_read_tokens, std::memory_order_relaxed);
+}
+
+bool GdsTransport::readPressureLocked() const {
+    return pending_read_ios_ != 0 ||
+           !inflight_direct_reads_.empty() ||
+           runtime_queued_reads_.load(std::memory_order_relaxed) != 0 ||
+           runtime_reserved_read_tokens_.load(
+               std::memory_order_relaxed) != 0;
+}
+
+GdsWriteDispatchDecision
+GdsTransport::writeDispatchDecisionLocked() const {
+    return gdsWriteDispatchDecision(
+        write_adaptive_.configured_limit,
+        write_adaptive_.current_limit,
+        runtime_contended_write_limit_,
+        pause_writes_while_reads_pending_,
+        readPressureLocked());
 }
 
 Status GdsTransport::install(std::string& local_segment_name,
@@ -514,6 +529,8 @@ Status GdsTransport::install(std::string& local_segment_name,
     write_window_blocked_ = false;
     runtime_queued_reads_.store(0, std::memory_order_relaxed);
     runtime_queued_writes_.store(0, std::memory_order_relaxed);
+    runtime_reserved_read_tokens_.store(0, std::memory_order_relaxed);
+    write_dispatch_block_reasons_.fill(0);
     read_io_summary_ = IoSummaryDirection{};
     write_io_summary_ = IoSummaryDirection{};
     for (auto* samples : {&read_io_summary_.queue_wait_us,
@@ -977,19 +994,11 @@ Status GdsTransport::dispatchPendingIoLocked() {
     while (!pending_ios_.empty()) {
         auto pending_it = pending_ios_.begin();
         bool write = pending_it->operation.write;
-        const bool read_pressure =
-            pending_read_ios_ != 0 || !inflight_direct_reads_.empty() ||
-            runtime_queued_reads_.load(std::memory_order_relaxed) != 0;
-        const size_t effective_write_limit =
-            pause_writes_while_reads_pending_ && read_pressure
-                ? 0
-                : gdsFifoEffectiveWriteLimit(
-                      write_adaptive_.current_limit,
-                      runtime_contended_write_limit_, read_pressure);
+        const auto write_decision = writeDispatchDecisionLocked();
         GdsFifoDispatchState state{
             max_inflight_ios_,
             read_adaptive_.current_limit,
-            effective_write_limit,
+            write_decision.runtime_limit,
             inflight_direct_reads_.size(),
             inflight_direct_writes_.size()};
         if (gdsFifoFrontBlocksQueue(state, write)) {
@@ -1000,7 +1009,25 @@ Status GdsTransport::dispatchPendingIoLocked() {
                     return gdsFifoCanBypassBlockedFront(
                         state, front_write, pending.operation.write);
                 });
-            if (pending_it == pending_ios_.end()) break;
+            if (pending_it == pending_ios_.end()) {
+                GdsWriteDispatchBlockReason reason =
+                    GdsWriteDispatchBlockReason::FifoFront;
+                if (gdsFifoSharedInflight(state) >=
+                    state.shared_limit) {
+                    reason =
+                        GdsWriteDispatchBlockReason::SharedTokens;
+                } else if (front_write) {
+                    reason =
+                        write_decision.reason ==
+                                GdsWriteDispatchBlockReason::None
+                            ? GdsWriteDispatchBlockReason::
+                                  WriteDirectionLimit
+                            : write_decision.reason;
+                }
+                ++write_dispatch_block_reasons_[static_cast<size_t>(
+                    reason)];
+                break;
+            }
             write = pending_it->operation.write;
             ++direction_capacity_bypasses;
         }
@@ -1008,6 +1035,8 @@ Status GdsTransport::dispatchPendingIoLocked() {
         ThreadPool* const thread_pool =
             write ? write_thread_pool_.get() : read_thread_pool_.get();
         if (!thread_pool) {
+            ++write_dispatch_block_reasons_[static_cast<size_t>(
+                GdsWriteDispatchBlockReason::WorkerPool)];
             return Status::InvalidEntry(
                 "GDS parallel IO workers are not available" LOC_MARK);
         }
@@ -1056,6 +1085,7 @@ Status GdsTransport::dispatchPendingIoLocked() {
     const bool front_write =
         !pending_ios_.empty() && pending_ios_.front().operation.write;
     const bool fifo_blocked = !pending_ios_.empty();
+    const auto write_decision = writeDispatchDecisionLocked();
     if (fifo_blocked &&
         ((front_write && !write_window_blocked_) ||
          (!front_write && !read_window_blocked_))) {
@@ -1069,9 +1099,17 @@ Status GdsTransport::dispatchPendingIoLocked() {
             << ", queued_ios=" << pending_ios_.size()
             << ", inflight_reads=" << inflight_direct_reads_.size()
             << ", inflight_writes=" << inflight_direct_writes_.size()
-            << ", shared_inflight_limit=" << max_inflight_ios_
-            << ", read_pool_limit=" << read_adaptive_.current_limit
-            << ", write_pool_limit=" << write_adaptive_.current_limit;
+             << ", shared_inflight_limit=" << max_inflight_ios_
+             << ", read_pool_limit=" << read_adaptive_.current_limit
+             << ", write_configured_limit="
+             << write_decision.configured_limit
+             << ", write_current_limit="
+             << write_decision.current_limit
+             << ", write_runtime_limit="
+             << write_decision.runtime_limit
+             << ", read_pressure=" << write_decision.read_pressure
+             << ", pause_writes_while_reads_pending="
+             << pause_writes_while_reads_pending_;
     }
     read_window_blocked_ = fifo_blocked && !front_write;
     write_window_blocked_ = fifo_blocked && front_write;
@@ -1163,6 +1201,7 @@ void GdsTransport::maybeLogIoSummaryLocked(
 
     const double elapsed_seconds =
         std::chrono::duration<double>(elapsed).count();
+    const auto write_decision = writeDispatchDecisionLocked();
     LOG(INFO)
         << "GDS IO 1s summary: window_ms=" << elapsed_seconds * 1000.0
         << ", READ{completions=" << read_io_summary_.completions
@@ -1184,6 +1223,9 @@ void GdsTransport::maybeLogIoSummaryLocked(
         << ", internal_queued=" << pending_read_ios_
         << ", runtime_queued_owners="
         << runtime_queued_reads_.load(std::memory_order_relaxed)
+        << ", runtime_reserved_tokens="
+        << runtime_reserved_read_tokens_.load(
+               std::memory_order_relaxed)
         << ", effective_limit=" << read_adaptive_.current_limit
         << "}, WRITE{completions=" << write_io_summary_.completions
         << ", failures=" << write_io_summary_.failures
@@ -1204,10 +1246,30 @@ void GdsTransport::maybeLogIoSummaryLocked(
         << ", internal_queued=" << pending_write_ios_
         << ", runtime_queued_owners="
         << runtime_queued_writes_.load(std::memory_order_relaxed)
-        << ", effective_limit=" << write_adaptive_.current_limit
+        << ", configured_limit=" << write_decision.configured_limit
+        << ", current_limit=" << write_decision.current_limit
         << ", runtime_dispatch_limit="
-        << write_adaptive_.current_limit
+        << write_decision.runtime_limit
+        << ", read_pressure=" << write_decision.read_pressure
+        << ", pause_for_read="
+        << pause_writes_while_reads_pending_
         << ", shared_device_tokens=" << max_inflight_ios_
+        << ", block_reasons{shared_tokens="
+        << write_dispatch_block_reasons_[static_cast<size_t>(
+               GdsWriteDispatchBlockReason::SharedTokens)]
+        << ", write_direction_limit="
+        << write_dispatch_block_reasons_[static_cast<size_t>(
+               GdsWriteDispatchBlockReason::WriteDirectionLimit)]
+        << ", write_paused_for_read="
+        << write_dispatch_block_reasons_[static_cast<size_t>(
+               GdsWriteDispatchBlockReason::WritePausedForRead)]
+        << ", worker_pool="
+        << write_dispatch_block_reasons_[static_cast<size_t>(
+               GdsWriteDispatchBlockReason::WorkerPool)]
+        << ", fifo_front="
+        << write_dispatch_block_reasons_[static_cast<size_t>(
+               GdsWriteDispatchBlockReason::FifoFront)]
+        << "}"
         << "}}";
 
     auto reset_summary = [](IoSummaryDirection& summary,
@@ -1223,6 +1285,7 @@ void GdsTransport::maybeLogIoSummaryLocked(
     };
     reset_summary(read_io_summary_, active_read_workers_);
     reset_summary(write_io_summary_, active_write_workers_);
+    write_dispatch_block_reasons_.fill(0);
     io_summary_started_at_ = now;
 }
 

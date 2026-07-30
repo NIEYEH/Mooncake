@@ -16,6 +16,7 @@
 #define GDS_TRANSPORT_H_
 
 #include <atomic>
+#include <array>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -136,8 +137,9 @@ class GdsTransport : public Transport {
 
     Status setRuntimeQueueContendedWriteLimit(size_t tokens) override;
 
-    void updateRuntimeQueueDepth(size_t queued_reads,
-                                 size_t queued_writes) override;
+    void updateRuntimeQueueDepth(
+        size_t queued_reads, size_t queued_writes,
+        size_t reserved_read_tokens) override;
 
    private:
     std::string getGdsFilePath(SegmentID handle);
@@ -186,6 +188,10 @@ class GdsTransport : public Transport {
     // always dequeues and submits them as independent synchronous cuFile IOs.
     // No cuFile Batch API handle is created by this transport.
     Status dispatchPendingIoLocked();
+
+    bool readPressureLocked() const;
+
+    GdsWriteDispatchDecision writeDispatchDecisionLocked() const;
 
     void executeDirectIo(std::shared_ptr<DirectIo> direct_io);
 
@@ -263,6 +269,11 @@ class GdsTransport : public Transport {
     std::atomic<bool> shutting_down_{false};
     std::atomic<size_t> runtime_queued_reads_{0};
     std::atomic<size_t> runtime_queued_writes_{0};
+    std::atomic<size_t> runtime_reserved_read_tokens_{0};
+    std::array<
+        size_t,
+        static_cast<size_t>(GdsWriteDispatchBlockReason::Count)>
+        write_dispatch_block_reasons_{};
 
     struct IoSummaryDirection {
         size_t completions{0};

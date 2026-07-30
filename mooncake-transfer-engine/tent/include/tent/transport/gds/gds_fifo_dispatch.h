@@ -29,6 +29,25 @@ struct GdsDirectIoOutcome {
     bool completed{false};
 };
 
+enum class GdsWriteDispatchBlockReason : uint8_t {
+    None,
+    SharedTokens,
+    WriteDirectionLimit,
+    WritePausedForRead,
+    WorkerPool,
+    FifoFront,
+    Count,
+};
+
+struct GdsWriteDispatchDecision {
+    size_t configured_limit{0};
+    size_t current_limit{0};
+    size_t runtime_limit{0};
+    bool read_pressure{false};
+    GdsWriteDispatchBlockReason reason{
+        GdsWriteDispatchBlockReason::None};
+};
+
 // cuFile returns the transferred byte count or a negative error. Preserve a
 // positive short result for reservation/WDRR reconciliation while keeping the
 // request terminal status failed. A defensive cap prevents a malformed driver
@@ -48,6 +67,23 @@ inline size_t gdsFifoEffectiveWriteLimit(
     bool read_pressure) {
     return read_pressure ? std::min(configured_limit, contended_limit)
                          : configured_limit;
+}
+
+inline GdsWriteDispatchDecision gdsWriteDispatchDecision(
+    size_t configured_limit, size_t current_limit,
+    size_t contended_limit, bool pause_for_read,
+    bool read_pressure) {
+    if (pause_for_read && read_pressure) {
+        return {configured_limit, current_limit, 0, true,
+                GdsWriteDispatchBlockReason::WritePausedForRead};
+    }
+    const size_t runtime_limit = gdsFifoEffectiveWriteLimit(
+        current_limit, contended_limit, read_pressure);
+    return {configured_limit, current_limit, runtime_limit,
+            read_pressure,
+            runtime_limit == 0
+                ? GdsWriteDispatchBlockReason::WriteDirectionLimit
+                : GdsWriteDispatchBlockReason::None};
 }
 
 inline size_t gdsFifoSharedInflight(

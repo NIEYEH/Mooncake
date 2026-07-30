@@ -76,6 +76,7 @@ class FakeTransport : public Transport {
         std::numeric_limits<size_t>::max()};
     std::atomic<size_t> runtime_queued_reads{0};
     std::atomic<size_t> runtime_queued_writes{0};
+    std::atomic<size_t> runtime_reserved_read_tokens{0};
     std::atomic<size_t> planned_physical_ios{1};
     std::function<bool(const Request&)> reject_request;
     std::function<void(const Request&)> plan_request_hook;
@@ -220,10 +221,12 @@ class FakeTransport : public Transport {
                                        : runtime_write_limit.load();
     }
 
-    void updateRuntimeQueueDepth(size_t queued_reads,
-                                 size_t queued_writes) override {
+    void updateRuntimeQueueDepth(
+        size_t queued_reads, size_t queued_writes,
+        size_t reserved_read_tokens) override {
         runtime_queued_reads.store(queued_reads);
         runtime_queued_writes.store(queued_writes);
+        runtime_reserved_read_tokens.store(reserved_read_tokens);
     }
 
     const char* getName() const override { return "<fake-rdma>"; }
@@ -1433,6 +1436,7 @@ TEST(RuntimeQueueDispatch, PublishesExternalGdsBacklogByDirection) {
               static_cast<int>(Request::READ));
     EXPECT_EQ(fake_gds->runtime_queued_reads.load(), 1u);
     EXPECT_EQ(fake_gds->runtime_queued_writes.load(), 1u);
+    EXPECT_EQ(fake_gds->runtime_reserved_read_tokens.load(), 1u);
 
     complete.store(true);
     TransferStatus first_read{};
@@ -1440,12 +1444,14 @@ TEST(RuntimeQueueDispatch, PublishesExternalGdsBacklogByDirection) {
     EXPECT_EQ(first_read.s, TransferStatusEnum::COMPLETED);
     EXPECT_EQ(fake_gds->runtime_queued_reads.load(), 0u);
     EXPECT_EQ(fake_gds->runtime_queued_writes.load(), 1u);
+    EXPECT_EQ(fake_gds->runtime_reserved_read_tokens.load(), 1u);
 
     TransferStatus second_read{};
     ASSERT_TRUE(engine.getTransferStatus(batch, 2, second_read).ok());
     EXPECT_EQ(second_read.s, TransferStatusEnum::COMPLETED);
     EXPECT_EQ(fake_gds->runtime_queued_reads.load(), 0u);
     EXPECT_EQ(fake_gds->runtime_queued_writes.load(), 0u);
+    EXPECT_EQ(fake_gds->runtime_reserved_read_tokens.load(), 0u);
 
     TransferStatus write{};
     ASSERT_TRUE(engine.getTransferStatus(batch, 0, write).ok());
