@@ -1,0 +1,64 @@
+{
+  "verbose": true,
+  "merge_requests": false,
+  "enable_runtime_queue": true,
+  "runtime_queue": {
+    "max_outstanding_owners": 64,
+    "max_outstanding_bytes": 268435456,
+    "max_dispatch_owners": 16,
+    "max_dispatch_bytes": 67108864,
+    "max_dispatch_read_owners": 16,
+    "max_dispatch_write_owners": 4,
+    "max_waiting_owners": 1024,
+    "max_waiting_bytes": 2147483648,
+    "staging_owner_reserve": 0,
+    "staging_byte_reserve": 0,
+    "progress_fallback_interval_us": 1000,
+    "gds_scheduler_mode": "fixed",
+    "gds_shared_physical_tokens": 16,
+    "gds_read_standalone_tokens": 16,
+    "gds_write_standalone_tokens": 4,
+    "gds_contended_write_tokens": 1,
+    "gds_pause_writes_while_reads_pending": true,
+    "gds_primary_read_tokens": 16,
+    "gds_primary_read_bytes": 50331648,
+    "gds_secondary_segment_requests": 8,
+    "gds_secondary_segment_bytes": 16777216,
+    "gds_segment_max_requests": 8,
+    "gds_segment_max_bytes": 16777216,
+    "indirect_lease_refresh": false
+  },
+  "transports": {
+    "tcp": {
+      "enable": true
+    },
+    "rdma": {
+      "enable": false
+    },
+    "gds": {
+      "enable": true,
+      "read_worker_threads": 16,
+      "write_worker_threads": 4,
+      "shared_device_tokens": 16,
+      "max_inflight_reads": 16,
+      "max_inflight_writes": 4,
+      "submit_retry_count": 0,
+      "adaptive_concurrency": false,
+      "batch_api": false,
+      "async_api": false,
+      "merge_mode": "shadow"
+    },
+    "io_uring": {
+      "enable": false
+    },
+    "shm": {
+      "enable": false
+    },
+    "nvlink": {
+      "enable": false
+    },
+    "mnnvl": {
+      "enable": false
+    }
+  }
+}

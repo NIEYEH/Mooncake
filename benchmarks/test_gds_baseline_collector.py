@@ -42,6 +42,24 @@ def test_weighted_config_uses_shared_tokens_and_completed_byte_quanta():
     assert config["transports"]["gds"]["adaptive_concurrency"] is False
 
 
+def test_write4_target_config_matches_all_three_concurrency_layers():
+    config = json.loads(
+        (CONFIG_DIR / "tent-gds-write4.json").read_text(encoding="utf-8")
+    )
+    queue = config["runtime_queue"]
+    gds = config["transports"]["gds"]
+    assert queue["max_dispatch_write_owners"] == 4
+    assert queue["gds_shared_physical_tokens"] == 16
+    assert queue["gds_read_standalone_tokens"] == 16
+    assert queue["gds_write_standalone_tokens"] == 4
+    assert queue["gds_contended_write_tokens"] == 1
+    assert queue["gds_primary_read_tokens"] == 16
+    assert gds["write_worker_threads"] == 4
+    assert gds["shared_device_tokens"] == 16
+    assert gds["max_inflight_writes"] == 4
+    assert gds["adaptive_concurrency"] is False
+
+
 def test_missing_gpu_and_block_tools_are_explicitly_unavailable(tmp_path):
     with patch.object(
         gds_baseline_collector.shutil, "which", return_value=None
