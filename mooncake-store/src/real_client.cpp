@@ -406,6 +406,74 @@ inline QueryResult FilterQueryResult(const QueryResult &qr,
                                      const Replica::Descriptor &replica) {
     return QueryResult({replica}, qr.lease_timeout);
 }
+
+enum class BatchGetSelectedRoute { kMemory, kGds, kLocal, kUnsupported };
+
+struct BatchGetReplicaAvailability {
+    bool memory{false};
+    bool gds{false};
+    bool local{false};
+};
+
+inline BatchGetReplicaAvailability InspectBatchGetReplicaAvailability(
+    const std::vector<Replica::Descriptor> &replicas) {
+    BatchGetReplicaAvailability availability;
+    for (const auto &replica : replicas) {
+        if (replica.status != ReplicaStatus::COMPLETE) continue;
+        if (replica.is_memory_replica() || replica.is_nof_replica()) {
+            availability.memory = true;
+        } else if (replica.is_gds_ssd_replica() &&
+                   !replica.get_gds_ssd_descriptor().segment_uri.empty()) {
+            availability.gds = true;
+        } else if (replica.is_local_disk_replica() ||
+                   replica.is_disk_replica()) {
+            availability.local = true;
+        }
+    }
+    return availability;
+}
+
+inline BatchGetSelectedRoute ClassifyBatchGetSelectedRoute(
+    const Replica::Descriptor &replica) {
+    if (replica.is_gds_ssd_replica()) {
+        return BatchGetSelectedRoute::kGds;
+    }
+    if (replica.is_memory_replica() || replica.is_nof_replica()) {
+        return BatchGetSelectedRoute::kMemory;
+    }
+    if (replica.is_local_disk_replica() || replica.is_disk_replica()) {
+        return BatchGetSelectedRoute::kLocal;
+    }
+    return BatchGetSelectedRoute::kUnsupported;
+}
+
+inline void RecordBatchGetAvailability(
+    BatchGetLookupObservation &observation,
+    const BatchGetReplicaAvailability &availability) {
+    observation.available_memory_keys += availability.memory;
+    observation.available_gds_keys += availability.gds;
+    observation.available_local_keys += availability.local;
+}
+
+inline void RecordBatchGetSelectedRoute(
+    BatchGetLookupObservation &observation,
+    BatchGetSelectedRoute route, bool gds_available) {
+    switch (route) {
+        case BatchGetSelectedRoute::kMemory:
+            ++observation.selected_memory_keys;
+            observation.skipped_gds_due_memory_keys += gds_available;
+            break;
+        case BatchGetSelectedRoute::kGds:
+            ++observation.selected_gds_keys;
+            break;
+        case BatchGetSelectedRoute::kLocal:
+            ++observation.selected_local_keys;
+            observation.skipped_gds_due_local_keys += gds_available;
+            break;
+        case BatchGetSelectedRoute::kUnsupported:
+            break;
+    }
+}
 }  // namespace
 
 PyClient::~PyClient() {}
@@ -4496,8 +4564,11 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
 
     const size_t num_keys = keys.size();
     std::vector<tl::expected<int64_t, ErrorCode>> results(num_keys);
+    BatchGetLookupObservation lookup_observation{
+        .calls = 1, .requested_keys = num_keys};
 
     if (num_keys == 0) {
+        client_->ObserveBatchGetLookup(lookup_observation);
         return results;
     }
 
@@ -4518,6 +4589,7 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
         QueryResult query_result;
         std::vector<Slice> slices;
         uint64_t total_size;
+        bool selected_gds{false};
     };
     struct DiskKeyInfo {
         std::string key;
@@ -4540,16 +4612,23 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
         if (!query_results[i]) {
             const auto error = query_results[i].error();
             results[i] = tl::unexpected(error);
-            if (error != ErrorCode::OBJECT_NOT_FOUND &&
-                error != ErrorCode::REPLICA_IS_NOT_READY) {
+            if (error == ErrorCode::OBJECT_NOT_FOUND ||
+                error == ErrorCode::REPLICA_IS_NOT_READY) {
+                ++lookup_observation.metadata_miss_keys;
+            } else {
+                ++lookup_observation.query_error_keys;
                 LOG(ERROR) << "Query failed for key '" << key
                            << "': " << toString(error);
             }
             continue;
         }
+        ++lookup_observation.metadata_hit_keys;
 
         // Validate replica list
         auto query_result_values = query_results[i].value();
+        const auto availability = InspectBatchGetReplicaAvailability(
+            query_result_values.replicas);
+        RecordBatchGetAvailability(lookup_observation, availability);
         if (query_result_values.replicas.empty()) {
             LOG(ERROR) << "Empty replica list for key: " << key;
             results[i] = tl::unexpected(ErrorCode::INVALID_REPLICA);
@@ -4578,6 +4657,10 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
             results[i] = tl::unexpected(ErrorCode::INVALID_PARAMS);
             continue;
         }
+        const auto selected_route =
+            ClassifyBatchGetSelectedRoute(replica);
+        RecordBatchGetSelectedRoute(
+            lookup_observation, selected_route, availability.gds);
         if (replica.is_gds_ssd_replica()) {
             ++gds_key_count;
             gds_bytes += total_size;
@@ -4616,7 +4699,8 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
              .original_index = i,
              .query_result = FilterQueryResult(query_result_values, replica),
              .slices = std::move(key_slices),
-             .total_size = total_size});
+             .total_size = total_size,
+             .selected_gds = replica.is_gds_ssd_replica()});
 
         // Set success result (actual bytes transferred)
         results[i] = static_cast<int64_t>(total_size);
@@ -4625,6 +4709,7 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
     // Early return if no valid operations
     if (valid_operations.empty() && valid_local_disk_operations.empty() &&
         disk_operations.empty()) {
+        client_->ObserveBatchGetLookup(lookup_observation);
         return results;
     }
 
@@ -4653,6 +4738,12 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
                         transfer_started_at - start_time)
                         .count());
         }
+        lookup_observation.gds_submit_attempt_keys +=
+            static_cast<uint64_t>(std::count_if(
+                valid_operations.begin(), valid_operations.end(),
+                [](const ValidKeyInfo &operation) {
+                    return operation.selected_gds;
+                }));
         const auto batch_get_results =
             client_->BatchGet(batch_keys, batch_query_results, batch_slices);
         if (gds_key_count != 0) {
@@ -4672,6 +4763,8 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
                 LOG(ERROR) << "BatchGet failed for key '" << op.key
                            << "': " << toString(error);
                 results[op.original_index] = tl::unexpected(error);
+                lookup_observation.gds_submit_failure_keys +=
+                    op.selected_gds;
             }
         }
     }
@@ -4810,6 +4903,7 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
         first_gds_dispatch_delay_us, gds_transfer_us, keys.size(),
         gds_key_count, gds_bytes, store_operation_token,
         caller_interarrival_us, results);
+    client_->ObserveBatchGetLookup(lookup_observation);
     return results;
 }
 
@@ -5011,7 +5105,10 @@ RealClient::batch_get_into_multi_buffers_internal(
     const size_t num_keys = keys.size();
     std::vector<tl::expected<int64_t, ErrorCode>> results;
     results.reserve(num_keys);
+    BatchGetLookupObservation lookup_observation{
+        .calls = 1, .requested_keys = num_keys};
     if (num_keys == 0) {
+        client_->ObserveBatchGetLookup(lookup_observation);
         return results;
     }
     // Query metadata for all keys
@@ -5030,6 +5127,7 @@ RealClient::batch_get_into_multi_buffers_internal(
         QueryResult query_result;
         std::vector<Slice> slices;
         uint64_t total_size;
+        bool selected_gds{false};
     };
 
     struct DiskKeyInfo {
@@ -5053,14 +5151,22 @@ RealClient::batch_get_into_multi_buffers_internal(
         if (!query_results[i]) {
             const auto error = query_results[i].error();
             results.emplace_back(tl::unexpected(error));
-            if (error != ErrorCode::OBJECT_NOT_FOUND) {
+            if (error == ErrorCode::OBJECT_NOT_FOUND ||
+                error == ErrorCode::REPLICA_IS_NOT_READY) {
+                ++lookup_observation.metadata_miss_keys;
+            } else {
+                ++lookup_observation.query_error_keys;
                 LOG(ERROR) << "Query failed for key '" << key
                            << "': " << toString(error);
             }
             continue;
         }
+        ++lookup_observation.metadata_hit_keys;
         // Validate replica list
         auto query_result_values = query_results[i].value();
+        const auto availability = InspectBatchGetReplicaAvailability(
+            query_result_values.replicas);
+        RecordBatchGetAvailability(lookup_observation, availability);
         if (query_result_values.replicas.empty()) {
             LOG(ERROR) << "Empty replica list for key: " << key;
             results.emplace_back(tl::unexpected(ErrorCode::INVALID_REPLICA));
@@ -5090,6 +5196,10 @@ RealClient::batch_get_into_multi_buffers_internal(
             results.emplace_back(tl::unexpected(ErrorCode::INVALID_PARAMS));
             continue;
         }
+        const auto selected_route =
+            ClassifyBatchGetSelectedRoute(replica);
+        RecordBatchGetSelectedRoute(
+            lookup_observation, selected_route, availability.gds);
         if (replica.is_gds_ssd_replica()) {
             ++gds_key_count;
             gds_bytes += total_size;
@@ -5140,12 +5250,14 @@ RealClient::batch_get_into_multi_buffers_internal(
              .original_index = i,
              .query_result = FilterQueryResult(query_result_values, replica),
              .slices = std::move(key_slices),
-             .total_size = total_size});
+             .total_size = total_size,
+             .selected_gds = replica.is_gds_ssd_replica()});
         // Set success result (actual bytes transferred)
         results.emplace_back(static_cast<int64_t>(total_size));
     }
     // Early return if no valid operations
     if (valid_operations.empty() && valid_local_disk_ops.empty()) {
+        client_->ObserveBatchGetLookup(lookup_observation);
         return results;
     }
 
@@ -5161,6 +5273,12 @@ RealClient::batch_get_into_multi_buffers_internal(
             batch_query_results.push_back(op.query_result);
             batch_slices[op.key] = op.slices;
         }
+        lookup_observation.gds_submit_attempt_keys +=
+            static_cast<uint64_t>(std::count_if(
+                valid_operations.begin(), valid_operations.end(),
+                [](const ValidKeyInfo &operation) {
+                    return operation.selected_gds;
+                }));
 
         const auto transfer_started_at = std::chrono::steady_clock::now();
         if (gds_key_count != 0) {
@@ -5190,6 +5308,8 @@ RealClient::batch_get_into_multi_buffers_internal(
                 LOG(ERROR) << "BatchGet failed for key '" << op.key
                            << "': " << toString(error);
                 results[op.original_index] = tl::unexpected(error);
+                lookup_observation.gds_submit_failure_keys +=
+                    op.selected_gds;
             }
         }
     }
@@ -5372,6 +5492,7 @@ RealClient::batch_get_into_multi_buffers_internal(
         first_gds_dispatch_delay_us, gds_transfer_us, keys.size(),
         gds_key_count, gds_bytes, store_operation_token,
         caller_interarrival_us, results);
+    client_->ObserveBatchGetLookup(lookup_observation);
     return results;
 }
 

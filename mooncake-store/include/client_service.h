@@ -551,6 +551,13 @@ class Client {
         }
     }
 
+    void ObserveBatchGetLookup(
+        const BatchGetLookupObservation& observation) {
+        if (metrics_ != nullptr) {
+            metrics_->ObserveBatchGetLookup(observation);
+        }
+    }
+
     // For Prometheus-style metrics
     tl::expected<std::string, ErrorCode> SerializeMetrics() {
         if (metrics_ == nullptr) {

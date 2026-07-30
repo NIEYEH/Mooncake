@@ -708,12 +708,155 @@ struct GdsTransferMetric {
     }
 };
 
+struct BatchGetLookupObservation {
+    uint64_t calls{0};
+    uint64_t requested_keys{0};
+    uint64_t metadata_hit_keys{0};
+    uint64_t metadata_miss_keys{0};
+    uint64_t query_error_keys{0};
+    uint64_t available_memory_keys{0};
+    uint64_t available_gds_keys{0};
+    uint64_t available_local_keys{0};
+    uint64_t selected_memory_keys{0};
+    uint64_t selected_gds_keys{0};
+    uint64_t selected_local_keys{0};
+    uint64_t skipped_gds_due_memory_keys{0};
+    uint64_t skipped_gds_due_local_keys{0};
+    uint64_t gds_submit_attempt_keys{0};
+    uint64_t gds_submit_failure_keys{0};
+};
+
+struct BatchGetLookupMetric {
+    explicit BatchGetLookupMetric(
+        std::map<std::string, std::string> labels = {})
+        : calls("mooncake_batch_get_calls_total",
+                "Total BatchGet lookup calls", labels),
+          requested_keys("mooncake_batch_get_requested_keys_total",
+                         "Total keys requested by BatchGet lookups", labels),
+          metadata_hit_keys("mooncake_batch_get_metadata_hit_keys_total",
+                            "BatchGet keys with metadata", labels),
+          metadata_miss_keys("mooncake_batch_get_metadata_miss_keys_total",
+                             "BatchGet keys without ready metadata", labels),
+          query_error_keys("mooncake_batch_get_query_error_keys_total",
+                           "BatchGet keys with metadata query errors", labels),
+          available_memory_keys(
+              "mooncake_batch_get_available_memory_keys_total",
+              "BatchGet keys with a usable memory replica", labels),
+          available_gds_keys(
+              "mooncake_batch_get_available_gds_keys_total",
+              "BatchGet keys with a usable GDS replica", labels),
+          available_local_keys(
+              "mooncake_batch_get_available_local_keys_total",
+              "BatchGet keys with a usable local/disk replica", labels),
+          selected_memory_keys(
+              "mooncake_batch_get_selected_memory_keys_total",
+              "BatchGet keys routed through memory or NoF", labels),
+          selected_gds_keys(
+              "mooncake_batch_get_selected_gds_keys_total",
+              "BatchGet keys routed through GDS", labels),
+          selected_local_keys(
+              "mooncake_batch_get_selected_local_keys_total",
+              "BatchGet keys routed through local/disk storage", labels),
+          skipped_gds_due_memory_keys(
+              "mooncake_batch_get_skipped_gds_due_memory_keys_total",
+              "BatchGet keys where memory was selected over available GDS",
+              labels),
+          skipped_gds_due_local_keys(
+              "mooncake_batch_get_skipped_gds_due_local_keys_total",
+              "BatchGet keys where local/disk was selected over available GDS",
+              labels),
+          gds_submit_attempt_keys(
+              "mooncake_batch_get_gds_submit_attempt_keys_total",
+              "BatchGet keys submitted through GDS", labels),
+          gds_submit_failure_keys(
+              "mooncake_batch_get_gds_submit_failure_keys_total",
+              "BatchGet GDS key submissions that failed", labels) {}
+
+    ylt::metric::counter_t calls;
+    ylt::metric::counter_t requested_keys;
+    ylt::metric::counter_t metadata_hit_keys;
+    ylt::metric::counter_t metadata_miss_keys;
+    ylt::metric::counter_t query_error_keys;
+    ylt::metric::counter_t available_memory_keys;
+    ylt::metric::counter_t available_gds_keys;
+    ylt::metric::counter_t available_local_keys;
+    ylt::metric::counter_t selected_memory_keys;
+    ylt::metric::counter_t selected_gds_keys;
+    ylt::metric::counter_t selected_local_keys;
+    ylt::metric::counter_t skipped_gds_due_memory_keys;
+    ylt::metric::counter_t skipped_gds_due_local_keys;
+    ylt::metric::counter_t gds_submit_attempt_keys;
+    ylt::metric::counter_t gds_submit_failure_keys;
+
+    void Observe(const BatchGetLookupObservation& observation) {
+        calls.inc(observation.calls);
+        requested_keys.inc(observation.requested_keys);
+        metadata_hit_keys.inc(observation.metadata_hit_keys);
+        metadata_miss_keys.inc(observation.metadata_miss_keys);
+        query_error_keys.inc(observation.query_error_keys);
+        available_memory_keys.inc(observation.available_memory_keys);
+        available_gds_keys.inc(observation.available_gds_keys);
+        available_local_keys.inc(observation.available_local_keys);
+        selected_memory_keys.inc(observation.selected_memory_keys);
+        selected_gds_keys.inc(observation.selected_gds_keys);
+        selected_local_keys.inc(observation.selected_local_keys);
+        skipped_gds_due_memory_keys.inc(
+            observation.skipped_gds_due_memory_keys);
+        skipped_gds_due_local_keys.inc(
+            observation.skipped_gds_due_local_keys);
+        gds_submit_attempt_keys.inc(observation.gds_submit_attempt_keys);
+        gds_submit_failure_keys.inc(observation.gds_submit_failure_keys);
+    }
+
+    void serialize(std::string& str) {
+        calls.serialize(str);
+        requested_keys.serialize(str);
+        metadata_hit_keys.serialize(str);
+        metadata_miss_keys.serialize(str);
+        query_error_keys.serialize(str);
+        available_memory_keys.serialize(str);
+        available_gds_keys.serialize(str);
+        available_local_keys.serialize(str);
+        selected_memory_keys.serialize(str);
+        selected_gds_keys.serialize(str);
+        selected_local_keys.serialize(str);
+        skipped_gds_due_memory_keys.serialize(str);
+        skipped_gds_due_local_keys.serialize(str);
+        gds_submit_attempt_keys.serialize(str);
+        gds_submit_failure_keys.serialize(str);
+    }
+
+    std::string summary_metrics() {
+        std::stringstream ss;
+        ss << "=== BatchGet Lookup Metrics Summary ===\n"
+           << "calls=" << calls.value()
+           << ", requested_keys=" << requested_keys.value()
+           << ", metadata_hit_keys=" << metadata_hit_keys.value()
+           << ", metadata_miss_keys=" << metadata_miss_keys.value()
+           << ", query_error_keys=" << query_error_keys.value() << "\n"
+           << "available(memory/gds/local)="
+           << available_memory_keys.value() << "/"
+           << available_gds_keys.value() << "/"
+           << available_local_keys.value()
+           << ", selected(memory/gds/local)="
+           << selected_memory_keys.value() << "/"
+           << selected_gds_keys.value() << "/"
+           << selected_local_keys.value() << "\n"
+           << "gds_submit_attempt_keys="
+           << gds_submit_attempt_keys.value()
+           << ", gds_submit_failure_keys="
+           << gds_submit_failure_keys.value();
+        return ss.str();
+    }
+};
+
 struct ClientMetric {
     TransferMetric transfer_metric;
     MasterClientMetric master_client_metric;
     TransferOperationMetric transfer_operation_metric;
     SsdMetric ssd_metric;
     GdsTransferMetric gds_transfer_metric;
+    BatchGetLookupMetric batch_get_lookup_metric;
 
     /**
      * @brief Creates a ClientMetric instance based on environment variables
@@ -734,6 +877,11 @@ struct ClientMetric {
                                   const std::string& op_name, uint64_t bytes,
                                   uint64_t latency_us) {
         transfer_operation_metric.Observe(kind, op_name, bytes, latency_us);
+    }
+
+    void ObserveBatchGetLookup(
+        const BatchGetLookupObservation& observation) {
+        batch_get_lookup_metric.Observe(observation);
     }
 
     void serialize(std::string& str);

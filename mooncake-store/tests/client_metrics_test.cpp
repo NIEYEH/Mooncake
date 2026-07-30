@@ -162,6 +162,44 @@ TEST_F(ClientMetricsTest, GdsTransferMetricsUseBoundedLabels) {
     EXPECT_EQ(serialized.find("segment_uri"), std::string::npos);
 }
 
+TEST_F(ClientMetricsTest, BatchGetLookupMetricsAreLosslessAndBounded) {
+    ClientMetric metrics;
+    BatchGetLookupObservation observation{
+        .calls = 1,
+        .requested_keys = 4,
+        .metadata_hit_keys = 3,
+        .metadata_miss_keys = 1,
+        .available_memory_keys = 2,
+        .available_gds_keys = 2,
+        .selected_memory_keys = 1,
+        .selected_gds_keys = 1,
+        .selected_local_keys = 1,
+        .skipped_gds_due_memory_keys = 1,
+        .gds_submit_attempt_keys = 1,
+    };
+    metrics.ObserveBatchGetLookup(observation);
+
+    EXPECT_EQ(metrics.batch_get_lookup_metric.calls.value(), 1);
+    EXPECT_EQ(metrics.batch_get_lookup_metric.requested_keys.value(), 4);
+    EXPECT_EQ(metrics.batch_get_lookup_metric.available_gds_keys.value(), 2);
+    EXPECT_EQ(metrics.batch_get_lookup_metric.selected_gds_keys.value(), 1);
+    EXPECT_EQ(
+        metrics.batch_get_lookup_metric.skipped_gds_due_memory_keys.value(),
+        1);
+
+    std::string serialized;
+    metrics.serialize(serialized);
+    EXPECT_NE(serialized.find("mooncake_batch_get_calls_total"),
+              std::string::npos);
+    EXPECT_NE(serialized.find("mooncake_batch_get_requested_keys_total"),
+              std::string::npos);
+    EXPECT_NE(serialized.find("mooncake_batch_get_selected_gds_keys_total"),
+              std::string::npos);
+    EXPECT_EQ(serialized.find("segment_uri"), std::string::npos);
+    EXPECT_EQ(serialized.find("object_key"), std::string::npos);
+    EXPECT_EQ(serialized.find("route="), std::string::npos);
+}
+
 TEST_F(ClientMetricsTest, ByteFormattingTest) {
     TransferMetric metrics;
 
