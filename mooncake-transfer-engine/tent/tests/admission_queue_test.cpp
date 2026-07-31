@@ -312,14 +312,22 @@ TEST(AdmissionQueueTest, UsesReadSlotsAndOneContendedWriteSlot) {
         admitted_ids);
 
     ASSERT_EQ(status.code(), Status::Code::kOk);
-    const std::vector<QueueOwnerId> expected_first{2, 4, 1};
     auto picked = queue.pickForDispatch(4, 64);
-    EXPECT_EQ(picked, expected_first);
+    ASSERT_EQ(picked.size(), 3u);
+    EXPECT_EQ(std::count(picked.begin(), picked.end(), 2u), 1);
+    EXPECT_EQ(std::count(picked.begin(), picked.end(), 4u), 1);
+    const bool dispatched_first_write =
+        std::count(picked.begin(), picked.end(), 1u) == 1;
+    const bool dispatched_second_write =
+        std::count(picked.begin(), picked.end(), 3u) == 1;
+    EXPECT_NE(dispatched_first_write, dispatched_second_write);
     for (const auto owner_id : picked) {
         ASSERT_TRUE(queue.complete(owner_id, COMPLETED).ok());
     }
-    const std::vector<QueueOwnerId> expected_second{3};
-    EXPECT_EQ(queue.pickForDispatch(4, 64), expected_second);
+    const auto second = queue.pickForDispatch(4, 64);
+    ASSERT_EQ(second.size(), 1u);
+    EXPECT_TRUE(second.front() == 1u || second.front() == 3u);
+    EXPECT_NE(second.front() == 1u, dispatched_first_write);
 }
 
 TEST(AdmissionQueueTest, FixedModeReservesOneWriteTokenUnderContention) {
@@ -339,7 +347,54 @@ TEST(AdmissionQueueTest, FixedModeReservesOneWriteTokenUnderContention) {
     const auto picked = queue.pickForDispatch(owner_count, 1024);
     ASSERT_EQ(picked.size(), 16u);
     EXPECT_EQ(std::count(picked.begin(), picked.end(), 1u), 1);
-    EXPECT_EQ(picked.back(), 1u);
+}
+
+TEST(AdmissionQueueTest, RestoresContendedWriteFloorBeforeRefillingRead) {
+    LocalTransferAdmissionQueue queue({64, 4096, 0, 0});
+    std::vector<QueueOwnerInput> owners;
+    owners.push_back(makeGdsOwner(0, 16, Request::WRITE));
+    owners.push_back(makeGdsOwner(1, 16, Request::WRITE));
+    for (size_t task_id = 2; task_id < 20; ++task_id) {
+        owners.push_back(makeGdsOwner(task_id, 16, Request::READ));
+    }
+
+    std::vector<QueueOwnerId> admitted_ids;
+    const size_t owner_count = owners.size();
+    ASSERT_TRUE(
+        queue.tryAdmit(
+                 makeSubmit(1, owner_count, std::move(owners)),
+                 admitted_ids)
+            .ok());
+    const QueueOwnerId write0 = admitted_ids[0];
+    const QueueOwnerId write1 = admitted_ids[1];
+    const auto is_write = [&](QueueOwnerId owner_id) {
+        return owner_id == write0 || owner_id == write1;
+    };
+
+    const auto initial = queue.pickForDispatch(16, 4096, 16, 1);
+    ASSERT_EQ(initial.size(), 16u);
+    ASSERT_EQ(std::count_if(initial.begin(), initial.end(), is_write), 1);
+    const auto selected_write =
+        std::find_if(initial.begin(), initial.end(), is_write);
+    const auto selected_read = std::find_if(
+        initial.begin(), initial.end(),
+        [&](QueueOwnerId owner_id) { return !is_write(owner_id); });
+    ASSERT_NE(selected_write, initial.end());
+    ASSERT_NE(selected_read, initial.end());
+    ASSERT_TRUE(queue.complete(*selected_read, COMPLETED).ok());
+    ASSERT_TRUE(queue.complete(*selected_write, COMPLETED).ok());
+
+    const auto before_refill = queue.gdsSchedulerSnapshot();
+    ASSERT_EQ(before_refill.reserved_tokens[0], 14u);
+    ASSERT_EQ(before_refill.reserved_tokens[1], 0u);
+
+    const auto write_refill = queue.pickForDispatch(1, 4096, 1, 1);
+    ASSERT_EQ(write_refill.size(), 1u);
+    EXPECT_TRUE(is_write(write_refill.front()));
+
+    const auto read_refill = queue.pickForDispatch(1, 4096, 1, 1);
+    ASSERT_EQ(read_refill.size(), 1u);
+    EXPECT_FALSE(is_write(read_refill.front()));
 }
 
 TEST(AdmissionQueueTest, OutstandingReservationsBoundSharedWindow) {
@@ -379,6 +434,28 @@ TEST(AdmissionQueueTest, GdsReadPriorityDoesNotBypassEarlierNonGdsOwner) {
     EXPECT_EQ(queue.pickForDispatch(3, 48), expected_ids);
 }
 
+TEST(AdmissionQueueTest, ReportsWriteFloorMissBehindSequenceBarrier) {
+    LocalTransferAdmissionQueue queue({3, 128, 0, 0});
+    std::vector<QueueOwnerId> admitted_ids;
+    auto status = queue.tryAdmit(
+        makeSubmit(1, 3,
+                   {makeGdsOwner(0, 16, Request::READ),
+                    makeOwner(1, 16),
+                    makeGdsOwner(2, 16, Request::WRITE)}),
+        admitted_ids);
+    ASSERT_EQ(status.code(), Status::Code::kOk);
+
+    const auto picked = queue.pickForDispatch(1, 48, 1, 1);
+    ASSERT_EQ(picked.size(), 1u);
+    EXPECT_EQ(picked.front(), 1u);
+    const auto snapshot = queue.gdsSchedulerSnapshot();
+    EXPECT_EQ(snapshot.fixed_write_floor_needed, 1u);
+    EXPECT_EQ(snapshot.fixed_write_floor_dispatched, 0u);
+    EXPECT_EQ(snapshot.fixed_write_floor_blocked, 1u);
+    EXPECT_EQ(snapshot.gds_write_floor_missed, 1u);
+    EXPECT_EQ(snapshot.last_select_max_enqueue_sequence, 1u);
+}
+
 TEST(AdmissionQueueTest, EnforcesIndependentGdsDirectionBudgets) {
     LocalTransferAdmissionQueue queue({8, 256, 0, 0});
     std::vector<QueueOwnerId> admitted_ids;
@@ -393,8 +470,18 @@ TEST(AdmissionQueueTest, EnforcesIndependentGdsDirectionBudgets) {
         admitted_ids);
     ASSERT_EQ(status.code(), Status::Code::kOk);
 
-    const std::vector<QueueOwnerId> expected_ids{1, 2, 4};
-    EXPECT_EQ(queue.pickForDispatch(6, 256, 2, 1), expected_ids);
+    const auto picked = queue.pickForDispatch(6, 256, 2, 1);
+    ASSERT_EQ(picked.size(), 3u);
+    EXPECT_EQ(std::count_if(picked.begin(), picked.end(),
+                            [](QueueOwnerId owner_id) {
+                                return owner_id >= 1 && owner_id <= 3;
+                            }),
+              2);
+    EXPECT_EQ(std::count_if(picked.begin(), picked.end(),
+                            [](QueueOwnerId owner_id) {
+                                return owner_id >= 4 && owner_id <= 6;
+                            }),
+              1);
 }
 
 TEST(AdmissionQueueTest, RequiresDispatchBeforeTerminalCompletion) {

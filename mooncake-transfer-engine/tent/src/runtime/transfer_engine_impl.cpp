@@ -2422,10 +2422,68 @@ void TransferEngineImpl::maybeLogRuntimeQueueSummary(
         runtimeQueueNearestRankP99(read.total_latency_us);
     const double write_queue_p99_us =
         runtimeQueueNearestRankP99(write.queue_wait_us);
+    const size_t queued_read_owners = saturatingAdd(
+        admission_waiting_gds_reads_,
+        scheduler_snapshot.queued_entries[0]);
+    const size_t queued_write_owners = saturatingAdd(
+        admission_waiting_gds_writes_,
+        scheduler_snapshot.queued_entries[1]);
+    const bool write_starved = gdsWriteStarvedInWindow(
+        queued_write_owners, read.dispatches, write.dispatches,
+        runtime_queue_window_max_write_budget_);
+    if (write_starved) {
+        if (runtime_queue_write_starvation_windows_ <
+            std::numeric_limits<uint64_t>::max()) {
+            ++runtime_queue_write_starvation_windows_;
+        }
+        if (consecutive_runtime_queue_write_starvation_windows_ <
+            std::numeric_limits<size_t>::max()) {
+            ++consecutive_runtime_queue_write_starvation_windows_;
+        }
+    } else {
+        consecutive_runtime_queue_write_starvation_windows_ = 0;
+    }
+    if (write_starved &&
+        (consecutive_runtime_queue_write_starvation_windows_ == 3 ||
+         consecutive_runtime_queue_write_starvation_windows_ % 10 == 0)) {
+        LOG(WARNING)
+            << "GDS fixed scheduler write starvation: "
+            << "consecutive_windows="
+            << consecutive_runtime_queue_write_starvation_windows_
+            << ", total_windows="
+            << runtime_queue_write_starvation_windows_
+            << ", queued_read=" << queued_read_owners
+            << ", queued_write=" << queued_write_owners
+            << ", reserved_read="
+            << scheduler_snapshot.reserved_tokens[0]
+            << ", reserved_write="
+            << scheduler_snapshot.reserved_tokens[1]
+            << ", budget_read="
+            << runtime_queue_window_max_read_budget_
+            << ", budget_write="
+            << runtime_queue_window_max_write_budget_
+            << ", last_select_max_tokens="
+            << scheduler_snapshot.last_select_max_tokens
+            << ", max_entries="
+            << scheduler_snapshot.last_select_max_entries
+            << ", last_select_max_bytes="
+            << scheduler_snapshot.last_select_max_bytes
+            << ", last_select_max_read_tokens="
+            << scheduler_snapshot.last_select_max_read_tokens
+            << ", last_select_max_write_tokens="
+            << scheduler_snapshot.last_select_max_write_tokens
+            << ", sequence_barrier="
+            << scheduler_snapshot.last_select_max_enqueue_sequence
+            << ", fixed_write_floor_needed="
+            << scheduler_snapshot.fixed_write_floor_needed
+            << ", fixed_write_floor_dispatched="
+            << scheduler_snapshot.fixed_write_floor_dispatched
+            << ", fixed_write_floor_blocked="
+            << scheduler_snapshot.fixed_write_floor_blocked
+            << ", gds_write_floor_missed="
+            << scheduler_snapshot.gds_write_floor_missed;
+    }
     if (runtime_queue_config_.gds_write_boost_enabled) {
-        const size_t queued_write_owners = saturatingAdd(
-            admission_waiting_gds_writes_,
-            scheduler_snapshot.queued_entries[1]);
         const bool sustained_write_pressure =
             queued_write_owners >=
                 runtime_queue_config_
@@ -2498,6 +2556,30 @@ void TransferEngineImpl::maybeLogRuntimeQueueSummary(
         << scheduler_snapshot.completed_bytes[0]
         << ", gds_completed_write_bytes="
         << scheduler_snapshot.completed_bytes[1]
+        << ", gds_fixed_write_floor_needed="
+        << scheduler_snapshot.fixed_write_floor_needed
+        << ", gds_fixed_write_floor_dispatched="
+        << scheduler_snapshot.fixed_write_floor_dispatched
+        << ", gds_fixed_write_floor_blocked="
+        << scheduler_snapshot.fixed_write_floor_blocked
+        << ", gds_write_floor_missed="
+        << scheduler_snapshot.gds_write_floor_missed
+        << ", gds_write_starvation_windows="
+        << runtime_queue_write_starvation_windows_
+        << ", gds_window_max_read_budget="
+        << runtime_queue_window_max_read_budget_
+        << ", gds_window_max_write_budget="
+        << runtime_queue_window_max_write_budget_
+        << ", gds_last_select_max_read_tokens="
+        << scheduler_snapshot.last_select_max_read_tokens
+        << ", gds_last_select_max_write_tokens="
+        << scheduler_snapshot.last_select_max_write_tokens
+        << ", gds_last_select_max_entries="
+        << scheduler_snapshot.last_select_max_entries
+        << ", gds_last_select_max_bytes="
+        << scheduler_snapshot.last_select_max_bytes
+        << ", gds_last_select_max_enqueue_sequence="
+        << scheduler_snapshot.last_select_max_enqueue_sequence
         << ", READ{dispatches=" << read.dispatches
         << ", completions=" << read.completions
         << ", failures=" << read.failures
@@ -2532,6 +2614,8 @@ void TransferEngineImpl::maybeLogRuntimeQueueSummary(
         summary.queue_wait_us.clear();
         summary.total_latency_us.clear();
     }
+    runtime_queue_window_max_read_budget_ = 0;
+    runtime_queue_window_max_write_budget_ = 0;
     runtime_queue_summary_started_at_ = now;
 }
 
@@ -2994,6 +3078,10 @@ Status TransferEngineImpl::refillDispatchWindow() {
         write_io_limit > dispatch_inflight_write_ios_
             ? write_io_limit - dispatch_inflight_write_ios_
             : 0;
+    runtime_queue_window_max_read_budget_ =
+        std::max(runtime_queue_window_max_read_budget_, read_budget);
+    runtime_queue_window_max_write_budget_ =
+        std::max(runtime_queue_window_max_write_budget_, write_budget);
     auto picked = runtime_queue_->pickForDispatch(
         owner_budget, byte_budget, read_budget, write_budget);
     auto dispatch_status = dispatchQueuedOwners(picked);

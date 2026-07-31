@@ -171,6 +171,11 @@ bool gdsDispatchSegmentCanAppend(const GdsDispatchSegment& segment,
 void gdsDispatchSegmentAppend(GdsDispatchSegment& segment,
                               size_t request_bytes);
 
+bool gdsWriteStarvedInWindow(size_t queued_write_owners,
+                             size_t read_dispatches,
+                             size_t write_dispatches,
+                             size_t max_write_budget);
+
 struct GdsOperationSchedulerSnapshot {
     std::array<size_t, 2> queued_entries{};
     std::array<size_t, 2> reserved_bytes{};
@@ -179,6 +184,16 @@ struct GdsOperationSchedulerSnapshot {
     std::array<int64_t, 2> spendable_deficit_bytes{};
     size_t global_reserved_bytes{0};
     size_t global_reserved_tokens{0};
+    uint64_t fixed_write_floor_needed{0};
+    uint64_t fixed_write_floor_dispatched{0};
+    uint64_t fixed_write_floor_blocked{0};
+    uint64_t gds_write_floor_missed{0};
+    size_t last_select_max_tokens{0};
+    size_t last_select_max_bytes{0};
+    size_t last_select_max_entries{0};
+    size_t last_select_max_read_tokens{0};
+    size_t last_select_max_write_tokens{0};
+    uint64_t last_select_max_enqueue_sequence{0};
     std::unordered_map<uint64_t, size_t> operation_reserved_bytes;
     std::unordered_map<uint64_t, size_t> operation_reserved_tokens;
 };
@@ -239,6 +254,12 @@ class GdsOperationScheduler {
 
     bool hasQueued(GdsDirection direction) const;
 
+    bool hasDemand(GdsDirection direction) const;
+
+    bool capacityContended() const;
+
+    bool fixedWriteFloorNeeded(const GdsDispatchBudget& budget) const;
+
     bool directionHasCapacity(GdsDirection direction, bool contended) const;
 
     size_t directionTokenLimit(GdsDirection direction,
@@ -287,6 +308,10 @@ class GdsOperationScheduler {
     uint64_t next_reservation_id_{1};
     GdsDirection round_cursor_{GdsDirection::Read};
     bool contention_active_{false};
+    uint64_t fixed_write_floor_needed_{0};
+    uint64_t fixed_write_floor_dispatched_{0};
+    uint64_t fixed_write_floor_blocked_{0};
+    GdsDispatchBudget last_select_budget_{};
 };
 
 }  // namespace mooncake::tent

@@ -161,6 +161,7 @@ class LocalTransferAdmissionQueue {
     size_t outstanding_user_owners_{0};
     size_t outstanding_user_bytes_{0};
     GdsOperationScheduler gds_scheduler_;
+    uint64_t gds_write_floor_missed_{0};
 };
 
 }  // namespace tent

@@ -13,6 +13,7 @@
 
 #include "tent/runtime/admission_queue.h"
 
+#include <algorithm>
 #include <cstdlib>
 #include <iostream>
 #include <vector>
@@ -209,6 +210,80 @@ void testNonGdsOwnerIsDispatchBarrier() {
     EXPECT_EQ(picked[2], admitted[2]);
 }
 
+void testFixedModeSingleSlotRefillSelectsWriteFloor() {
+    auto config = schedulerConfig();
+    config.mode = GdsSchedulerMode::Fixed;
+    LocalTransferAdmissionQueue queue(
+        {32, 128 * kMiB, 0, 0}, config);
+    QueueSubmit submit;
+    submit.batch_token = 97;
+    submit.batch_slots_left = 20;
+    submit.owners.push_back(owner(0, Request::WRITE));
+    submit.owners.push_back(owner(1, Request::WRITE));
+    for (size_t index = 2; index < 20; ++index) {
+        submit.owners.push_back(owner(index, Request::READ));
+    }
+    std::vector<QueueOwnerId> admitted;
+    EXPECT_TRUE(queue.tryAdmit(submit, admitted).ok());
+    const auto is_write = [&](QueueOwnerId owner_id) {
+        return owner_id == admitted[0] || owner_id == admitted[1];
+    };
+
+    const auto initial =
+        queue.pickForDispatch(16, 64 * kMiB, 16, 1);
+    EXPECT_EQ(initial.size(), 16u);
+    const auto selected_write =
+        std::find_if(initial.begin(), initial.end(), is_write);
+    const auto selected_read = std::find_if(
+        initial.begin(), initial.end(),
+        [&](QueueOwnerId owner_id) { return !is_write(owner_id); });
+    EXPECT_TRUE(selected_write != initial.end());
+    EXPECT_TRUE(selected_read != initial.end());
+    EXPECT_TRUE(queue.complete(*selected_read, COMPLETED).ok());
+    EXPECT_TRUE(queue.complete(*selected_write, COMPLETED).ok());
+    const auto before_refill = queue.gdsSchedulerSnapshot();
+    EXPECT_EQ(before_refill.reserved_tokens[0], 14u);
+    EXPECT_EQ(before_refill.reserved_tokens[1], 0u);
+
+    const auto write_refill =
+        queue.pickForDispatch(1, 64 * kMiB, 1, 1);
+    EXPECT_EQ(write_refill.size(), 1u);
+    EXPECT_TRUE(is_write(write_refill.front()));
+    const auto read_refill =
+        queue.pickForDispatch(1, 64 * kMiB, 1, 1);
+    EXPECT_EQ(read_refill.size(), 1u);
+    EXPECT_TRUE(!is_write(read_refill.front()));
+    const auto snapshot = queue.gdsSchedulerSnapshot();
+    EXPECT_EQ(snapshot.fixed_write_floor_needed, 2u);
+    EXPECT_EQ(snapshot.fixed_write_floor_dispatched, 2u);
+    EXPECT_EQ(snapshot.gds_write_floor_missed, 0u);
+}
+
+void testSequenceBarrierReportsWriteFloorMiss() {
+    auto config = schedulerConfig();
+    config.mode = GdsSchedulerMode::Fixed;
+    LocalTransferAdmissionQueue queue(
+        {4, 64 * kMiB, 0, 0}, config);
+    QueueSubmit submit;
+    submit.batch_token = 98;
+    submit.batch_slots_left = 3;
+    submit.owners.push_back(owner(0, Request::READ));
+    submit.owners.push_back(owner(1, Request::WRITE, TCP));
+    submit.owners.push_back(owner(2, Request::WRITE));
+    std::vector<QueueOwnerId> admitted;
+    EXPECT_TRUE(queue.tryAdmit(submit, admitted).ok());
+
+    const auto picked =
+        queue.pickForDispatch(1, 48 * kMiB, 1, 1);
+    EXPECT_EQ(picked.size(), 1u);
+    EXPECT_EQ(picked.front(), admitted.front());
+    const auto snapshot = queue.gdsSchedulerSnapshot();
+    EXPECT_EQ(snapshot.fixed_write_floor_needed, 1u);
+    EXPECT_EQ(snapshot.fixed_write_floor_dispatched, 0u);
+    EXPECT_EQ(snapshot.fixed_write_floor_blocked, 1u);
+    EXPECT_EQ(snapshot.gds_write_floor_missed, 1u);
+}
+
 }  // namespace
 }  // namespace mooncake::tent
 
@@ -221,6 +296,8 @@ int main() {
     testTerminalOwnerPreservesPartialBytes();
     testMixedDirectionPublicBatchRemainsValid();
     testNonGdsOwnerIsDispatchBarrier();
+    testFixedModeSingleSlotRefillSelectsWriteFloor();
+    testSequenceBarrierReportsWriteFloorMiss();
     std::cout << "admission_queue_operation_test: PASS" << std::endl;
     return 0;
 }

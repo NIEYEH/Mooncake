@@ -312,6 +312,20 @@ std::vector<QueueOwnerId> LocalTransferAdmissionQueue::pickForDispatch(
             {absolute_tokens, absolute_bytes, max_owners - used_owners,
              absolute_read_tokens, absolute_write_tokens,
              sequence_barrier});
+        const auto scheduler_after_select = gds_scheduler_.snapshot();
+        const bool write_floor_opportunity =
+            scheduler_after_select.fixed_write_floor_needed >
+            scheduler_snapshot.fixed_write_floor_needed;
+        const bool selected_write = std::any_of(
+            reservations.begin(), reservations.end(),
+            [](const GdsDispatchReservation& reservation) {
+                return reservation.direction == GdsDirection::Write;
+            });
+        if (write_floor_opportunity && !selected_write &&
+            gds_write_floor_missed_ <
+                std::numeric_limits<uint64_t>::max()) {
+            ++gds_write_floor_missed_;
+        }
         if (!reservations.empty()) {
             for (const auto& reservation : reservations) {
                 auto owner_it = owners_.find(reservation.owner_id);
@@ -562,7 +576,9 @@ QueueCapacity LocalTransferAdmissionQueue::availableCapacity(
 
 GdsOperationSchedulerSnapshot
 LocalTransferAdmissionQueue::gdsSchedulerSnapshot() const {
-    return gds_scheduler_.snapshot();
+    auto snapshot = gds_scheduler_.snapshot();
+    snapshot.gds_write_floor_missed = gds_write_floor_missed_;
+    return snapshot;
 }
 
 Status LocalTransferAdmissionQueue::setGdsContendedWriteTokens(

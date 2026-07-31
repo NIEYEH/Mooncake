@@ -424,6 +424,10 @@ class TransferEngineImpl {
     GdsWriteBoostController gds_write_boost_controller_;
     std::chrono::steady_clock::time_point
         runtime_queue_summary_started_at_{};
+    size_t runtime_queue_window_max_read_budget_{0};
+    size_t runtime_queue_window_max_write_budget_{0};
+    uint64_t runtime_queue_write_starvation_windows_{0};
+    size_t consecutive_runtime_queue_write_starvation_windows_{0};
 
     // Guards alive_batches_ and serializes pollTaskStatus /
     // updateTaskStatusAfterPoll / lazyFreeBatch against the optional

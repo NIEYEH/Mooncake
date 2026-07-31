@@ -53,6 +53,14 @@ void gdsDispatchSegmentAppend(GdsDispatchSegment& segment,
     segment.bytes += request_bytes;
 }
 
+bool gdsWriteStarvedInWindow(size_t queued_write_owners,
+                             size_t read_dispatches,
+                             size_t write_dispatches,
+                             size_t max_write_budget) {
+    return queued_write_owners != 0 && read_dispatches != 0 &&
+           write_dispatches == 0 && max_write_budget != 0;
+}
+
 GdsOperationScheduler::GdsOperationScheduler(
     GdsOperationSchedulerConfig config)
     : config_(config),
@@ -182,6 +190,28 @@ bool GdsOperationScheduler::hasQueued(GdsDirection direction) const {
                        });
 }
 
+bool GdsOperationScheduler::hasDemand(GdsDirection direction) const {
+    return hasQueued(direction) ||
+           directions_[index(direction)].outstanding_reserved_tokens != 0;
+}
+
+bool GdsOperationScheduler::capacityContended() const {
+    return hasDemand(GdsDirection::Read) &&
+           hasDemand(GdsDirection::Write);
+}
+
+bool GdsOperationScheduler::fixedWriteFloorNeeded(
+    const GdsDispatchBudget& budget) const {
+    if (config_.mode != GdsSchedulerMode::Fixed ||
+        !hasQueued(GdsDirection::Write) || !capacityContended()) {
+        return false;
+    }
+    const size_t effective_write_floor =
+        std::min(contended_write_tokens_, budget.max_write_tokens);
+    return directions_[index(GdsDirection::Write)]
+               .outstanding_reserved_tokens < effective_write_floor;
+}
+
 size_t GdsOperationScheduler::directionTokenLimit(
     GdsDirection direction, bool contended) const {
     if (direction == GdsDirection::Read) {
@@ -241,15 +271,7 @@ uint64_t GdsOperationScheduler::primaryReadOperation() {
 bool GdsOperationScheduler::canReserve(
     const GdsDispatchEntry& entry,
     const GdsDispatchBudget& budget) {
-    const bool read_demand =
-        hasQueued(GdsDirection::Read) ||
-        directions_[index(GdsDirection::Read)]
-                .outstanding_reserved_tokens != 0;
-    const bool write_demand =
-        hasQueued(GdsDirection::Write) ||
-        directions_[index(GdsDirection::Write)]
-                .outstanding_reserved_tokens != 0;
-    const bool contended = read_demand && write_demand;
+    const bool contended = capacityContended();
     const size_t token_charge =
         reservationTokenCharge(entry, contended);
     size_t next_global_tokens = 0;
@@ -519,6 +541,7 @@ GdsDispatchReservation GdsOperationScheduler::reserve(
 std::vector<GdsDispatchReservation> GdsOperationScheduler::select(
     const GdsDispatchBudget& budget) {
     std::vector<GdsDispatchReservation> selected;
+    last_select_budget_ = budget;
     if (!config_status_.ok() || budget.max_tokens == 0 ||
         budget.max_bytes == 0 || budget.max_entries == 0) {
         return selected;
@@ -529,28 +552,41 @@ std::vector<GdsDispatchReservation> GdsOperationScheduler::select(
         const bool read_backlog = hasQueued(GdsDirection::Read);
         const bool write_backlog = hasQueued(GdsDirection::Write);
         if (!read_backlog && !write_backlog) break;
-        const bool contended =
+        const bool capacity_contended = capacityContended();
+        const bool weighted_contended =
             config_.mode == GdsSchedulerMode::WeightedFair &&
             read_backlog && write_backlog;
-        enterOrLeaveContention(contended);
+        const bool write_floor_needed =
+            fixedWriteFloorNeeded(budget);
+        if (write_floor_needed) {
+            ++fixed_write_floor_needed_;
+        }
+        enterOrLeaveContention(weighted_contended);
 
         GdsDirection direction = GdsDirection::Read;
-        if (contended) {
+        if (weighted_contended) {
             advanceRoundIfDone(read_backlog, write_backlog);
             grantRoundCredit(read_backlog, write_backlog);
             direction =
                 chooseWeightedDirection(read_backlog, write_backlog);
+        } else if (write_floor_needed) {
+            direction = GdsDirection::Write;
         } else if (!read_backlog) {
             direction = GdsDirection::Write;
         }
 
         auto candidate = findCandidate(direction, budget);
         bool direction_capacity =
-            directionHasCapacity(direction, contended);
+            directionHasCapacity(direction, capacity_contended);
         bool spendable =
             candidate != queued_.end() &&
-            (!contended || canSpendWdrr(*candidate));
-        if (!contended &&
+            (!weighted_contended || canSpendWdrr(*candidate));
+        if (write_floor_needed &&
+            (candidate == queued_.end() || !direction_capacity ||
+             !spendable)) {
+            ++fixed_write_floor_blocked_;
+        }
+        if (!weighted_contended &&
             (candidate == queued_.end() || !direction_capacity) &&
             read_backlog && write_backlog) {
             const auto alternate =
@@ -559,7 +595,7 @@ std::vector<GdsDispatchReservation> GdsOperationScheduler::select(
             auto alternate_candidate =
                 findCandidate(alternate, budget);
             const bool alternate_capacity =
-                directionHasCapacity(alternate, false);
+                directionHasCapacity(alternate, capacity_contended);
             if (alternate_candidate != queued_.end() &&
                 alternate_capacity) {
                 direction = alternate;
@@ -570,7 +606,7 @@ std::vector<GdsDispatchReservation> GdsOperationScheduler::select(
         }
         if (candidate == queued_.end() || !direction_capacity ||
             !spendable) {
-            if (!contended) break;
+            if (!weighted_contended) break;
             directions_[index(direction)].round_exhausted = true;
             round_cursor_ = direction == GdsDirection::Read
                                 ? GdsDirection::Write
@@ -581,24 +617,20 @@ std::vector<GdsDispatchReservation> GdsOperationScheduler::select(
         }
 
         no_progress_rounds = 0;
-        const bool read_demand =
-            read_backlog ||
-            directions_[index(GdsDirection::Read)]
-                    .outstanding_reserved_tokens != 0;
-        const bool write_demand =
-            write_backlog ||
-            directions_[index(GdsDirection::Write)]
-                    .outstanding_reserved_tokens != 0;
         const size_t token_charge = reservationTokenCharge(
-            *candidate, read_demand && write_demand);
+            *candidate, capacity_contended);
         auto reservation =
-            reserve(candidate, contended, token_charge);
+            reserve(candidate, weighted_contended, token_charge);
         selected.push_back(reservation);
+        if (write_floor_needed &&
+            reservation.direction == GdsDirection::Write) {
+            ++fixed_write_floor_dispatched_;
+        }
 
-        if (contended) {
+        if (weighted_contended) {
             const auto next_candidate = findCandidate(direction, budget);
             if (next_candidate == queued_.end() ||
-                !directionHasCapacity(direction, true) ||
+                !directionHasCapacity(direction, capacityContended()) ||
                 !canSpendWdrr(*next_candidate)) {
                 directions_[index(direction)].round_exhausted = true;
                 round_cursor_ = direction == GdsDirection::Read
@@ -777,6 +809,19 @@ GdsOperationSchedulerSnapshot GdsOperationScheduler::snapshot() const {
         result.operation_reserved_tokens.emplace(operation_id,
                                                  operation.reserved_tokens);
     }
+    result.fixed_write_floor_needed = fixed_write_floor_needed_;
+    result.fixed_write_floor_dispatched =
+        fixed_write_floor_dispatched_;
+    result.fixed_write_floor_blocked = fixed_write_floor_blocked_;
+    result.last_select_max_tokens = last_select_budget_.max_tokens;
+    result.last_select_max_bytes = last_select_budget_.max_bytes;
+    result.last_select_max_entries = last_select_budget_.max_entries;
+    result.last_select_max_read_tokens =
+        last_select_budget_.max_read_tokens;
+    result.last_select_max_write_tokens =
+        last_select_budget_.max_write_tokens;
+    result.last_select_max_enqueue_sequence =
+        last_select_budget_.max_enqueue_sequence;
     return result;
 }
 

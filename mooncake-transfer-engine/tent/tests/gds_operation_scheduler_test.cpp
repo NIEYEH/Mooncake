@@ -431,8 +431,14 @@ void testFixedModeUsesWriteSlotWhenReadWindowIsFull() {
     auto selected = scheduler.select(
         {16, 64 * kMiB, 2, 1, 1});
     EXPECT_EQ(selected.size(), 2u);
-    EXPECT_EQ(selected[0].direction, GdsDirection::Read);
-    EXPECT_EQ(selected[1].direction, GdsDirection::Write);
+    size_t reads = 0;
+    size_t writes = 0;
+    for (const auto& reservation : selected) {
+        reads += reservation.direction == GdsDirection::Read ? 1 : 0;
+        writes += reservation.direction == GdsDirection::Write ? 1 : 0;
+    }
+    EXPECT_EQ(reads, 1u);
+    EXPECT_EQ(writes, 1u);
 }
 
 void testFixedModeReservesOneContendedWriteToken() {
@@ -464,6 +470,137 @@ void testFixedModeReservesOneContendedWriteToken() {
     }
     EXPECT_EQ(reads, 15u);
     EXPECT_EQ(writes, 1u);
+}
+
+void testFixedModeSingleSlotRefillSelectsWriteFloor() {
+    auto config = weightedConfig();
+    config.mode = GdsSchedulerMode::Fixed;
+    GdsOperationScheduler scheduler(config);
+    for (uint64_t index = 0; index < 16; ++index) {
+        EXPECT_TRUE(
+            scheduler
+                .enqueue(entry(500 + index, 87, GdsDirection::Read,
+                               2 * kMiB))
+                .ok());
+    }
+    EXPECT_TRUE(
+        scheduler
+            .enqueue(entry(600, 88, GdsDirection::Write, 2 * kMiB))
+            .ok());
+
+    const auto initial =
+        scheduler.select({16, 64 * kMiB, 14, 16, 0});
+    EXPECT_EQ(initial.size(), 14u);
+    for (const auto& reservation : initial) {
+        EXPECT_EQ(reservation.direction, GdsDirection::Read);
+    }
+
+    const auto refill =
+        scheduler.select({16, 64 * kMiB, 1, 16, 1});
+    EXPECT_EQ(refill.size(), 1u);
+    EXPECT_EQ(refill.front().direction, GdsDirection::Write);
+    const auto snapshot = scheduler.snapshot();
+    EXPECT_EQ(snapshot.fixed_write_floor_needed, 1u);
+    EXPECT_EQ(snapshot.fixed_write_floor_dispatched, 1u);
+    EXPECT_EQ(snapshot.fixed_write_floor_blocked, 0u);
+    EXPECT_EQ(snapshot.last_select_max_entries, 1u);
+    EXPECT_EQ(snapshot.last_select_max_write_tokens, 1u);
+}
+
+void testFixedWriteFloorReportsSequenceBarrierBlock() {
+    auto config = weightedConfig();
+    config.mode = GdsSchedulerMode::Fixed;
+    GdsOperationScheduler scheduler(config);
+    auto read = entry(700, 89, GdsDirection::Read, 2 * kMiB);
+    read.enqueue_sequence = 700;
+    auto write = entry(701, 90, GdsDirection::Write, 2 * kMiB);
+    write.enqueue_sequence = 701;
+    EXPECT_TRUE(scheduler.enqueue(read).ok());
+    EXPECT_TRUE(scheduler.enqueue(write).ok());
+
+    const auto selected =
+        scheduler.select({16, 64 * kMiB, 1, 16, 1, 700});
+    EXPECT_EQ(selected.size(), 1u);
+    EXPECT_EQ(selected.front().direction, GdsDirection::Read);
+    const auto snapshot = scheduler.snapshot();
+    EXPECT_EQ(snapshot.fixed_write_floor_needed, 1u);
+    EXPECT_EQ(snapshot.fixed_write_floor_dispatched, 0u);
+    EXPECT_EQ(snapshot.fixed_write_floor_blocked, 1u);
+    EXPECT_EQ(snapshot.last_select_max_enqueue_sequence, 700u);
+}
+
+void testFixedModeKeepsStandaloneDirectionLimits() {
+    auto config = weightedConfig();
+    config.mode = GdsSchedulerMode::Fixed;
+    GdsOperationScheduler read_scheduler(config);
+    for (uint64_t index = 0; index < 20; ++index) {
+        EXPECT_TRUE(
+            read_scheduler
+                .enqueue(entry(800 + index, 101, GdsDirection::Read,
+                               2 * kMiB))
+                .ok());
+    }
+    EXPECT_EQ(
+        read_scheduler.select({20, 64 * kMiB, 20, 20, 20}).size(),
+        config.read_standalone_tokens);
+
+    GdsOperationScheduler write_scheduler(config);
+    for (uint64_t index = 0; index < 4; ++index) {
+        EXPECT_TRUE(
+            write_scheduler
+                .enqueue(entry(900 + index, 102, GdsDirection::Write,
+                               2 * kMiB))
+                .ok());
+    }
+    EXPECT_EQ(
+        write_scheduler.select({20, 64 * kMiB, 20, 20, 20}).size(),
+        config.write_standalone_tokens);
+}
+
+void testFixedModeHonorsZeroWriteBudget() {
+    auto config = weightedConfig();
+    config.mode = GdsSchedulerMode::Fixed;
+    GdsOperationScheduler scheduler(config);
+    for (uint64_t index = 0; index < 20; ++index) {
+        EXPECT_TRUE(
+            scheduler
+                .enqueue(entry(1000 + index, 103, GdsDirection::Read,
+                               2 * kMiB))
+                .ok());
+    }
+    EXPECT_TRUE(
+        scheduler
+            .enqueue(entry(1100, 104, GdsDirection::Write, 2 * kMiB))
+            .ok());
+
+    const auto selected =
+        scheduler.select({16, 64 * kMiB, 16, 16, 0});
+    EXPECT_EQ(selected.size(), 15u);
+    for (const auto& reservation : selected) {
+        EXPECT_EQ(reservation.direction, GdsDirection::Read);
+    }
+    const auto snapshot = scheduler.snapshot();
+    EXPECT_EQ(snapshot.fixed_write_floor_needed, 0u);
+    EXPECT_EQ(snapshot.last_select_max_write_tokens, 0u);
+}
+
+void testWeightedFairDoesNotUseFixedFloorCounters() {
+    GdsOperationScheduler scheduler(weightedConfig());
+    EXPECT_TRUE(
+        scheduler
+            .enqueue(entry(1200, 105, GdsDirection::Read, 2 * kMiB))
+            .ok());
+    EXPECT_TRUE(
+        scheduler
+            .enqueue(entry(1201, 106, GdsDirection::Write, 2 * kMiB))
+            .ok());
+    EXPECT_EQ(
+        scheduler.select({16, 64 * kMiB, 2, 16, 1}).size(),
+        2u);
+    const auto snapshot = scheduler.snapshot();
+    EXPECT_EQ(snapshot.fixed_write_floor_needed, 0u);
+    EXPECT_EQ(snapshot.fixed_write_floor_dispatched, 0u);
+    EXPECT_EQ(snapshot.fixed_write_floor_blocked, 0u);
 }
 
 void testWriteFourConfigSharesTokensWithRead() {
@@ -514,6 +651,14 @@ void testGdsSegmentStopsAtFirstRequestOrByteLimit() {
     }
     EXPECT_TRUE(!gdsDispatchSegmentCanAppend(
         request_limited, 4096, 8, 16 * kMiB));
+}
+
+void testWriteStarvationWindowRequiresDemandProgressAndBudget() {
+    EXPECT_TRUE(gdsWriteStarvedInWindow(1, 5, 0, 1));
+    EXPECT_TRUE(!gdsWriteStarvedInWindow(0, 5, 0, 1));
+    EXPECT_TRUE(!gdsWriteStarvedInWindow(1, 0, 0, 1));
+    EXPECT_TRUE(!gdsWriteStarvedInWindow(1, 5, 1, 1));
+    EXPECT_TRUE(!gdsWriteStarvedInWindow(1, 5, 0, 0));
 }
 
 void testRetiredOperationReleasesReservationHistory() {
@@ -645,8 +790,14 @@ int main() {
     testDrainedOperationCanReceiveNextAdmissionSegment();
     testFixedModeUsesWriteSlotWhenReadWindowIsFull();
     testFixedModeReservesOneContendedWriteToken();
+    testFixedModeSingleSlotRefillSelectsWriteFloor();
+    testFixedWriteFloorReportsSequenceBarrierBlock();
+    testFixedModeKeepsStandaloneDirectionLimits();
+    testFixedModeHonorsZeroWriteBudget();
+    testWeightedFairDoesNotUseFixedFloorCounters();
     testWriteFourConfigSharesTokensWithRead();
     testGdsSegmentStopsAtFirstRequestOrByteLimit();
+    testWriteStarvationWindowRequiresDemandProgressAndBudget();
     testRetiredOperationReleasesReservationHistory();
     testCanceledOperationStopsNewDispatchAndDrainsInflight();
     testTerminalStatusesReleaseReservationsAndAllowNextDispatch();
