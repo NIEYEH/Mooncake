@@ -263,6 +263,20 @@ FinalizeDecision DetermineFinalizeDecision(
                          : summary.first_error};
 }
 
+bool GdsSsdSegmentMetadataMatches(const GdsSsdSegment& existing,
+                                  const GdsSsdSegment& requested) {
+    if (existing.base != requested.base || existing.size != requested.size ||
+        existing.block_size != requested.block_size ||
+        existing.allocation_alignment != requested.allocation_alignment ||
+        existing.metadata_reserved_bytes != requested.metadata_reserved_bytes ||
+        existing.namespace_id != requested.namespace_id) {
+        LOG(ERROR) << "GDS SSD segment metadata mismatch: name="
+                   << requested.name;
+        return false;
+    }
+    return true;
+}
+
 }  // namespace
 
 [[nodiscard]] size_t CalculateSliceSize(const std::vector<Slice>& slices) {
@@ -1136,6 +1150,102 @@ tl::expected<std::vector<std::string>, ErrorCode> Client::BatchReplicaClear(
     auto result =
         master_client_.BatchReplicaClear(object_keys, client_id, segment_name);
     return result;
+}
+
+tl::expected<void, ErrorCode> Client::RegisterGdsSsdSegment(
+    const GdsSsdSegment& segment) {
+    if (segment.name.empty() || segment.size == 0 || segment.block_size == 0 ||
+        segment.allocation_alignment == 0 || segment.namespace_id.empty() ||
+        segment.accessors.size() != 1) {
+        LOG(ERROR) << "Invalid GDS SSD segment registration request";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    const auto& accessor = segment.accessors.front();
+    if (accessor.client_host.empty() || accessor.segment_uri.empty() ||
+        accessor.namespace_id.empty() || accessor.size == 0 ||
+        accessor.block_size != segment.block_size ||
+        accessor.allocation_alignment != segment.allocation_alignment ||
+        accessor.namespace_id != segment.namespace_id) {
+        LOG(ERROR) << "Invalid GDS SSD accessor registration request";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    auto segments_result = master_client_.GetAllGdsSsdSegments();
+    if (!segments_result) {
+        LOG(ERROR) << "Failed to query GDS SSD segments: "
+                   << toString(segments_result.error());
+        return tl::unexpected(segments_result.error());
+    }
+
+    for (const auto& existing : segments_result.value()) {
+        if (existing.name != segment.name) {
+            continue;
+        }
+        if (!GdsSsdSegmentMetadataMatches(existing, segment)) {
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        auto result = master_client_.RegisterGdsSsdAccessor(
+            existing.id, accessor);
+        if (!result) {
+            LOG(ERROR) << "Failed to register GDS SSD accessor: "
+                       << toString(result.error());
+        }
+        return result;
+    }
+
+    auto result = master_client_.MountGdsSsdSegment(segment);
+    if (!result) {
+        LOG(ERROR) << "Failed to mount GDS SSD segment: "
+                   << toString(result.error());
+    }
+    return result;
+}
+
+tl::expected<void, ErrorCode> Client::UnregisterGdsSsdSegment(
+    const std::string& segment_name, const std::string& client_host) {
+    if (segment_name.empty() || client_host.empty()) {
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    auto segments_result = master_client_.GetAllGdsSsdSegments();
+    if (!segments_result) {
+        LOG(ERROR) << "Failed to query GDS SSD segments: "
+                   << toString(segments_result.error());
+        return tl::unexpected(segments_result.error());
+    }
+
+    for (const auto& segment : segments_result.value()) {
+        if (segment.name != segment_name) {
+            continue;
+        }
+        for (const auto& accessor : segment.accessors) {
+            if (accessor.client_host != client_host) {
+                continue;
+            }
+            if (!accessor.alive) {
+                return {};
+            }
+            auto result = master_client_.UnregisterGdsSsdAccessor(
+                segment.id, client_host);
+            if (!result) {
+                LOG(ERROR) << "Failed to unregister GDS SSD accessor: "
+                           << toString(result.error());
+            }
+            return result;
+        }
+        LOG(WARNING) << "GDS SSD accessor not found for segment="
+                     << segment_name << ", client_host=" << client_host;
+        return {};
+    }
+
+    LOG(WARNING) << "GDS SSD segment not found: " << segment_name;
+    return {};
+}
+
+tl::expected<std::vector<GdsSsdSegment>, ErrorCode>
+Client::GetAllGdsSsdSegments() {
+    return master_client_.GetAllGdsSsdSegments();
 }
 
 tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
@@ -2089,10 +2199,6 @@ void Client::SubmitTransfers(std::vector<PutOperation>& ops) {
         return;
     }
 
-    std::vector<Replica::Descriptor> gds_replicas;
-    std::vector<std::vector<Slice>> gds_slices;
-    std::vector<size_t> gds_op_indices;
-
     for (size_t op_index = 0; op_index < ops.size(); ++op_index) {
         auto& op = ops[op_index];
         // Skip operations that already failed in previous stages
@@ -2125,16 +2231,13 @@ void Client::SubmitTransfers(std::vector<PutOperation>& ops) {
         for (size_t replica_idx = 0; replica_idx < op.replicas.size();
              ++replica_idx) {
             const auto& replica = op.replicas[replica_idx];
-            if (replica.is_gds_ssd_replica()) {
-                gds_replicas.emplace_back(replica);
-                gds_slices.emplace_back(op.slices);
-                gds_op_indices.emplace_back(op_index);
-                continue;
-            }
-            if (replica.is_memory_replica() || replica.is_nof_replica()) {
-                const auto replica_type = replica.is_memory_replica()
-                                              ? ReplicaType::MEMORY
-                                              : ReplicaType::NOF_SSD;
+            if (replica.is_memory_replica() || replica.is_nof_replica() ||
+                replica.is_gds_ssd_replica()) {
+                const auto replica_type =
+                    replica.is_memory_replica()
+                        ? ReplicaType::MEMORY
+                        : (replica.is_nof_replica() ? ReplicaType::NOF_SSD
+                                                    : ReplicaType::GDS_SSD);
                 std::optional<TransferFuture> submit_result;
                 if (replica.is_nof_replica()) {
                     auto contiguous_range = GetContiguousSliceRange(op.slices);
@@ -2175,26 +2278,6 @@ void Client::SubmitTransfers(std::vector<PutOperation>& ops) {
                 << " transfers for key " << op.key;
     }
 
-    if (gds_replicas.empty()) return;
-
-    auto gds_future = transfer_submitter_->submitGdsSsdBatch(
-        gds_replicas, gds_slices, TransferRequest::WRITE);
-    ErrorCode gds_result = ErrorCode::TRANSFER_FAIL;
-    if (gds_future.has_value()) {
-        gds_result = gds_future->get();
-    }
-
-    for (size_t i = 0; i < gds_op_indices.size(); ++i) {
-        auto& op = ops[gds_op_indices[i]];
-        if (gds_result == ErrorCode::OK) {
-            op.transfer_summary.RecordSuccess(ReplicaType::GDS_SSD);
-        } else {
-            op.transfer_summary.RecordFailure(ReplicaType::GDS_SSD,
-                                              gds_result);
-            op.AppendFailureContext("Batched GDS transfer failed for replica " +
-                                    std::to_string(i));
-        }
-    }
 }
 
 void Client::WaitForTransfers(std::vector<PutOperation>& ops) {

@@ -3693,6 +3693,74 @@ RealClient::build_ranged_read_metadata_from_query_result(
 
 std::string RealClient::get_hostname() const { return local_hostname; }
 
+int RealClient::register_gds_ssd_segment(
+    const std::string &segment_name, const std::string &client_host,
+    const std::string &segment_uri, const std::string &namespace_id,
+    uint64_t base, uint64_t size, uint64_t device_size, uint64_t block_size,
+    uint64_t allocation_alignment, uint64_t metadata_reserved_bytes,
+    const std::vector<int32_t> &gpu_device_ids, int32_t numa_node) {
+    if (!client_) {
+        LOG(ERROR) << "GDS SSD register client is not initialized";
+        return to_py_ret(ErrorCode::INVALID_PARAMS);
+    }
+    if (segment_name.empty() || client_host.empty() || segment_uri.empty() ||
+        namespace_id.empty() || size == 0 || block_size == 0 ||
+        allocation_alignment == 0) {
+        LOG(ERROR) << "Invalid GDS SSD registration parameters";
+        return to_py_ret(ErrorCode::INVALID_PARAMS);
+    }
+    if (device_size == 0) {
+        device_size = size;
+    }
+
+    GdsSsdAccessor accessor;
+    accessor.client_host = client_host;
+    accessor.segment_uri = segment_uri;
+    accessor.namespace_id = namespace_id;
+    accessor.size = device_size;
+    accessor.block_size = block_size;
+    accessor.allocation_alignment = allocation_alignment;
+    accessor.gpu_device_ids = gpu_device_ids;
+    accessor.numa_node = numa_node;
+    accessor.alive = true;
+
+    GdsSsdSegment segment;
+    segment.id = generate_uuid();
+    segment.name = segment_name;
+    segment.base = base;
+    segment.size = size;
+    segment.block_size = block_size;
+    segment.allocation_alignment = allocation_alignment;
+    segment.metadata_reserved_bytes = metadata_reserved_bytes;
+    segment.namespace_id = namespace_id;
+    segment.accessors.push_back(std::move(accessor));
+
+    return to_py_ret(client_->RegisterGdsSsdSegment(segment));
+}
+
+int RealClient::unregister_gds_ssd_segment(
+    const std::string &segment_name, const std::string &client_host) {
+    if (!client_) {
+        LOG(ERROR) << "GDS SSD unregister client is not initialized";
+        return to_py_ret(ErrorCode::INVALID_PARAMS);
+    }
+    if (segment_name.empty() || client_host.empty()) {
+        LOG(ERROR) << "Invalid GDS SSD unregister parameters";
+        return to_py_ret(ErrorCode::INVALID_PARAMS);
+    }
+    return to_py_ret(client_->UnregisterGdsSsdSegment(segment_name,
+                                                       client_host));
+}
+
+tl::expected<std::vector<GdsSsdSegment>, ErrorCode>
+RealClient::list_gds_ssd_segments() {
+    if (!client_) {
+        LOG(ERROR) << "GDS SSD register client is not initialized";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    return client_->GetAllGdsSsdSegments();
+}
+
 std::vector<int> RealClient::batch_put_from(
     const std::vector<std::string> &keys, const std::vector<void *> &buffers,
     const std::vector<size_t> &sizes, const ReplicateConfig &config) {

@@ -165,6 +165,25 @@ class Client {
         const std::string& segment_name);
 
     /**
+     * @brief Register a GDS SSD segment/accessor through the master client.
+     *        If a segment with the same name exists, its immutable metadata is
+     *        validated and only the accessor is registered.
+     */
+    tl::expected<void, ErrorCode> RegisterGdsSsdSegment(
+        const GdsSsdSegment& segment);
+
+    /**
+     * @brief Mark a GDS SSD accessor for client_host as unregistered.
+     *        Missing segment/accessor is treated as an idempotent success.
+     */
+    tl::expected<void, ErrorCode> UnregisterGdsSsdSegment(
+        const std::string& segment_name, const std::string& client_host);
+
+    /** @brief Query all GDS SSD segments through MasterClient. */
+    tl::expected<std::vector<GdsSsdSegment>, ErrorCode>
+    GetAllGdsSsdSegments();
+
+    /**
      * @brief Transfers data using pre-queried object information
      * @param object_key Key of the object
      * @param query_result Previously queried object metadata containing

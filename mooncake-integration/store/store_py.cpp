@@ -1896,228 +1896,48 @@ class MooncakeDistributedNoFRegisterPyWrapper {
 
 class MooncakeGdsSsdRegisterPyWrapper {
    public:
+    std::shared_ptr<RealClient> register_{nullptr};
+
     MooncakeGdsSsdRegisterPyWrapper() = default;
-
-    int real_register(const std::string &master_server_addr,
-                      const std::string &segment_name,
-                      const std::string &client_host,
-                      const std::string &segment_uri,
-                      const std::string &namespace_id, uint64_t base,
-                      uint64_t size, uint64_t device_size,
-                      uint64_t block_size, uint64_t allocation_alignment,
-                      uint64_t metadata_reserved_bytes,
-                      const std::vector<int32_t> &gpu_device_ids,
-                      int32_t numa_node) {
-        if (master_server_addr.empty() || segment_name.empty() ||
-            client_host.empty() || segment_uri.empty() ||
-            namespace_id.empty() || size == 0 || block_size == 0 ||
-            allocation_alignment == 0) {
-            LOG(ERROR) << "Invalid GDS SSD registration parameters";
-            return OPERATION_FAILED;
-        }
-        if (device_size == 0) {
-            device_size = size;
-        }
-
-        GdsSsdAccessor accessor;
-        accessor.client_host = client_host;
-        accessor.segment_uri = segment_uri;
-        accessor.namespace_id = namespace_id;
-        accessor.size = device_size;
-        accessor.block_size = block_size;
-        accessor.allocation_alignment = allocation_alignment;
-        accessor.gpu_device_ids = gpu_device_ids;
-        accessor.numa_node = numa_node;
-        accessor.alive = true;
-
-        MasterClient master_client(generate_uuid(), nullptr);
-        auto err = master_client.Connect(master_server_addr);
-        if (err != ErrorCode::OK) {
-            LOG(ERROR) << "Failed to connect to master: "
-                       << static_cast<int>(err);
-            return OPERATION_FAILED;
-        }
-
-        auto segments_result = master_client.GetAllGdsSsdSegments();
-        if (!segments_result) {
-            LOG(ERROR) << "Failed to query GDS SSD segments: "
-                       << static_cast<int>(segments_result.error());
-            return OPERATION_FAILED;
-        }
-
-        const GdsSsdSegment *existing_segment = nullptr;
-        for (const auto &segment : segments_result.value()) {
-            if (segment.name == segment_name) {
-                existing_segment = &segment;
-                break;
-            }
-        }
-
-        if (existing_segment != nullptr) {
-            if (!SegmentMatches(*existing_segment, base, size, block_size,
-                                allocation_alignment,
-                                metadata_reserved_bytes, namespace_id)) {
-                return OPERATION_FAILED;
-            }
-            auto register_result = master_client.RegisterGdsSsdAccessor(
-                existing_segment->id, accessor);
-            if (!register_result) {
-                LOG(ERROR) << "Failed to register GDS SSD accessor: "
-                           << static_cast<int>(register_result.error());
-                return OPERATION_FAILED;
-            }
-            return OPERATION_OK;
-        }
-
-        GdsSsdSegment segment;
-        segment.id = generate_uuid();
-        segment.name = segment_name;
-        segment.base = base;
-        segment.size = size;
-        segment.block_size = block_size;
-        segment.allocation_alignment = allocation_alignment;
-        segment.metadata_reserved_bytes = metadata_reserved_bytes;
-        segment.namespace_id = namespace_id;
-        segment.accessors.push_back(accessor);
-
-        auto mount_result = master_client.MountGdsSsdSegment(segment);
-        if (!mount_result) {
-            LOG(ERROR) << "Failed to mount GDS SSD segment: "
-                       << static_cast<int>(mount_result.error());
-            return OPERATION_FAILED;
-        }
-        return OPERATION_OK;
-    }
-
-    int real_unregister(const std::string &master_server_addr,
-                        const std::string &segment_name,
-                        const std::string &client_host) {
-        if (master_server_addr.empty() || segment_name.empty() ||
-            client_host.empty()) {
-            LOG(ERROR) << "Invalid GDS SSD unregister parameters";
-            return OPERATION_FAILED;
-        }
-
-        MasterClient master_client(generate_uuid(), nullptr);
-        auto err = master_client.Connect(master_server_addr);
-        if (err != ErrorCode::OK) {
-            LOG(ERROR) << "Failed to connect to master: "
-                       << static_cast<int>(err);
-            return OPERATION_FAILED;
-        }
-
-        auto segments_result = master_client.GetAllGdsSsdSegments();
-        if (!segments_result) {
-            LOG(ERROR) << "Failed to query GDS SSD segments: "
-                       << static_cast<int>(segments_result.error());
-            return OPERATION_FAILED;
-        }
-
-        for (const auto &segment : segments_result.value()) {
-            if (segment.name != segment_name) {
-                continue;
-            }
-            for (const auto &accessor : segment.accessors) {
-                if (accessor.client_host != client_host) {
-                    continue;
-                }
-                if (!accessor.alive) {
-                    return OPERATION_OK;
-                }
-                auto unregister_result =
-                    master_client.UnregisterGdsSsdAccessor(segment.id,
-                                                           client_host);
-                if (!unregister_result) {
-                    LOG(ERROR) << "Failed to unregister GDS SSD accessor: "
-                               << static_cast<int>(
-                                      unregister_result.error());
-                    return OPERATION_FAILED;
-                }
-                return OPERATION_OK;
-            }
-            LOG(WARNING) << "GDS SSD accessor not found for segment="
-                         << segment_name << ", client_host=" << client_host;
-            return OPERATION_OK;
-        }
-
-        LOG(WARNING) << "GDS SSD segment not found: " << segment_name;
-        return OPERATION_OK;
-    }
-
-    py::list list_segments(const std::string &master_server_addr) {
-        MasterClient master_client(generate_uuid(), nullptr);
-        auto err = master_client.Connect(master_server_addr);
-        if (err != ErrorCode::OK) {
-            throw std::runtime_error("failed to connect to master");
-        }
-        auto segments_result = master_client.GetAllGdsSsdSegments();
-        if (!segments_result) {
-            throw std::runtime_error("failed to query GDS SSD segments");
-        }
-
-        py::list result;
-        for (const auto &segment : segments_result.value()) {
-            result.append(SegmentToDict(segment));
-        }
-        return result;
-    }
-
-   private:
-    static bool SegmentMatches(const GdsSsdSegment &segment, uint64_t base,
-                               uint64_t size, uint64_t block_size,
-                               uint64_t allocation_alignment,
-                               uint64_t metadata_reserved_bytes,
-                               const std::string &namespace_id) {
-        if (segment.base != base || segment.size != size ||
-            segment.block_size != block_size ||
-            segment.allocation_alignment != allocation_alignment ||
-            segment.metadata_reserved_bytes != metadata_reserved_bytes ||
-            segment.namespace_id != namespace_id) {
-            LOG(ERROR) << "GDS SSD segment metadata mismatch: name="
-                       << segment.name;
-            return false;
-        }
-        return true;
-    }
-
-    static std::string UuidToString(const UUID &uuid) {
-        std::ostringstream oss;
-        oss << uuid;
-        return oss.str();
-    }
-
-    static py::dict AccessorToDict(const GdsSsdAccessor &accessor) {
-        py::dict dict;
-        dict["client_host"] = accessor.client_host;
-        dict["segment_uri"] = accessor.segment_uri;
-        dict["namespace_id"] = accessor.namespace_id;
-        dict["size"] = accessor.size;
-        dict["block_size"] = accessor.block_size;
-        dict["allocation_alignment"] = accessor.allocation_alignment;
-        dict["gpu_device_ids"] = accessor.gpu_device_ids;
-        dict["numa_node"] = accessor.numa_node;
-        dict["alive"] = accessor.alive;
-        return dict;
-    }
-
-    static py::dict SegmentToDict(const GdsSsdSegment &segment) {
-        py::dict dict;
-        dict["id"] = UuidToString(segment.id);
-        dict["name"] = segment.name;
-        dict["base"] = segment.base;
-        dict["size"] = segment.size;
-        dict["block_size"] = segment.block_size;
-        dict["allocation_alignment"] = segment.allocation_alignment;
-        dict["metadata_reserved_bytes"] = segment.metadata_reserved_bytes;
-        dict["namespace_id"] = segment.namespace_id;
-        py::list accessors;
-        for (const auto &accessor : segment.accessors) {
-            accessors.append(AccessorToDict(accessor));
-        }
-        dict["accessors"] = accessors;
-        return dict;
-    }
 };
+
+static std::string GdsUuidToString(const UUID &uuid) {
+    std::ostringstream oss;
+    oss << uuid;
+    return oss.str();
+}
+
+static py::dict GdsAccessorToDict(const GdsSsdAccessor &accessor) {
+    py::dict dict;
+    dict["client_host"] = accessor.client_host;
+    dict["segment_uri"] = accessor.segment_uri;
+    dict["namespace_id"] = accessor.namespace_id;
+    dict["size"] = accessor.size;
+    dict["block_size"] = accessor.block_size;
+    dict["allocation_alignment"] = accessor.allocation_alignment;
+    dict["gpu_device_ids"] = accessor.gpu_device_ids;
+    dict["numa_node"] = accessor.numa_node;
+    dict["alive"] = accessor.alive;
+    return dict;
+}
+
+static py::dict GdsSegmentToDict(const GdsSsdSegment &segment) {
+    py::dict dict;
+    dict["id"] = GdsUuidToString(segment.id);
+    dict["name"] = segment.name;
+    dict["base"] = segment.base;
+    dict["size"] = segment.size;
+    dict["block_size"] = segment.block_size;
+    dict["allocation_alignment"] = segment.allocation_alignment;
+    dict["metadata_reserved_bytes"] = segment.metadata_reserved_bytes;
+    dict["namespace_id"] = segment.namespace_id;
+    py::list accessors;
+    for (const auto &accessor : segment.accessors) {
+        accessors.append(GdsAccessorToDict(accessor));
+    }
+    dict["accessors"] = accessors;
+    return dict;
+}
 
 PYBIND11_MODULE(store, m) {
     m.def("_serialize_tensor", &serialize_tensor_metadata,
@@ -2391,22 +2211,93 @@ PYBIND11_MODULE(store, m) {
 
     py::class_<MooncakeGdsSsdRegisterPyWrapper>(m, "MooncakeGdsSsdRegister")
         .def(py::init<>())
-        .def("real_register", &MooncakeGdsSsdRegisterPyWrapper::real_register,
-             py::arg("master_server_addr") = "127.0.0.1:50051",
-             py::arg("segment_name") = "", py::arg("client_host") = "",
-             py::arg("segment_uri") = "", py::arg("namespace_id") = "",
-             py::arg("base") = 0, py::arg("size") = 0,
-             py::arg("device_size") = 0, py::arg("block_size") = 0,
-             py::arg("allocation_alignment") = 0,
-             py::arg("metadata_reserved_bytes") = 0,
-             py::arg("gpu_device_ids") = std::vector<int32_t>{},
-             py::arg("numa_node") = -1)
-        .def("real_unregister",
-             &MooncakeGdsSsdRegisterPyWrapper::real_unregister,
-             py::arg("master_server_addr") = "127.0.0.1:50051",
-             py::arg("segment_name") = "", py::arg("client_host") = "")
-        .def("list_segments", &MooncakeGdsSsdRegisterPyWrapper::list_segments,
-             py::arg("master_server_addr") = "127.0.0.1:50051");
+        .def(
+            "real_register",
+            [](MooncakeGdsSsdRegisterPyWrapper &self,
+               const std::string &master_server_addr,
+               const std::string &segment_name,
+               const std::string &client_host,
+               const std::string &segment_uri,
+               const std::string &namespace_id, uint64_t base, uint64_t size,
+               uint64_t device_size, uint64_t block_size,
+               uint64_t allocation_alignment,
+               uint64_t metadata_reserved_bytes,
+               const std::vector<int32_t> &gpu_device_ids, int32_t numa_node,
+               const std::string &metadata_server) {
+                // Use the same RealClient initialization path as
+                // MooncakeDistributedStore. This deliberately does NOT use
+                // protocol="rpc_only": Client::Create must initialize the
+                // TransferEngine. In TENT mode TransferEngine::init() loads
+                // enabled transports, including GDS, through loadTransports().
+                self.register_ = RealClient::create();
+                int rc = self.register_->setup_real(
+                    client_host, metadata_server, 0, 0, "tcp", "",
+                    master_server_addr, nullptr, "", false, "", "default");
+                if (rc != OPERATION_OK) {
+                    return rc;
+                }
+                return self.register_->register_gds_ssd_segment(
+                    segment_name, client_host, segment_uri, namespace_id, base,
+                    size, device_size, block_size, allocation_alignment,
+                    metadata_reserved_bytes, gpu_device_ids, numa_node);
+            },
+            py::arg("master_server_addr") = "127.0.0.1:50051",
+            py::arg("segment_name") = "", py::arg("client_host") = "",
+            py::arg("segment_uri") = "", py::arg("namespace_id") = "",
+            py::arg("base") = 0, py::arg("size") = 0,
+            py::arg("device_size") = 0, py::arg("block_size") = 0,
+            py::arg("allocation_alignment") = 0,
+            py::arg("metadata_reserved_bytes") = 0,
+            py::arg("gpu_device_ids") = std::vector<int32_t>{},
+            py::arg("numa_node") = -1,
+            py::arg("metadata_server") = "P2PHANDSHAKE")
+        .def(
+            "real_unregister",
+            [](MooncakeGdsSsdRegisterPyWrapper &self,
+               const std::string &master_server_addr,
+               const std::string &segment_name,
+               const std::string &client_host,
+               const std::string &metadata_server) {
+                self.register_ = RealClient::create();
+                int rc = self.register_->setup_real(
+                    client_host, metadata_server, 0, 0, "tcp", "",
+                    master_server_addr, nullptr, "", false, "", "default");
+                if (rc != OPERATION_OK) {
+                    return rc;
+                }
+                return self.register_->unregister_gds_ssd_segment(segment_name,
+                                                                  client_host);
+            },
+            py::arg("master_server_addr") = "127.0.0.1:50051",
+            py::arg("segment_name") = "", py::arg("client_host") = "",
+            py::arg("metadata_server") = "P2PHANDSHAKE")
+        .def(
+            "list_segments",
+            [](MooncakeGdsSsdRegisterPyWrapper &self,
+               const std::string &master_server_addr,
+               const std::string &metadata_server) {
+                self.register_ = RealClient::create();
+                // list_segments has no client_host argument. Use a logical
+                // localhost name; setup_real will allocate an endpoint port.
+                int rc = self.register_->setup_real(
+                    "localhost", metadata_server, 0, 0, "tcp", "",
+                    master_server_addr, nullptr, "", false, "", "default");
+                if (rc != OPERATION_OK) {
+                    throw std::runtime_error(
+                        "failed to initialize GDS SSD register client");
+                }
+                auto segments = self.register_->list_gds_ssd_segments();
+                if (!segments) {
+                    throw std::runtime_error("failed to query GDS SSD segments");
+                }
+                py::list result;
+                for (const auto &segment : segments.value()) {
+                    result.append(GdsSegmentToDict(segment));
+                }
+                return result;
+            },
+            py::arg("master_server_addr") = "127.0.0.1:50051",
+            py::arg("metadata_server") = "P2PHANDSHAKE");
     // Create a wrapper that exposes DistributedObjectStore with Python-specific
     // methods
     // Helper function to extract PyClient shared_ptr from

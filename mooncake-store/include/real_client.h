@@ -269,6 +269,24 @@ class RealClient : public PyClient {
 
     [[nodiscard]] std::string get_hostname() const;
 
+    // GDS SSD registration façade. The Python binding initializes this
+    // RealClient through setup_real() first, so calls below always traverse
+    // RealClient -> Client -> MasterClient rather than issuing master RPCs in
+    // the pybind wrapper.
+    int register_gds_ssd_segment(
+        const std::string &segment_name, const std::string &client_host,
+        const std::string &segment_uri, const std::string &namespace_id,
+        uint64_t base, uint64_t size, uint64_t device_size,
+        uint64_t block_size, uint64_t allocation_alignment,
+        uint64_t metadata_reserved_bytes,
+        const std::vector<int32_t> &gpu_device_ids, int32_t numa_node);
+
+    int unregister_gds_ssd_segment(const std::string &segment_name,
+                                   const std::string &client_host);
+
+    tl::expected<std::vector<GdsSsdSegment>, ErrorCode>
+    list_gds_ssd_segments();
+
     /**
      * @brief Get a buffer containing the data for a key
      * @param key Key to get data for
